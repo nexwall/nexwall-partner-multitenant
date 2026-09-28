@@ -1,0 +1,33 @@
+name: partner-plane-ci
+
+on:
+  pull_request:
+    paths:
+      - 'partner-plane/**'
+  push:
+    branches: [main]
+    paths:
+      - 'partner-plane/**'
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: partner-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: partner-plane/go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./... -v
