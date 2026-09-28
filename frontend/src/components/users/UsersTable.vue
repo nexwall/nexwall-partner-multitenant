@@ -1,0 +1,712 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { USERS_TABLE_ID, type User } from '@/lib/users/users'
+import { PAGE_SIZE_OPTIONS } from '@/lib/tablePageSize'
+import {
+  faMagnifyingGlass,
+  faUserGroup,
+  faPenToSquare,
+  faBoxArchive,
+  faKey,
+  faUserSecret,
+  faCirclePause,
+  faCirclePlay,
+  faCircleCheck,
+  faRotateLeft,
+  faBomb,
+  faArrowRight,
+} from '@fortawesome/free-solid-svg-icons'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import {
+  NeTable,
+  NeTableHead,
+  NeTableHeadCell,
+  NeTableBody,
+  NeTableRow,
+  NeTableCell,
+  NePaginator,
+  NeButton,
+  NeEmptyState,
+  NeInlineNotification,
+  NeTextInput,
+  NeDropdown,
+  type SortEvent,
+  NeSortDropdown,
+  sortByProperty,
+  type NeDropdownItem,
+  NeDropdownFilterV2,
+  type NeDropdownFilterV2Option,
+} from '@nethesis/vue-components'
+import { computed, ref, watch } from 'vue'
+import CreateOrEditUserDrawer from './CreateOrEditUserDrawer.vue'
+import { useI18n } from 'vue-i18n'
+import DeleteUserModal from './DeleteUserModal.vue'
+import DestroyUserModal from './DestroyUserModal.vue'
+import { savePageSizeToStorage } from '@/lib/tablePageSize'
+import ResetPasswordModal from './ResetPasswordModal.vue'
+import PasswordChangedModal from './PasswordChangedModal.vue'
+import { useUsers } from '@/queries/users/users'
+import { canManageUsers, canImpersonateUsers, canDestroyUsers } from '@/lib/permissions'
+import { isCurrentUser } from '@/lib/users/users'
+import { useLoginStore } from '@/stores/login'
+import ImpersonateUserModal from './ImpersonateUserModal.vue'
+import SuspendUserModal from './SuspendUserModal.vue'
+import ReactivateUserModal from './ReactivateUserModal.vue'
+import RestoreUserModal from './RestoreUserModal.vue'
+import OrganizationIconAndLink from '@/components/organizations/OrganizationIconAndLink.vue'
+import UserRoleBadge from './UserRoleBadge.vue'
+import { useUserFilters } from '@/queries/users/userFilters'
+import { normalize } from '@/lib/common'
+import UpdatingSpinner from '@/components/common/UpdatingSpinner.vue'
+import UserAvatar from './UserAvatar.vue'
+import ClickToCopy from '@/components/common/ClickToCopy.vue'
+import OrganizationDropdownFilter from '@/components/organizations/OrganizationDropdownFilter.vue'
+import { isUserCustomer } from '@/lib/organizations/organizations.ts'
+import router from '@/router/index.ts'
+import CreatorOrganization from '@/components/organizations/CreatorOrganization.vue'
+
+const { isShownCreateUserDrawer = false } = defineProps<{
+  isShownCreateUserDrawer: boolean
+}>()
+
+const emit = defineEmits(['close-drawer'])
+
+const { t } = useI18n()
+const {
+  state,
+  asyncStatus,
+  pageNum,
+  pageSize,
+  textFilter,
+  debouncedTextFilter,
+  organizationFilter,
+  roleFilter,
+  statusFilter,
+  createdByFilter,
+  sortBy,
+  sortDescending,
+  resetFilters,
+  resetStatusFilter,
+} = useUsers()
+const loginStore = useLoginStore()
+const { state: userFiltersState } = useUserFilters()
+
+const currentUser = ref<User | undefined>()
+const isShownCreateOrEditUserDrawer = ref(false)
+const isShownDeleteUserModal = ref(false)
+const isShownResetPasswordModal = ref(false)
+const isShownPasswordChangedModal = ref(false)
+const isShownImpersonateUserModal = ref(false)
+const isShownSuspendUserModal = ref(false)
+const isShownReactivateUserModal = ref(false)
+const isShownRestoreUserModal = ref(false)
+const isShownDestroyUserModal = ref(false)
+const newPassword = ref<string>('')
+const isImpersonating = ref(false)
+
+const statusFilterOptions = ref<NeDropdownFilterV2Option[]>([
+  {
+    id: 'enabled',
+    label: t('common.enabled'),
+  },
+  {
+    id: 'suspended',
+    label: t('common.suspended'),
+  },
+  {
+    id: 'deleted',
+    label: t('common.archived'),
+  },
+])
+
+const usersPage = computed(() => {
+  return state.value.data?.users
+})
+
+const pagination = computed(() => {
+  return state.value.data?.pagination
+})
+
+const areDefaultFiltersApplied = computed(() => {
+  return (
+    !debouncedTextFilter.value &&
+    organizationFilter.value.length === 0 &&
+    roleFilter.value.length === 0 &&
+    statusFilter.value.length === 2 &&
+    statusFilter.value.some((o) => o.id === 'enabled') &&
+    statusFilter.value.some((o) => o.id === 'suspended') &&
+    !statusFilter.value.some((o) => o.id === 'deleted') &&
+    createdByFilter.value.length === 0
+  )
+})
+
+const isNoDataEmptyStateShown = computed(() => {
+  return (
+    !usersPage.value?.length && state.value.status === 'success' && areDefaultFiltersApplied.value
+  )
+})
+
+const isNoMatchEmptyStateShown = computed(() => {
+  return (
+    !usersPage.value?.length && state.value.status === 'success' && !areDefaultFiltersApplied.value
+  )
+})
+
+const noEmptyStateShown = computed(() => {
+  return !isNoDataEmptyStateShown.value && !isNoMatchEmptyStateShown.value
+})
+
+const roleFilterOptions = computed<NeDropdownFilterV2Option[]>(() => {
+  if (!userFiltersState.value.data?.roles) {
+    return []
+  }
+  return userFiltersState.value.data.roles.map((role) => ({
+    id: role.id,
+    label: t(`user_roles.${normalize(role.name)}`),
+    description: t(`user_roles.${normalize(role.name)}_description`),
+  }))
+})
+
+const createdByFilterOptions = computed<NeDropdownFilterV2Option[]>(() => {
+  if (!userFiltersState.value.data?.created_by) {
+    return []
+  }
+  return userFiltersState.value.data.created_by.map((createdBy) => ({
+    id: createdBy.user_id,
+    label: createdBy.name,
+    description: createdBy.organization_name,
+  }))
+})
+
+watch(
+  () => isShownCreateUserDrawer,
+  () => {
+    if (isShownCreateUserDrawer) {
+      showCreateUserDrawer()
+    }
+  },
+  { immediate: true },
+)
+
+function showCreateUserDrawer() {
+  currentUser.value = undefined
+  isShownCreateOrEditUserDrawer.value = true
+}
+
+function showEditUserDrawer(user: User) {
+  currentUser.value = user
+  isShownCreateOrEditUserDrawer.value = true
+}
+
+function showDeleteUserModal(user: User) {
+  currentUser.value = user
+  isShownDeleteUserModal.value = true
+}
+
+function showResetPasswordModal(user: User) {
+  currentUser.value = user
+  isShownResetPasswordModal.value = true
+}
+
+function showSuspendUserModal(user: User) {
+  currentUser.value = user
+  isShownSuspendUserModal.value = true
+}
+
+function showReactivateUserModal(user: User) {
+  currentUser.value = user
+  isShownReactivateUserModal.value = true
+}
+
+function showRestoreUserModal(user: User) {
+  currentUser.value = user
+  isShownRestoreUserModal.value = true
+}
+
+function showDestroyUserModal(user: User) {
+  currentUser.value = user
+  isShownDestroyUserModal.value = true
+}
+
+function showImpersonateUserModal(user: User) {
+  currentUser.value = user
+  isShownImpersonateUserModal.value = true
+}
+
+function onPasswordChanged(newPwd: string) {
+  newPassword.value = newPwd
+  isShownPasswordChangedModal.value = true
+}
+
+function onCloseDrawer() {
+  isShownCreateOrEditUserDrawer.value = false
+  emit('close-drawer')
+}
+
+function getKebabMenuItems(user: User) {
+  let items: NeDropdownItem[] = []
+
+  // Hide impersonate option for yourself
+  if (
+    canImpersonateUsers() &&
+    user.logto_id !== loginStore.userInfo?.logto_id &&
+    !user.suspended_at &&
+    !user.deleted_at
+  ) {
+    items = [
+      ...items,
+      {
+        id: 'impersonate',
+        label: t('users.impersonate_user'),
+        icon: faUserSecret,
+        action: () => showImpersonateUserModal(user),
+        disabled: isImpersonating.value || !user.can_be_impersonated,
+      },
+    ]
+  }
+
+  if (canManageUsers()) {
+    if (user.deleted_at) {
+      items = [
+        ...items,
+        {
+          id: 'restoreUser',
+          label: t('common.restore'),
+          icon: faRotateLeft,
+          action: () => showRestoreUserModal(user),
+        },
+      ]
+    } else if (user.suspended_at) {
+      items = [
+        ...items,
+        {
+          id: 'reactivateUser',
+          label: t('users.reactivate'),
+          icon: faCirclePlay,
+          action: () => showReactivateUserModal(user),
+        },
+        {
+          id: 'deleteAccount',
+          label: t('common.archive'),
+          icon: faBoxArchive,
+          danger: true,
+          action: () => showDeleteUserModal(user),
+        },
+      ]
+    } else {
+      items = [
+        ...items,
+        {
+          id: 'suspendUser',
+          label: t('common.suspend'),
+          icon: faCirclePause,
+          action: () => showSuspendUserModal(user),
+        },
+        {
+          id: 'resetPassword',
+          label: t('users.reset_password'),
+          icon: faKey,
+          action: () => showResetPasswordModal(user),
+        },
+        {
+          id: 'deleteAccount',
+          label: t('common.archive'),
+          icon: faBoxArchive,
+          danger: true,
+          action: () => showDeleteUserModal(user),
+        },
+      ]
+    }
+  }
+
+  if (canDestroyUsers()) {
+    items = [
+      ...items,
+      {
+        id: 'destroyUser',
+        label: t('common.destroy'),
+        icon: faBomb,
+        danger: true,
+        action: () => showDestroyUserModal(user),
+      },
+    ]
+  }
+  return items
+}
+
+const onSort = (payload: SortEvent) => {
+  sortBy.value = payload.key as keyof User
+  sortDescending.value = payload.descending
+}
+
+const onClosePasswordChangedModal = () => {
+  isShownPasswordChangedModal.value = false
+  newPassword.value = ''
+}
+
+const goToAccount = () => {
+  router.push({ name: 'account' })
+}
+</script>
+
+<template>
+  <div>
+    <!-- get users error notification -->
+    <NeInlineNotification
+      v-if="state.status === 'error'"
+      kind="error"
+      :title="$t('users.cannot_retrieve_users')"
+      :description="state.error.message"
+      class="mb-6"
+    />
+    <!-- table toolbar -->
+    <div class="mb-6 flex items-center gap-4">
+      <div class="flex w-full items-end justify-between gap-4">
+        <!-- filters -->
+        <div class="flex flex-wrap items-center gap-4">
+          <!-- text filter -->
+          <NeTextInput
+            v-model="textFilter"
+            @blur="textFilter = textFilter.trim()"
+            is-search
+            :placeholder="$t('users.filter_users')"
+            class="max-w-48 sm:max-w-sm"
+          />
+          <!-- organization filter -->
+          <OrganizationDropdownFilter v-if="!isUserCustomer()" v-model="organizationFilter" />
+          <!-- role filter -->
+          <NeDropdownFilterV2
+            v-model="roleFilter"
+            kind="checkbox"
+            :label="t('users.role')"
+            :options="roleFilterOptions"
+            :disabled="userFiltersState.status === 'pending'"
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+          />
+          <!-- created by filter -->
+          <NeDropdownFilterV2
+            v-model="createdByFilter"
+            kind="checkbox"
+            :disabled="userFiltersState.status === 'pending'"
+            :label="t('systems.created_by')"
+            :options="createdByFilterOptions"
+            show-options-filter
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+          />
+          <!-- status filter -->
+          <NeDropdownFilterV2
+            v-model="statusFilter"
+            kind="checkbox"
+            :label="t('common.status')"
+            :options="statusFilterOptions"
+            :show-clear-filter="false"
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+            :custom-action-label="t('ne_dropdown_filter.reset_selection')"
+            @custom-action="resetStatusFilter"
+          />
+          <!-- sort dropdown -->
+          <NeSortDropdown
+            v-model:sort-key="sortBy"
+            v-model:sort-descending="sortDescending"
+            :label="t('sort.sort')"
+            :options="[
+              { id: 'name', label: t('users.name') },
+              { id: 'email', label: t('users.email') },
+              { id: 'organization', label: t('users.organization') },
+              { id: 'creator_name', label: t('systems.created_by') },
+              { id: 'status', label: t('common.status') },
+            ]"
+            :open-menu-aria-label="t('ne_dropdown.open_menu')"
+            :sort-by-label="t('sort.sort_by')"
+            :sort-direction-label="t('sort.direction')"
+            :ascending-label="t('sort.ascending')"
+            :descending-label="t('sort.descending')"
+          />
+          <NeButton kind="tertiary" @click="resetFilters">
+            {{ t('common.reset_filters') }}
+          </NeButton>
+        </div>
+        <!-- update indicator -->
+        <UpdatingSpinner v-if="asyncStatus === 'loading' && state.status !== 'pending'" />
+      </div>
+    </div>
+    <!-- empty state -->
+    <NeEmptyState
+      v-if="isNoDataEmptyStateShown"
+      :title="$t('users.no_user')"
+      :icon="faUserGroup"
+      class="bg-white dark:bg-gray-950"
+    />
+    <!-- no user matching filter -->
+    <NeEmptyState
+      v-else-if="isNoMatchEmptyStateShown"
+      :title="$t('users.no_user_found')"
+      :description="$t('common.try_changing_search_filters')"
+      :icon="faMagnifyingGlass"
+      class="bg-white dark:bg-gray-950"
+    >
+      <NeButton kind="tertiary" @click="resetFilters"> {{ $t('common.clear_filters') }}</NeButton>
+    </NeEmptyState>
+    <NeTable
+      v-if="noEmptyStateShown"
+      :sort-key="sortBy"
+      :sort-descending="sortDescending"
+      :aria-label="$t('users.title')"
+      card-breakpoint="2xl"
+      :loading="state.status === 'pending'"
+      :skeleton-columns="5"
+      :skeleton-rows="7"
+    >
+      <NeTableHead>
+        <NeTableHeadCell sortable column-key="name" @sort="onSort">{{
+          $t('users.name')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="organization" @sort="onSort">{{
+          $t('users.organization')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell>{{ $t('users.role') }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="creator_name" @sort="onSort">{{
+          $t('systems.created_by')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="status" @sort="onSort">{{
+          $t('common.status')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell>
+          <!-- no header for actions -->
+        </NeTableHeadCell>
+      </NeTableHead>
+      <NeTableBody>
+        <NeTableRow v-for="item in usersPage" :key="item.username">
+          <NeTableCell :data-label="$t('users.name')" :class="{ 'opacity-50': item.deleted_at }">
+            <div class="flex items-center gap-2">
+              <UserAvatar
+                :size="'sm'"
+                :is-owner="item.username === 'owner'"
+                :name="item.name"
+                :logto-id="item.logto_id || ''"
+                :has-avatar="item.has_avatar"
+              />
+              <div class="flex flex-col">
+                <div class="flex items-center gap-2">
+                  {{ item.name }}
+                  <span v-if="isCurrentUser(item)" class="text-tertiary-neutral"
+                    >({{ $t('users.me') }})</span
+                  >
+                </div>
+                <ClickToCopy
+                  v-if="item.email"
+                  :text="item.email"
+                  tooltip-placement="right"
+                  class="text-tertiary-neutral break-all 2xl:break-normal"
+                />
+              </div>
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('users.organization')">
+            <div :class="{ 'opacity-50': item.deleted_at }">
+              <OrganizationIconAndLink
+                v-if="item.organization"
+                :organization="item.organization"
+                size="sm"
+              />
+              <span v-else>-</span>
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('users.role')">
+            <span
+              v-if="!item.roles || item.roles.length === 0"
+              :class="{ 'opacity-50': item.deleted_at }"
+              >-</span
+            >
+            <div v-else class="flex flex-wrap gap-1" :class="{ 'opacity-50': item.deleted_at }">
+              <UserRoleBadge
+                v-for="role in item.roles?.sort(sortByProperty('name'))"
+                :key="role.id"
+                :role="role.name"
+              />
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('systems.created_by')">
+            <div :class="{ 'opacity-50': item.deleted_at }">
+              <template v-if="item.created_by">
+                <div class="flex items-center gap-2">
+                  <UserAvatar
+                    size="sm"
+                    :is-owner="item.created_by.username === 'owner'"
+                    :name="item.created_by.name"
+                    :logto-id="item.created_by.user_id"
+                  />
+                  <div class="space-y-0.5">
+                    <div>{{ item.created_by.name || '-' }}</div>
+                    <div
+                      v-if="item.created_by.organization_name"
+                      class="text-gray-500 dark:text-gray-400"
+                    >
+                      <CreatorOrganization :creator="item.created_by" />
+                    </div>
+                  </div>
+                </div>
+              </template>
+              <template v-else>-</template>
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('common.status')">
+            <div class="flex items-center gap-2">
+              <template v-if="item.deleted_at">
+                <FontAwesomeIcon
+                  :icon="faBoxArchive"
+                  class="text-icon-neutral size-4"
+                  aria-hidden="true"
+                />
+                <span>
+                  {{ t('common.archived') }}
+                </span>
+              </template>
+              <template v-else-if="item.suspended_at">
+                <FontAwesomeIcon
+                  :icon="faCirclePause"
+                  class="text-icon-neutral size-4"
+                  aria-hidden="true"
+                />
+                <span>
+                  {{ t('users.suspended') }}
+                </span>
+              </template>
+              <template v-else>
+                <FontAwesomeIcon
+                  :icon="faCircleCheck"
+                  class="text-icon-enabled size-4"
+                  aria-hidden="true"
+                />
+                <span>
+                  {{ t('common.enabled') }}
+                </span>
+              </template>
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('common.actions')">
+            <div v-if="canManageUsers()" class="-ml-2.5 flex gap-2 2xl:ml-0 2xl:justify-end">
+              <template v-if="!isCurrentUser(item)">
+                <NeButton v-if="!item.deleted_at" kind="tertiary" @click="showEditUserDrawer(item)">
+                  <template #prefix>
+                    <FontAwesomeIcon :icon="faPenToSquare" class="h-4 w-4" aria-hidden="true" />
+                  </template>
+                  {{ $t('common.edit') }}
+                </NeButton>
+                <!-- kebab menu -->
+                <NeDropdown :items="getKebabMenuItems(item)" :align-to-right="true" />
+              </template>
+              <template v-else>
+                <NeButton kind="tertiary" @click="goToAccount">
+                  <template #prefix>
+                    <FontAwesomeIcon :icon="faArrowRight" class="h-4 w-4" aria-hidden="true" />
+                  </template>
+                  {{ $t('account.title') }}
+                </NeButton>
+              </template>
+            </div>
+          </NeTableCell>
+        </NeTableRow>
+      </NeTableBody>
+      <template #paginator>
+        <NePaginator
+          :current-page="pageNum"
+          :total-rows="pagination?.total_count || 0"
+          :page-size="pageSize"
+          :page-sizes="PAGE_SIZE_OPTIONS"
+          :nav-pagination-label="$t('ne_table.pagination')"
+          :next-label="$t('ne_table.go_to_next_page')"
+          :previous-label="$t('ne_table.go_to_previous_page')"
+          :range-of-total-label="$t('ne_table.of')"
+          :page-size-label="$t('ne_table.show')"
+          @select-page="
+            (page: number) => {
+              pageNum = page
+            }
+          "
+          @select-page-size="
+            (size: number) => {
+              pageSize = size
+              savePageSizeToStorage(USERS_TABLE_ID, size)
+            }
+          "
+        />
+      </template>
+    </NeTable>
+    <!-- side drawer -->
+    <CreateOrEditUserDrawer
+      :is-shown="isShownCreateOrEditUserDrawer"
+      :current-user="currentUser"
+      @close="onCloseDrawer"
+    />
+    <!-- delete user modal -->
+    <DeleteUserModal
+      :visible="isShownDeleteUserModal"
+      :user="currentUser"
+      @close="isShownDeleteUserModal = false"
+    />
+    <!-- suspend user modal -->
+    <SuspendUserModal
+      :visible="isShownSuspendUserModal"
+      :user="currentUser"
+      @close="isShownSuspendUserModal = false"
+    />
+    <!-- reactivate user modal -->
+    <ReactivateUserModal
+      :visible="isShownReactivateUserModal"
+      :user="currentUser"
+      @close="isShownReactivateUserModal = false"
+    />
+    <!-- restore user modal -->
+    <RestoreUserModal
+      :visible="isShownRestoreUserModal"
+      :user="currentUser"
+      @close="isShownRestoreUserModal = false"
+    />
+    <!-- impersonate user modal -->
+    <ImpersonateUserModal
+      :visible="isShownImpersonateUserModal"
+      :user="currentUser"
+      @close="isShownImpersonateUserModal = false"
+    />
+    <!-- reset password modal -->
+    <ResetPasswordModal
+      :visible="isShownResetPasswordModal"
+      :user="currentUser"
+      @close="isShownResetPasswordModal = false"
+      @password-changed="onPasswordChanged"
+    />
+    <!-- password changed modal -->
+    <PasswordChangedModal
+      :visible="isShownPasswordChangedModal"
+      :user="currentUser"
+      :new-password="newPassword"
+      @close="onClosePasswordChangedModal"
+    />
+    <!-- destroy user modal -->
+    <DestroyUserModal
+      :visible="isShownDestroyUserModal"
+      :user="currentUser"
+      @close="isShownDestroyUserModal = false"
+    />
+  </div>
+</template>

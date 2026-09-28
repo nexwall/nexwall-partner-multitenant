@@ -1,0 +1,83 @@
+# Build stage
+# Node version: keep in sync with /.nvmrc
+FROM docker.io/library/node:24.20.0 AS base
+
+WORKDIR /app
+
+FROM base as builder
+# Copy build trigger file to force rebuilds when it changes
+COPY .render-build-trigger /tmp/build-trigger
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies (including dev dependencies for build)
+RUN npm ci
+
+# Copy source code
+COPY . .
+
+# Accept build arguments for Vite environment variables
+ARG VITE_PRODUCT_NAME
+ARG VITE_LOGTO_ENDPOINT
+ARG VITE_LOGTO_APP_ID
+ARG VITE_LOGTO_API_RESOURCE
+ARG VITE_API_BASE_URL
+ARG VITE_SIGNIN_REDIRECT_URI
+ARG VITE_SIGNOUT_REDIRECT_URI
+ARG VITE_SHOP_BASE_URL
+# Set only for images built for the end-to-end suite; see src/lib/config.ts
+ARG VITE_E2E
+
+# Set environment variables for Vite build
+ENV VITE_PRODUCT_NAME=$VITE_PRODUCT_NAME
+ENV VITE_LOGTO_ENDPOINT=$VITE_LOGTO_ENDPOINT
+ENV VITE_LOGTO_APP_ID=$VITE_LOGTO_APP_ID
+ENV VITE_LOGTO_API_RESOURCE=$VITE_LOGTO_API_RESOURCE
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+ENV VITE_SIGNIN_REDIRECT_URI=$VITE_SIGNIN_REDIRECT_URI
+ENV VITE_SIGNOUT_REDIRECT_URI=$VITE_SIGNOUT_REDIRECT_URI
+ENV VITE_SHOP_BASE_URL=$VITE_SHOP_BASE_URL
+ENV VITE_E2E=$VITE_E2E
+
+# Build the application
+RUN npm run build
+
+# Distribution stage (for local use only - static files only)
+FROM scratch as dist
+COPY --from=builder /app/dist /
+
+# Production stage (default for deployment)
+FROM nginx:1.25-alpine as production
+
+# Install gettext for envsubst command
+RUN apk add --no-cache gettext
+
+# Remove default nginx configuration
+RUN rm -rf /usr/share/nginx/html/*
+
+# Copy built static files from builder stage
+COPY --from=builder /app/dist /usr/share/nginx/html/
+
+# Copy nginx configuration
+COPY nginx.conf /etc/nginx/nginx.conf
+
+# Create nginx user if it doesn't exist
+RUN addgroup -g 101 -S nginx || true
+RUN adduser -S -D -H -u 101 -h /var/cache/nginx -s /sbin/nologin -G nginx -g nginx nginx || true
+
+# Set correct permissions
+RUN chown -R nginx:nginx /usr/share/nginx/html
+RUN chmod -R 755 /usr/share/nginx/html
+
+# Expose port (default 8080, can be overridden by PORT env var)
+ARG PORT=8080
+ENV PORT=${PORT}
+EXPOSE ${PORT}
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:${PORT:-8080}/ || exit 1
+
+# Start nginx
+CMD ["sh", "-c", "envsubst '$$PORT' < /etc/nginx/nginx.conf > /tmp/nginx.conf && nginx -c /tmp/nginx.conf -g 'daemon off;'"]

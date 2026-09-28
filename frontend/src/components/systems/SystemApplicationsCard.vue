@@ -1,0 +1,98 @@
+<!--
+  Copyright (C) 2026 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { NeButton, NeLink } from '@nethesis/vue-components'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import { faArrowRight } from '@fortawesome/free-solid-svg-icons'
+import { faGridOne } from '@nethesis/nethesis-solid-svg-icons'
+import CounterCard from '@/components/common/CounterCard.vue'
+import ApplicationLogo from '@/components/applications/ApplicationLogo.vue'
+import { useI18n } from 'vue-i18n'
+import { computed } from 'vue'
+import router from '@/router'
+import { useRoute } from 'vue-router'
+import { useApplications } from '@/queries/applications/applications'
+import { useApplicationsSummaryBySystem } from '@/queries/applications/applicationsSummaryBySystem'
+import { useSystemDetail } from '@/queries/systems/systemDetail'
+
+const { t } = useI18n()
+const route = useRoute()
+
+const { state: applicationsSummary } = useApplicationsSummaryBySystem()
+const { state: systemDetail } = useSystemDetail()
+const { systemFilter: systemFilterForApps, clearFilters: clearApplicationsFilters } =
+  useApplications()
+
+const applicationsCount = computed(() => applicationsSummary.value?.data?.total ?? 0)
+const moreApplications = computed(() => {
+  if (!applicationsSummary.value.data) {
+    return 0
+  }
+  const totalApps = applicationsSummary.value.data.total
+  const retrievedApps = applicationsSummary.value.data.by_type.reduce(
+    (acc, appType) => acc + appType.count,
+    0,
+  )
+  const remainingApps = totalApps - retrievedApps
+
+  if (remainingApps > 0) {
+    return remainingApps
+  }
+  return 0
+})
+
+const goToApplications = () => {
+  const systemId = route.params.systemId as string
+  clearApplicationsFilters()
+  // the filter renders the label carried by the selection: pass the system name,
+  // as the selected system may not be among the options the dropdown has loaded
+  systemFilterForApps.value = systemId
+    ? [{ id: systemId, label: systemDetail.value.data?.name || systemId }]
+    : []
+  router.push({ name: 'applications' })
+}
+</script>
+
+<template>
+  <CounterCard
+    :title="$t('applications.system_applications')"
+    :counter="applicationsCount"
+    :icon="faGridOne"
+    :loading="applicationsSummary.status === 'pending'"
+    @counter-click="goToApplications"
+  >
+    <div class="divide-y divide-gray-200 dark:divide-gray-700">
+      <div
+        v-for="appType in applicationsSummary.data?.by_type"
+        :key="appType.instance_of"
+        class="flex items-center justify-between py-3"
+      >
+        <div class="flex items-center gap-2">
+          <ApplicationLogo :app="appType.instance_of" />
+          <span class="font-medium">
+            {{ appType.name || '-' }}
+          </span>
+        </div>
+        <span>
+          {{ appType.count }}
+        </span>
+      </div>
+      <div v-if="moreApplications > 0" class="py-3">
+        <NeLink @click="goToApplications()">
+          {{ t('common.plus_n_more', { count: moreApplications }) }}
+        </NeLink>
+      </div>
+    </div>
+    <div v-if="applicationsCount > 0" class="flex justify-end">
+      <NeButton kind="tertiary" class="mt-2" @click="goToApplications()">
+        <template #prefix>
+          <FontAwesomeIcon :icon="faArrowRight" aria-hidden="true" />
+        </template>
+        {{ t('common.go_to_page', { page: t('applications.title') }) }}
+      </NeButton>
+    </div>
+  </CounterCard>
+</template>

@@ -1,0 +1,429 @@
+name: Release - Production
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+        cache: false
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    # Quality checks before release
+    - name: Check code formatting (backend)
+      working-directory: backend
+      run: |
+        if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+          echo "Code is not formatted properly in backend:"
+          gofmt -s -l .
+          exit 1
+        fi
+
+    - name: Check code formatting (sync)
+      working-directory: sync
+      run: |
+        if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+          echo "Code is not formatted properly in sync:"
+          gofmt -s -l .
+          exit 1
+        fi
+
+    - name: Check code formatting (collect)
+      working-directory: collect
+      run: |
+        if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+          echo "Code is not formatted properly in collect:"
+          gofmt -s -l .
+          exit 1
+        fi
+
+    - name: Run backend linting
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: v2.11.4
+        working-directory: backend
+        args: --timeout=10m
+
+    - name: Sync email templates for sync component
+      working-directory: sync
+      run: make sync-templates
+
+    - name: Run sync linting
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: v2.11.4
+        working-directory: sync
+        args: --timeout=10m
+
+    - name: Run collect linting
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: v2.11.4
+        working-directory: collect
+        args: --timeout=10m
+
+    - name: Run backend tests
+      working-directory: backend
+      run: go test ./...
+
+    - name: Run sync tests
+      working-directory: sync
+      run: go test ./...
+
+    - name: Run collect tests
+      working-directory: collect
+      run: go test ./...
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version-file: .nvmrc
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install frontend dependencies
+      working-directory: frontend
+      run: npm ci
+
+    - name: Check frontend formatting
+      working-directory: frontend
+      run: npm run format
+
+    - name: Run frontend linting
+      working-directory: frontend
+      run: npm run lint
+
+    - name: Run frontend type checking
+      working-directory: frontend
+      run: npm run type-check
+
+    - name: Run frontend tests
+      working-directory: frontend
+      run: npm run test:unit
+
+    - name: Test frontend build
+      working-directory: frontend
+      run: npm run build
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract version
+      id: version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+    - name: Compute lowercase image prefix
+      id: image_prefix
+      run: echo "PREFIX=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+    # Backend Release
+    - name: Build backend binary
+      working-directory: backend
+      run: |
+        mkdir -p dist
+
+        VERSION="${{ steps.version.outputs.VERSION }}"
+        COMMIT="${{ github.sha }}"
+        BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        LDFLAGS="-s -w -X github.com/nethesis/my/backend/pkg/version.Version=${VERSION} -X github.com/nethesis/my/backend/pkg/version.Commit=${COMMIT} -X github.com/nethesis/my/backend/pkg/version.BuildTime=${BUILD_TIME}"
+
+        GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/backend-linux-amd64 main.go
+
+        cd dist
+        tar -czf backend-linux-amd64.tar.gz backend-linux-amd64
+
+    # Collect Release
+    - name: Build collect binary
+      working-directory: collect
+      run: |
+        mkdir -p dist
+
+        VERSION="${{ steps.version.outputs.VERSION }}"
+        COMMIT="${{ github.sha }}"
+        BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        LDFLAGS="-s -w -X github.com/nethesis/my/collect/pkg/version.Version=${VERSION} -X github.com/nethesis/my/collect/pkg/version.Commit=${COMMIT} -X github.com/nethesis/my/collect/pkg/version.BuildTime=${BUILD_TIME}"
+
+        GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/collect-linux-amd64 main.go
+
+        cd dist
+        tar -czf collect-linux-amd64.tar.gz collect-linux-amd64
+
+    # Sync Release
+    - name: Build sync binary
+      working-directory: sync
+      run: |
+        mkdir -p dist
+
+        VERSION="${{ steps.version.outputs.VERSION }}"
+        COMMIT="${{ github.sha }}"
+        BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        LDFLAGS="-s -w -X github.com/nethesis/my/sync/pkg/version.Version=${VERSION} -X github.com/nethesis/my/sync/pkg/version.Commit=${COMMIT} -X github.com/nethesis/my/sync/pkg/version.BuildTime=${BUILD_TIME}"
+
+        GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/sync-linux-amd64 ./cmd/sync/main.go
+
+        cd dist
+        mkdir -p sync-linux-amd64-release
+        cp sync-linux-amd64 sync-linux-amd64-release/sync
+        cp -r ../configs sync-linux-amd64-release/
+        tar -czf sync-linux-amd64.tar.gz sync-linux-amd64-release
+        rm -rf sync-linux-amd64-release
+
+    # Docker Images
+    - name: Extract backend metadata
+      id: backend_meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository }}/backend
+        tags: |
+          type=semver,pattern=v{{version}},value=${{ steps.version.outputs.VERSION }}
+          type=raw,value=latest
+
+    - name: Build and push backend Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: backend
+        file: backend/Containerfile
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.backend_meta.outputs.tags }}
+        labels: |
+          ${{ steps.backend_meta.outputs.labels }}
+          org.opencontainers.image.title=My Nethesis Backend
+          org.opencontainers.image.description=Backend API for My Nethesis
+        cache-from: type=gha,scope=backend
+        cache-to: type=gha,mode=max,scope=backend
+        build-args: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          COMMIT=${{ github.sha }}
+          BUILD_TIME=${{ steps.backend_meta.outputs.labels['org.opencontainers.image.created'] }}
+
+    - name: Generate backend SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ steps.image_prefix.outputs.PREFIX }}/backend:${{ steps.version.outputs.VERSION }}
+        format: cyclonedx-json
+        output-file: backend-sbom.cdx.json
+
+    - name: Extract sync metadata
+      id: sync_meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository }}/sync
+        tags: |
+          type=semver,pattern=v{{version}},value=${{ steps.version.outputs.VERSION }}
+          type=raw,value=latest
+
+    - name: Build and push sync Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: sync/Containerfile
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.sync_meta.outputs.tags }}
+        labels: |
+          ${{ steps.sync_meta.outputs.labels }}
+          org.opencontainers.image.title=My Nethesis Sync
+          org.opencontainers.image.description=CLI tool for syncing RBAC configuration with Logto
+        cache-from: type=gha,scope=sync
+        cache-to: type=gha,mode=max,scope=sync
+        build-args: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          COMMIT=${{ github.sha }}
+          BUILD_TIME=${{ steps.sync_meta.outputs.labels['org.opencontainers.image.created'] }}
+
+    - name: Generate sync SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ steps.image_prefix.outputs.PREFIX }}/sync:${{ steps.version.outputs.VERSION }}
+        format: cyclonedx-json
+        output-file: sync-sbom.cdx.json
+
+    - name: Extract collect metadata
+      id: collect_meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository }}/collect
+        tags: |
+          type=semver,pattern=v{{version}},value=${{ steps.version.outputs.VERSION }}
+          type=raw,value=latest
+
+    - name: Build and push collect Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: collect
+        file: collect/Containerfile
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.collect_meta.outputs.tags }}
+        labels: |
+          ${{ steps.collect_meta.outputs.labels }}
+          org.opencontainers.image.title=My Nethesis Collect
+          org.opencontainers.image.description=Collection service for My Nethesis
+        cache-from: type=gha,scope=collect
+        cache-to: type=gha,mode=max,scope=collect
+        build-args: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          COMMIT=${{ github.sha }}
+          BUILD_TIME=${{ steps.collect_meta.outputs.labels['org.opencontainers.image.created'] }}
+
+    - name: Generate collect SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ steps.image_prefix.outputs.PREFIX }}/collect:${{ steps.version.outputs.VERSION }}
+        format: cyclonedx-json
+        output-file: collect-sbom.cdx.json
+
+    - name: Extract frontend metadata
+      id: frontend_meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository }}/frontend
+        tags: |
+          type=semver,pattern=v{{version}},value=${{ steps.version.outputs.VERSION }}
+          type=raw,value=latest
+
+    - name: Build and push frontend Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: frontend
+        file: frontend/Containerfile
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.frontend_meta.outputs.tags }}
+        labels: |
+          ${{ steps.frontend_meta.outputs.labels }}
+          org.opencontainers.image.title=My Nethesis Frontend
+          org.opencontainers.image.description=Frontend web application for My Nethesis
+        # Vite SPA: VITE_* must be passed at build time so they are baked into
+        # the JS bundle (Render runtime env on a `runtime: image` service does
+        # not affect an already-compiled bundle). Values are public (sent to
+        # the browser as redirect URLs), no secret material here.
+        build-args: |
+          VITE_PRODUCT_NAME=My Nethesis
+          VITE_LOGTO_ENDPOINT=https://id.nethesis.it
+          VITE_LOGTO_APP_ID=7s20mi3w8797np5x2vgze
+          VITE_LOGTO_API_RESOURCE=https://id.nethesis.it/api/permissions
+          VITE_API_BASE_URL=/backend/api
+          VITE_SIGNIN_REDIRECT_URI=login-redirect
+          VITE_SIGNOUT_REDIRECT_URI=login
+          VITE_SHOP_BASE_URL=https://nethshop.nethesis.it
+        cache-from: type=gha,scope=frontend
+        cache-to: type=gha,mode=max,scope=frontend
+
+    - name: Generate frontend SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ steps.image_prefix.outputs.PREFIX }}/frontend:${{ steps.version.outputs.VERSION }}
+        format: cyclonedx-json
+        output-file: frontend-sbom.cdx.json
+
+    - name: Extract proxy metadata
+      id: proxy_meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository }}/proxy
+        tags: |
+          type=semver,pattern=v{{version}},value=${{ steps.version.outputs.VERSION }}
+          type=raw,value=latest
+
+    - name: Build and push proxy Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: proxy
+        file: proxy/Containerfile
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.proxy_meta.outputs.tags }}
+        labels: |
+          ${{ steps.proxy_meta.outputs.labels }}
+          org.opencontainers.image.title=My Nethesis Proxy
+          org.opencontainers.image.description=Reverse proxy for My Nethesis
+        cache-from: type=gha,scope=proxy
+        cache-to: type=gha,mode=max,scope=proxy
+
+    - name: Generate proxy SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ steps.image_prefix.outputs.PREFIX }}/proxy:${{ steps.version.outputs.VERSION }}
+        format: cyclonedx-json
+        output-file: proxy-sbom.cdx.json
+
+    - name: Extract mimir metadata
+      id: mimir_meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository }}/mimir
+        tags: |
+          type=semver,pattern=v{{version}},value=${{ steps.version.outputs.VERSION }}
+          type=raw,value=latest
+
+    - name: Build and push mimir Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: services/mimir
+        file: services/mimir/Containerfile
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.mimir_meta.outputs.tags }}
+        labels: |
+          ${{ steps.mimir_meta.outputs.labels }}
+          org.opencontainers.image.title=My Nethesis Mimir
+          org.opencontainers.image.description=Grafana Mimir metrics backend for My Nethesis
+        cache-from: type=gha,scope=mimir
+        cache-to: type=gha,mode=max,scope=mimir
+
+    - name: Generate mimir SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ steps.image_prefix.outputs.PREFIX }}/mimir:${{ steps.version.outputs.VERSION }}
+        format: cyclonedx-json
+        output-file: mimir-sbom.cdx.json
+
+    # Create GitHub Release
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        generate_release_notes: true
+        files: |
+          backend/dist/*.tar.gz
+          sync/dist/*.tar.gz
+          collect/dist/*.tar.gz
+          backend-sbom.cdx.json
+          sync-sbom.cdx.json
+          collect-sbom.cdx.json
+          frontend-sbom.cdx.json
+          proxy-sbom.cdx.json
+          mimir-sbom.cdx.json

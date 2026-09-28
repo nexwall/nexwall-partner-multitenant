@@ -1,0 +1,93 @@
+<!--
+  Copyright (C) 2026 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
+import CounterCard from '@/components/common/CounterCard.vue'
+import AlertsTable from '@/components/alerts/AlertsTable.vue'
+import { useAlertsTotals } from '@/queries/alerts/alertsTotals'
+import { useAlerts } from '@/queries/alerts/alerts'
+import { SEVERITY_FILTER_OPTIONS } from '@/lib/alerts'
+
+const { t } = useI18n()
+const { state: totalsState } = useAlertsTotals()
+const { clearFilters, severityFilters, statusFilters, pageNum } = useAlerts()
+
+function filterBySeverity(id: string) {
+  clearFilters()
+  const option = SEVERITY_FILTER_OPTIONS.find((o) => o.id === id)
+  if (option) {
+    severityFilters.value = [option]
+  }
+  pageNum.value = 1
+}
+
+function filterByMuted() {
+  clearFilters()
+  statusFilters.value = [{ id: 'suppressed', label: t('alerts.muted') }]
+  pageNum.value = 1
+}
+
+const totals = computed(() => totalsState.value?.data)
+const isLoading = computed(() => totalsState.value?.status === 'pending')
+
+const totalCount = computed(() => totals.value?.active ?? 0)
+const criticalCount = computed(() => totals.value?.critical ?? 0)
+const warningCount = computed(() => totals.value?.warning ?? 0)
+const infoCount = computed(() => totals.value?.info ?? 0)
+const mutedCount = computed(() => totals.value?.muted ?? 0)
+</script>
+
+<template>
+  <div>
+    <!-- Counter cards -->
+    <div class="mb-10 grid gap-6 sm:grid-cols-6 xl:grid-cols-5">
+      <CounterCard
+        :title="t('alerts.total_alerts')"
+        :counter="totalCount"
+        :loading="isLoading"
+        colorClasses="text-secondary-neutral dark:text-secondary-neutral"
+        class="sm:col-span-3 xl:col-span-1"
+        @counter-click="clearFilters"
+      />
+      <CounterCard
+        :title="t('alerts.muted')"
+        :counter="mutedCount"
+        :loading="isLoading"
+        color-classes="text-secondary-neutral dark:text-secondary-neutral"
+        class="sm:col-span-3 xl:col-span-1"
+        @counter-click="filterByMuted"
+      />
+      <CounterCard
+        title="Critical"
+        :counter="criticalCount"
+        :loading="isLoading"
+        color-classes="text-rose-600 dark:text-rose-400"
+        class="sm:col-span-2 xl:col-span-1"
+        @counter-click="filterBySeverity('critical')"
+      />
+      <CounterCard
+        title="Warning"
+        :counter="warningCount"
+        :loading="isLoading"
+        color-classes="text-amber-600 dark:text-amber-400"
+        class="sm:col-span-2 xl:col-span-1"
+        @counter-click="filterBySeverity('warning')"
+      />
+      <CounterCard
+        title="Info"
+        :counter="infoCount"
+        :loading="isLoading"
+        color-classes="text-blue-600 dark:text-blue-400"
+        class="sm:col-span-2 xl:col-span-1"
+        @counter-click="filterBySeverity('info')"
+      />
+    </div>
+
+    <!-- Alerts table -->
+    <AlertsTable />
+  </div>
+</template>

@@ -1,0 +1,43 @@
+/* panel background */
+
+html[data-theme="light"] .logto_main-content {
+  background-color: oklch(98.5% 0.002 247.839) !important;
+}
+
+html[data-theme="dark"] .logto_main-content {
+  background-color: oklch(21% 0.034 264.665) !important;
+}
+
+/* input fields */
+
+html[data-theme="light"] input[type="email"],
+html[data-theme="light"] input[type="password"] {
+  background-color: white;
+}
+
+html[data-theme="dark"] input[type="email"],
+html[data-theme="dark"] input[type="password"] {
+  background-color: oklch(13% 0.028 261.692);
+}
+
+/* text color of primary button */
+html[data-theme="dark"] button.odkpo_large {
+  color:  oklch(13% 0.028 261.692);
+}
+
+/* text color of secondary buttons */
+
+html[data-theme="light"] button._0Rgzl_secondary {
+  color:  oklch(50.40% 0.128 245.46);
+}
+html[data-theme="dark"] button._0Rgzl_secondary {
+  color:  oklch(60.64% 0.159 246.97);
+}
+
+/* page background */
+
+.logto_page-container {
+  background-image: url("{{.BackgroundImage}}");
+  background-size: cover;
+  background-position: center;
+}

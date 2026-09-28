@@ -1,0 +1,64 @@
+//  Copyright (C) 2025 Nethesis S.r.l.
+//  SPDX-License-Identifier: GPL-3.0-or-later
+
+import type { AxiosError } from 'axios'
+import { normalize } from './common'
+
+export type BackendError = {
+  code: number
+  message: string
+  data: {
+    type: string
+    errors: { key: string; message: string }[]
+  }
+}
+
+export type ValidationIssue = Record<string, string[]>
+
+export const isValidationError = (error: Error | null): boolean => {
+  return isValidationErrorCode((error as AxiosError)?.response?.status)
+}
+
+////
+// The message the backend sent, falling back to the axios one. Axios leaves
+// error.message as "Request failed with status code 409", which tells the user
+// nothing: reach for response.data.message whenever the API bothered to explain
+// itself (e.g. "catalog item is referenced by existing grants").
+export const getBackendErrorMessage = (error: Error | null): string => {
+  const axiosError = error as AxiosError<{ message?: string }> | null
+  return axiosError?.response?.data?.message || axiosError?.message || ''
+}
+
+export const isValidationErrorCode = (errorCode: number | undefined) => {
+  if (!errorCode) {
+    return false
+  }
+  return [400, 409, 422].includes(errorCode)
+}
+
+export const getValidationIssues = (
+  axiosError: AxiosError,
+  i18nPrefix: string,
+): ValidationIssue => {
+  const issues: ValidationIssue = {}
+
+  if (axiosError.status && isValidationErrorCode(axiosError.status)) {
+    const backendError = axiosError.response?.data as BackendError
+    // Some validation-code responses (e.g. a 409 conflict) carry a plain message
+    // with `data: null` and no field errors — guard against that.
+    const validationErrors = backendError?.data?.errors || []
+
+    validationErrors.forEach((err: { key: string; message: string }) => {
+      // replace dots and spaces with underscores for i18n key
+      const key = err.key.replace(/\./g, '_')
+
+      if (!issues[key]) {
+        issues[key] = []
+      }
+
+      const normalizedMessage = normalize(err.message)
+      issues[key].push(`${i18nPrefix}.${key}_${normalizedMessage}`)
+    })
+  }
+  return issues
+}

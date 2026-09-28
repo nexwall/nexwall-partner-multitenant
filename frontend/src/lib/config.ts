@@ -1,0 +1,32 @@
+//  Copyright (C) 2025 Nethesis S.r.l.
+//  SPDX-License-Identifier: GPL-3.0-or-later
+
+export const PRODUCT_NAME = 'My Nethesis'
+
+// path requested by the OIDC provider to redirect the user after a successful login
+export const LOGIN_REDIRECT_URI = `${window.location.origin}/${import.meta.env.VITE_SIGNIN_REDIRECT_URI}`
+
+// go to the login page after a successful sign out
+export const SIGN_OUT_REDIRECT_URI = `${window.location.origin}/${import.meta.env.VITE_SIGNOUT_REDIRECT_URI}`
+
+// logto configuration
+export const LOGTO_ENDPOINT = import.meta.env.VITE_LOGTO_ENDPOINT
+export const LOGTO_APP_ID = import.meta.env.VITE_LOGTO_APP_ID
+// Indicator of the Logto API resource the access token is requested for. The
+// backend exchanges only JWT access tokens carrying it as audience and this
+// app as client, so a token any other application of the tenant obtains at
+// login cannot be turned into a my session. Must equal the backend's
+// LOGTO_API_RESOURCE (the resource `sync` pushes: {API_BASE_URL}/permissions).
+export const LOGTO_API_RESOURCE = import.meta.env.VITE_LOGTO_API_RESOURCE
+
+export const API_URL = import.meta.env.VITE_API_BASE_URL
+
+// NethShop base URL (no trailing slash) — where add-on deep-links and order
+// links point. Staging shop in dev/qa, live shop in production.
+export const SHOP_BASE_URL = import.meta.env.VITE_SHOP_BASE_URL
+
+// True only in builds made for the end-to-end suite (`npm run dev:e2e`, or the
+// CI e2e job). It suppresses background behaviour that races assertions —
+// query auto-refetch and the Pinia Colada devtools panel — and is never set in
+// a dev, qa or production build.
+export const IS_E2E = import.meta.env.VITE_E2E === 'true'

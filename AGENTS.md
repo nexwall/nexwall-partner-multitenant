@@ -1,0 +1,517 @@
+# MY (my.nethesis.it)
+
+`AGENTS.md` is source of truth. `CLAUDE.md` is symlink to it.
+
+Centralized authentication and management platform. Logto as IdP, RBAC with business hierarchy (Owner > Distributor > Reseller > Customer) and technical user roles (Owner, Staff, Admin, Support, Backoffice, Reader).
+
+**Version**: v0.5.0 (pre-production). Canonical source: `version.json`.
+
+---
+
+## 1. Critical Rules
+
+### 1.1 Pre-production mindset
+
+No users in production. Forbidden language in code, comments, docs:
+- Temporal: "was", "previously", "before", "has been", "used to"
+- Migration-flavored: "refactored", "migrated from", "deprecated", "legacy", "backward compatibility"
+
+The system IS designed the way it currently looks. Treat each change as the current design, not a migration. Remove temporal language on sight. No compatibility shims. Rule removed post-GA.
+
+### 1.2 Post-change verification (mandatory)
+
+After any code change, run the component's pre-commit before committing:
+
+```bash
+cd backend && make pre-commit      # fmt + lint + test + validate-docs (redocly)
+cd collect && make pre-commit      # fmt + lint + test
+cd sync && make pre-commit         # fmt + lint + test
+cd frontend && npm run pre-commit  # format + lint + type-check + test + build
+cd docs && make pre-commit         # type-check + build (broken links) + audit
+```
+
+**Touching authentication or authorization also requires `make test-authz`.** Before committing any change to routes, middleware, a handler's access check, the RBAC helpers, `sync/configs/config.yml`, or anything else in the auth/authz core, run:
+
+```bash
+cd backend && make test-authz      # ~3200 checks: every endpoint × every persona
+```
+
+`make pre-commit` does not cover this: unit tests cannot see a route wired to the wrong permission, a handler that compares organization ids instead of walking the hierarchy, or a list that leaks another tenant's rows. The suite fires the real API as real users of every (organization role × technical role) pair and fails on any unintended access. It needs a local backend and the fixture in place (`./apitool authz provision`, once). See §7.4 and `backend/authz/README.md`.
+
+Security updates: routine bumps are handled automatically by Dependabot/Renovate — do not chase them manually. What must not slip through is a release:
+
+```bash
+./vuln-check.sh --all              # every component; also run by release.sh
+cd docs && make audit              # one component (same target in backend/collect/sync)
+cd frontend && npm run audit
+```
+
+`vuln-check.sh` runs `npm audit` on the Node components (docs, frontend) and, when trivy is installed locally, the same `trivy fs` scan CI uploads to GitHub code scanning. It fails on HIGH and above (`NPM_LEVEL`, `SEVERITY` override the thresholds). `release.sh` runs it across all components and refuses to tag while anything is above threshold.
+
+Accepted risks live in `.trivyignore` with the reason they are accepted. A JS advisory needs **both** its CVE and its GHSA id there: the file is trivy's ignore file and the npm audit allowlist at the same time.
+
+### 1.3 Skills
+
+`.agents/skills/` holds task-specific skills (e.g. `frontend-conventions`, `frontend-a11y-audit`). Before touching matching files, read the skill's `SKILL.md` and follow it for the task's duration.
+
+### 1.4 Git commit messages
+
+- **Wrap the commit body at 72 columns — hard limit, always.** Keep the subject line ≤72 too.
+- Short and direct: summarize by theme, not a bullet list per fix.
+
+---
+
+## 2. Architecture
+
+### 2.1 Components (actual state of this branch)
+
+```
+my/
+  backend/        Go REST API (:8080). Gin, JWT, Logto integration. Main control plane.
+  collect/        Go inventory + Mimir proxy (:8081). Worker pool, Redis queues, HTTP Basic auth.
+  sync/           Go CLI (Cobra). Logto RBAC/org initialization and pull.
+  frontend/       Vue 3 + TS SPA. Vite, Tailwind, Pinia.
+  proxy/          nginx reverse proxy routing to backend/collect/frontend.
+  services/mimir/ Grafana Mimir single-node + multi-tenant Alertmanager. S3 backend.
+  services/support/    Artifacts only on this branch (prebuilt tunnel-client, examples). Source lives elsewhere.
+  services/ssh-gateway/ Placeholder only on this branch (.env + host key). Not implemented here.
+  docs/           Docusaurus site (published docs).
+  presentation/   Slides and mockups (out of scope for code work).
+```
+
+The six first-class components (tracked in `version.json`): backend, collect, sync, frontend, proxy, services/mimir. Do not attempt to build/run support or ssh-gateway from this branch.
+
+### 2.2 Authentication flow
+
+```
+Frontend --[Logto JWT access_token for the my API resource]--> POST /api/auth/exchange
+Backend validates it against the tenant JWKS (issuer, aud = LOGTO_API_RESOURCE,
+  client_id = LOGTO_FRONTEND_APP_ID, exp), fetches roles/permissions from the
+  Logto Management API
+Backend returns custom JWT (30m access + 7d rotating refresh) with embedded permissions
+Frontend uses custom JWT for subsequent calls
+```
+
+The SPA requests its access token with `resources: [LOGTO_API_RESOURCE]`. Only a JWT bound to that audience and to the SPA's client id is exchangeable: the opaque token any other application of the tenant obtains at login is refused, so a compromised third-party app cannot turn a user's login into a my session. `apitool` mirrors this (`logto_resource` in its registry). A suspended or soft-deleted account is refused at exchange, refresh and API-key authentication (`local.ErrUserInactive`), and every lifecycle change (single or organization cascade) revokes the tokens issued before it, keyed on the Logto ID.
+
+Custom JWT claims: user_id, user_roles, user_permissions, org_role, org_permissions, organization_id, plus `impersonated_by` when acting as another user.
+
+### 2.3 Impersonation
+
+Owner organization only (Staff and Owner user roles carry `impersonate:users`). `POST /api/impersonate` mints a JWT with the target user's permissions, expiring with the remaining consent window (not a fixed hour). Requires the target to have opted-in via `POST /api/impersonate/consent` (1-168h, default 1h; revoked with DELETE). All sessions and actions are audited via `impersonation_audit` middleware. No self-impersonation, no chaining. An account holding the Owner user role is never a target. `DELETE /api/impersonate` revokes the impersonation token and re-mints the impersonator's session from its current state (a suspended impersonator gets 401); `GET /api/impersonate/status` re-checks the target's consent before handing out a token. The consent and sessions endpoints refuse impersonation tokens (`DisableOnImpersonate`): they belong to the real account only.
+
+---
+
+## 3. Components
+
+### 3.1 Backend (`backend/`)
+
+Layered request flow:
+```
+main.go (routes + middleware chains)
+  --> middleware/ (logto.go, jwt.go, rbac.go, impersonation_audit.go, rate_limit.go, self_modification.go)
+  --> methods/ (handlers — one or more files per resource)
+  --> services/ (logto/, local/, alerting/, csvimport/, email/, export/)
+  --> entities/ (raw SQL, no ORM)
+```
+
+Notable backend `services/`:
+- `services/logto/` — Logto Management API client
+- `services/local/` — DB-backed domain services (users, systems, applications, etc.)
+- `services/alerting/` — Mimir Alertmanager client + YAML config renderer + email templates (en/it, firing/resolved)
+- `services/csvimport/` — CSV parsing for bulk import flows
+- `services/email/` — transactional email dispatch
+- `services/export/` — CSV/PDF export generation
+
+Notable `methods/` groupings:
+- Resource CRUD: `distributors.go`, `resellers.go`, `customers.go`, `users.go`, `systems.go`, `applications.go`
+- Bulk import/export: `*_import.go`, `*_export.go`, `import_helpers.go`
+- Alerting: `alerting.go` (backend-side — per-tenant config, active alerts from Mimir, history from DB)
+- Backups: `backups.go` (list/download/delete of appliance configuration backups stored on S3; purges the system's prefix on hard delete for GDPR)
+- Filters: `systems_filters.go`, `users_filters.go` — aggregation endpoints for UI filters
+- Other: `auth.go`, `impersonate.go`, `rebranding.go`, `inventory.go`, `organizations.go`, `roles.go`, `totals.go`, `validators/`
+
+Source of truth for routes: `backend/main.go`. Source of truth for the API contract: `backend/openapi.yaml` (validated by `make validate-docs`; edits to handlers require corresponding OpenAPI updates).
+
+### 3.2 Collect (`collect/`)
+
+Inventory ingestion + Mimir proxy + LinkFailed cron.
+
+```
+main.go
+  --> middleware/ (auth.go HTTP Basic with SHA256; webhook_auth.go Bearer token)
+  --> methods/ (inventory.go, heartbeat.go, system_info.go, rebranding.go,
+                mimir.go   — reverse proxy to Mimir Alertmanager with X-Scope-OrgID injection
+                alertmanager.go — /api/alert_history webhook receiver)
+  --> workers/ (InventoryWorker, DiffWorker, NotificationWorker, CleanupWorker,
+                QueueMonitorWorker, DelayedMessageWorker — all started by manager.go)
+  --> differ/ (YAML-configured JSON diff engine, severity/significance)
+  --> cron/ (heartbeat_monitor.go — alive/dead/zombie + LinkFailed alert poster)
+```
+
+Key properties:
+- Systems auth with HTTP Basic (`system_key:system_secret`, SHA256 in DB).
+- `/api/services/mimir/alertmanager/api/v2/{alerts,silences}[/*subpath]` proxied to Mimir with server-set `X-Scope-OrgID` and authoritative identity labels (`injectLabels` overwrites client values, strips when DB is NULL).
+- `/api/alert_history` receives Alertmanager resolved-alert webhooks with Bearer auth (constant-time compare, fail-closed). `organization_id` is resolved at write-time from `systems.system_key`; unknown keys are dropped.
+- `/api/systems/backups` ingests GPG-encrypted configuration backups from appliances. Stream body → S3 with SHA-256 `io.TeeReader`, metadata reconciled via same-key `CopyObject`, retention enforced inline under a Redis `SET NX` lock, per-system rate limit. Keys: `{org_id}/{system_key}/{backup_id}.{ext}`. Storage is any S3-compatible bucket configured via `BACKUP_S3_*` env vars (see `collect/README.md`).
+
+### 3.3 Sync (`sync/`)
+
+Cobra CLI. Commands: `init`, `sync`, `pull`, `prune`. Drives Logto setup and keeps local DB in sync.
+
+```
+cmd/sync/main.go
+  --> internal/cli/         (cobra commands)
+  --> internal/client/      (Logto API client, fetchAllPages[T], auth refresh)
+  --> internal/config/      (YAML config loading — configs/config.yml)
+  --> internal/sync/        (push engine: Config -> Logto)
+        engine.go           orchestration
+        roles.go / organization.go / resources.go / applications.go
+        pull_engine.go      Logto -> local DB
+```
+
+`IsSystemEntityByPatterns` detects Logto system entities to skip. `upsertOrganizationEntity` handles distributor/reseller/customer upserts uniformly. Dry-run available on all commands.
+
+### 3.4 Frontend (`frontend/`)
+
+Vue 3 + TypeScript, Vite, Tailwind, Pinia. Alerting UI present (`src/views/AlertingView.vue`, `src/queries/alerting/`, `src/lib/alerting.ts`). Pre-commit includes build step to catch TS errors and Vite misconfigs.
+
+### 3.5 Mimir (`services/mimir/`)
+
+Single-node Grafana Mimir with S3-compatible backend and multi-tenant Alertmanager. Containerfile, Makefile, docker-compose.yml + docker-compose.local.yml. `scripts/` contains Python helpers (`alert.py`, `alerting_config.py`) for manual testing.
+
+**Alerting integration**:
+- Backend (`backend/services/alerting/`) holds one `AlertingConfigLayer` per organization in `alert_config_layers` (flat recipient-based shape: `enabled`, `email_recipients[]`, `webhook_recipients[]`, `telegram_recipients[]`, each recipient carries its own `severities[]`; email also `language` + `format`). The effective per-tenant Mimir YAML is the server-side merge of every layer from Owner down to the tenant (union dedup, additive-only). `/alerts/config` only ever returns the caller's own layer — the merged view is internal and never leaves the backend. Templates are Go `html/template`-embedded, en/it locales, firing + resolved variants; both languages ship with every tenant push and the renderer picks per email recipient via per-language dispatchers (`alert_<lang>.html|txt|subject`).
+- Collect proxies systems to Alertmanager `alerts`/`silences` with `X-Scope-OrgID` from the authenticated system's org.
+- Alertmanager webhooks resolved alerts back to collect `/api/alert_history`, which persists them scoped by `organization_id` (column on `alert_history`, populated from the DB via `system_key` lookup — never trusted from the payload).
+- RBAC: `/alerts/config*` is gated on a dedicated `alerts` resource (`read:alerts` for GET, `manage:alerts` for POST/DELETE) — admin/super only. The list/silence endpoints (`/alerts`, `/alerts/history`, `/alerts/silences*`, `/alerts/activity/:fingerprint`, `/systems/:id/alerts*`) stay on `read:systems`/`manage:systems`. The cross-system `/alerts/silences*` set mirrors `/systems/:id/alerts/silences*` 1:1 — same backend `buildSystemAlertSilenceRequest` builds the Mimir payload, so a silence created via either route is interoperable with the other.
+
+### 3.6 Proxy (`proxy/`)
+
+nginx. Routes `/api/*` (backend), `/api/services/mimir/*` and `/api/alert_history` (collect), everything else to frontend. Mixed TLS certs under `my.localtest.me+*.pem` for local dev.
+
+---
+
+## 4. Authorization & RBAC
+
+### 4.1 Hierarchy (org_role, case-insensitive; **always lowercase in code switches**)
+
+```
+Owner (Nethesis) > Distributors > Resellers > Customers
+```
+
+- **Owner**: full control, can target any org via `?organization_id=X`
+- **Distributor**: manages own resellers + their customers
+- **Reseller**: manages own customers
+- **Customer**: read-only on own data; most alerting endpoints auto-pin to `user.OrganizationID` regardless of query params
+
+### 4.2 User roles (technical capability)
+
+- **Owner** — the technical role of the bootstrap `owner` account only, seeded by `sync init`. **Never assignable**: `GET /api/roles` never returns it and create/update refuse it (`validateOwnerOrgRolePairing`). It carries everything Staff has plus `destroy:systems|users`, and it is the only role that may manage the Owner organization's own membership (create/move/update/delete/suspend/restore its users — `models.HasOwnerUserRole` gates).
+- **Staff** — Nethesis cross-cutting employees, **Owner organization only**. All non-destructive technical scopes (read/manage on systems, users, applications, alerts + `config:alerts`, entitlements, rebranding) plus `impersonate:users` and `connect:systems`. No `destroy:systems|users`. Assignable only into the Owner organization, and only by an Owner-role caller.
+- **Admin** — system/user/application management, add-on purchases, rebranding of its own organization
+- **Backoffice** — user and application management, add-on licensing
+- **Support** — systems, applications and alerts; read-focused elsewhere
+- **Reader** — read-only
+
+Every member of the Owner organization shares the **Owner organization role** (global reach + `destroy:distributors|resellers|customers`): the org role no longer distinguishes the break-glass account from Staff — the **user role** does. `methods.IsOwnerOrgMember` is the owner-level-authority check used by the administrative surfaces (entitlement catalog and grants, rebranding enablement, promotion); the break-glass-only gates key on `models.HasOwnerUserRole` instead.
+
+Role/organization pairing is fail-closed (`services/local/users.go: validateOwnerOrgRolePairing`): inside the Owner organization only `Staff` is assignable; `Staff` is never assignable outside it; `Owner` is never assignable at all.
+
+### 4.3 Effective permissions
+
+```
+effective = org_permissions (from org_role) UNION user_permissions (from user_roles)
+```
+
+Embedded in the custom JWT at exchange time. No external calls during request handling.
+
+### 4.4 Route protection
+
+- `middleware.RequirePermission("read:systems")` — single permission gate
+- `middleware.RequireResourcePermission("systems")` — HTTP-verb-aware: `read:` on GET, `manage:` on **POST/PUT/PATCH/DELETE alike** (`middleware/rbac.go`). `destroy:` is never derived from the verb — an endpoint that needs it says so explicitly, e.g. `middleware.RequirePermission("destroy:systems")` on `/systems/:id/destroy`
+- `middleware.RequireResourcePermissionOrSelf("resellers")` — as above, plus a GET on the caller's own organization is always allowed (org roles carry permissions for the levels *below*, so without this a reseller could not read itself)
+- `middleware.PreventSelfModification()` — blocks a user from acting on their own account for dangerous verbs
+- Hierarchy check for cross-org reads/writes: `local.UserService.IsOrganizationInHierarchy(orgRole, userOrgID, targetOrgID)`
+- RBAC filtering in SQL: `helpers.AppendOrgFilter(query, orgRole, orgID, tableAlias, args, nextArgIdx)` uses `GetAllowedOrgIDsForFilter` (cached org-ID set) for non-owner roles
+
+---
+
+## 5. Shared Infrastructure
+
+PostgreSQL and Redis are shared by backend and collect. **Use `podman` locally, not `docker`.**
+
+| Resource  | Container     | Port | Connection                                                              |
+| --------- | ------------- | ---- | ----------------------------------------------------------------------- |
+| Postgres  | `my-postgres` | 5432 | `postgresql://noc_user:noc_password@localhost:5432/noc?sslmode=disable` |
+| Redis     | `my-redis`    | 6379 | `redis://localhost:6379`                                                |
+
+Makefile shortcuts (from any Go component dir):
+```bash
+make dev-up    # starts postgres + redis
+make dev-down
+make db-migrate         # applies all pending backend migrations
+make db-migration MIGRATION=019 ACTION=apply|rollback|status
+make redis-flush
+make redis-cli
+```
+
+Direct DB access: `podman exec -it my-postgres psql -U noc_user -d noc`.
+
+---
+
+## 6. Coding Patterns
+
+### 6.1 Entity IDs
+
+Entities synced with Logto (orgs, users) carry both `id` (DB UUID) and `logto_id` (Logto's ID).
+
+- **URL params** (`:id`): use `logto_id` for users/distributors/resellers/customers. Use DB UUID for systems/applications.
+- **Request body fields**: use `logto_id` when assigning to an organization.
+- **Response**: always return BOTH `id` and `logto_id` (including nested org objects).
+- **SQL JOINs** on `organization_id`: match both formats:
+  ```sql
+  ON (t.organization_id = org.logto_id OR t.organization_id = org.id::text)
+  ```
+
+### 6.2 Error messages
+
+User-facing errors are **lowercase**. Example: `"the user has revoked consent for impersonation. please exit impersonation mode."`
+
+### 6.3 List response format
+
+```json
+{
+  "code": 200,
+  "message": "<resource> retrieved successfully",
+  "data": {
+    "<plural_resource>": [...],
+    "pagination": { "page", "page_size", "total_count", "total_pages",
+                    "has_next", "has_prev", "sort_by", "sort_direction" }
+  }
+}
+```
+
+Build pagination with `helpers.BuildPaginationInfoWithSorting(...)`. Reference `$ref: '#/components/schemas/Pagination'` in OpenAPI.
+
+### 6.4 SQL conventions
+
+- Raw SQL, no ORM. Use `database.DB.QueryRow/Query/Exec`.
+- Parameterized queries always (`$1`, `$2`). Never string-concatenate user input.
+- For dynamic `ORDER BY`: allowlist the column name before use (see `entities/local_alertmanager_history.go` for the pattern).
+- Handle `sql.ErrNoRows` explicitly.
+
+### 6.5 Go style
+
+- Go 1.24 across all components. `gofmt -s` compliant. `golangci-lint` clean.
+- Structured logging with zerolog (backend/collect) or custom logger (sync). Automatic redaction of secrets/tokens/passwords.
+- No comments that explain WHAT the code does — identifiers do that. Only comment non-obvious WHY.
+
+### 6.6 Alerting conventions (this branch)
+
+- **Never trust identity labels from clients**: `collect/methods/mimir.go:injectLabels` overwrites `system_*` and `organization_*` authoritatively. Empty DB values strip the label rather than leave the client's.
+- **`organization_id` on `alert_history`** is the single source of truth for tenant scoping. Never filter by `system_key` alone.
+- **`resolveOrgID` semantics** (`backend/methods/alerting.go`):
+  - Customer → pinned to own org (query param ignored)
+  - Distributor/Reseller → must pass `organization_id`, validated via hierarchy
+  - Owner → `organization_id` optional; empty means "aggregate all tenants" (only meaningful for totals/trend)
+  - Mimir-backed endpoints (`/alerts`, `/alerts/config`) reject empty via `requireOrgID`
+- **Webhook receiver URLs** validated against SSRF ranges (loopback, RFC1918, link-local, IMDS, non-http(s)).
+- **`system_key` in `SystemOverride`** must match `^[A-Za-z0-9_:.\-]+$` to avoid Alertmanager YAML matcher injection.
+
+---
+
+## 7. Testing
+
+### 7.1 Test tokens
+
+`make gen-tokens` is gone: it signed tokens locally, which referred to `org_id`s that did not exist in the database. Mint a real one with `apitool` instead (§7.3) — it runs the full Logto login + exchange, so the token carries a real organization and real permissions:
+
+```bash
+cd backend && ./apitool token owner            # or any user-key from `./apitool list`
+curl -H "Authorization: Bearer $(./apitool token owner | tail -1)" http://localhost:8080/api/alerts/totals
+```
+
+### 7.2 Running tests
+
+```bash
+cd <component> && make test            # all tests
+make test-coverage                     # coverage.html
+go test -race ./...                    # race detection
+go test -v ./<package>                 # focused
+```
+
+Backend integration tests use `testutils/` for mock users/tokens/JWT. SQL mocks via `github.com/DATA-DOG/go-sqlmock`.
+
+### 7.3 apitool — live end-to-end testing against a running backend
+
+`backend/apitool` (compiled binary, run from `backend/`) manages **real** OIDC test users, orgs and tokens via Logto login + token exchange — unlike §7.1 mock tokens, these exercise the full auth/RBAC path. State lives in `backend/.api-registry.json` (gitignored, 0600). Run `./apitool list` first: it shows the registered owner, orgs (name/type/logto_id) and users (key/email/role/org) already available, so you rarely need to create anything.
+
+```bash
+./apitool list                          # what's already registered: orgs + users + config
+./apitool token <user-key>              # fresh JWT for a registered user ("owner" for the owner)
+./apitool create-org <type> <name> --vat=<12 digits> [--data-<k>=<v>...] [--as=<user-key>]
+                                        # type: distributor|reseller|customer;
+                                        # --as makes the new org a child of that user's org
+./apitool create-user --org=<name> --email=<email> --name=<name> [--role=Admin] [--key=<alias>] [--as=<user-key>]
+./apitool create-system --org=<customer-name> <system-name> [--register]   # prints system_key + system_secret
+./apitool register-system <system_secret>   # public registration handshake (if --register was not used)
+./apitool delete-user <key> / delete-org <name>   # soft-delete + remove from registry
+./apitool cleanup-orphans --org=<name>
+```
+
+Typical e2e pattern (backend on `localhost:8080`, see §8.2):
+
+```bash
+TOKEN=$(./apitool token r1admin | tail -1)   # token prints last; user-key from `apitool list`
+curl -s http://localhost:8080/api/customers/<logto_id> -H "Authorization: Bearer $TOKEN"
+```
+
+Conventions: org endpoints take the **logto_id** (from `apitool list` or API responses), not the internal UUID. To test hierarchy/RBAC behavior, act as users of different orgs (e.g. a reseller admin vs. a sibling reseller vs. a distributor admin) and assert both the allowed (2xx) and denied (403) paths. For test emails use plus sub-addressing on a real inbox you own (`<name>+<tag>@nethesis.it`) so messages actually arrive and stay sortable.
+
+### 7.4 Authorization regression suite (`backend/authz/`)
+
+**Mandatory before any commit that touches the auth/authz core — routes, middleware, a handler's access check, the RBAC helpers, `sync/configs/config.yml`, or the hierarchy logic (§1.2).** It fires all 170 endpoints as every (org role × user role) persona against a real provisioned hierarchy, plus hand-written cross-organization scenarios, third-party app visibility and the credential-type rules (API key masks, impersonation, self-modification). ~3200 checks, non-destructive, local-only.
+
+```bash
+cd backend && make test-authz          # coverage + persona drift + all four layers
+./apitool authz provision              # one-time: create the fixture (idempotent)
+./apitool authz run --layer=scope --verbose --filter=reseller
+```
+
+Two rules when touching it:
+
+- **Never derive an expectation from the middleware you just wrote.** `authz/routes.yml` states what an endpoint *should* require, from the permission vocabulary in `config.yml`, the documented behaviour and what the endpoint does. A disagreement with the code is the finding — copying the wiring in makes the suite prove nothing.
+- **A new endpoint needs an entry.** `./apitool authz coverage` fails when `main.go` has a route `routes.yml` does not mention. That subcommand is offline and runs in `ci-main.yml` on every push — it also fails on a fixture user whose role no config defines. The rest of the suite needs a tenant and a local backend, so it stays a local gate.
+
+Deviations between the declared model (`effective = org_permissions ∪ user_permissions`) and what the backend really signs into the JWT live in `authz/model.yml`, each with the code that causes it. Full details, including known gaps and the findings from the first run, in `backend/authz/README.md`.
+
+### 7.5 Browser end-to-end suite (`frontend/e2e/`)
+
+Playwright specs that drive the real UI against a real backend — the layer §7.4 cannot reach: it proves the API refuses the wrong caller, not that the UI hides the button or scopes the table for that persona.
+
+```bash
+cd backend  && make dev-up && make run          # backend on :8080
+cd backend  && ./apitool authz provision        # personas + passwords, idempotent
+cd frontend && npm run test:e2e                          # local suite; npm run test:e2e:smoke targets QA
+cd frontend && npx playwright show-report       # screenshots, video, traces
+```
+
+Personas come from `backend/.api-registry.json`: `apitool` fixes a password on every user it creates, so the suite signs in through the real Logto form and needs no test-only code in the app. Only `storageState` is reused between specs — the app's JWT pair lives in `sessionStorage` and is re-minted per spec, because the backend rotates refresh tokens and treats a replayed one as theft.
+
+Two constraints worth knowing before touching it: the dev server must be on **port 5173** (the only origin registered as a Logto sign-in redirect URI), and `npm run dev:e2e` rather than `npm run dev` — the `VITE_E2E` flag suppresses query auto-refetch and the Colada devtools panel, both of which race assertions. `frontend/e2e/README.md` has the rest.
+
+---
+
+## 8. Development Workflow
+
+### 8.1 First-time setup
+
+```bash
+cd <component> && make dev-setup   # downloads deps, copies .env.example
+make dev-up                         # starts postgres + redis
+cd backend && make db-migrate
+```
+
+### 8.2 Running services
+
+```bash
+cd backend && make run             # :8080
+cd collect && make run             # :8081
+cd frontend && npm run dev         # :5173
+make run-qa                        # uses .env.qa (backend and collect)
+```
+
+### 8.3 Build & release
+
+```bash
+make build        # single platform -> build/
+make build-all    # linux/darwin/windows × amd64/arm64
+./release.sh patch|minor|major [--skip-tests]   # bumps version.json across all components; requires main == origin/main; runs unit tests and waits for passing CI fullstack + QA smoke runs of HEAD, unless skipped
+```
+
+---
+
+## 9. Database
+
+- **Master schema**: `backend/database/schema.sql` — complete current structure, used by fresh deployments.
+- **Migrations**: `backend/database/migrations/NNN_description.sql` + `NNN_description_rollback.sql`. Latest: **019_add_alert_history** (includes `organization_id` column for tenant scoping).
+- Any DB change MUST update BOTH the migration AND `schema.sql`. Fresh deployments use `schema.sql`; upgrades apply migrations.
+- Models under `backend/models/` and affected SQL queries must be updated alongside.
+- OpenAPI spec must be updated if response shapes change.
+
+---
+
+## 10. API
+
+### 10.1 Adding an endpoint
+
+1. Route in `backend/main.go` with middleware chain.
+2. Handler in `backend/methods/` (service/entity calls).
+3. Request/response models in `backend/models/`.
+4. **Update `backend/openapi.yaml`** (mandatory — validated by `make validate-docs`).
+5. `make pre-commit`.
+
+### 10.1b Naming — plural vs singular in path segments
+
+- **Plural** for collections with N elements addressable by ID: `/users`, `/systems`, `/alerts`, `/alerts/silences`, `/backups`. Any endpoint that supports `GET` list, `GET /:id`, `POST` create, or `DELETE /:id` belongs here.
+- **Singular** for singletons (one resource per parent) and for command/snapshot endpoints that accept a single payload and don't expose a collection: `/alerts/config`, `/me`, `/inventory`, `/heartbeat`.
+- Aggregate queries over a collection stay plural: `/alerts/totals`, `/alerts/trend`, `/systems/totals`.
+
+Apparent asymmetry like `/systems/:id/backups` (plural) next to `/systems/inventory` (singular) reflects this rule — `backups` is a multi-item collection, `inventory` is a single snapshot the client pushes and the server replaces.
+
+### 10.2 API reference
+
+Authoritative: `backend/openapi.yaml` (also `make docs` / redocly). High-level route groups in `backend/main.go`:
+
+```
+/api/health                         public
+/api/auth/*                         exchange/refresh public, rest JWT-protected
+/api/me, /api/me/*                  self-service profile + impersonation
+/api/distributors|resellers|customers/*    CRUD + import/export + totals/trend
+/api/users/*                        CRUD + avatar + import/export + password reset + suspend/reactivate
+/api/systems/*                      CRUD + inventory + alerts + regenerate-secret + reachability + export
+/api/applications/*                 CRUD + assign/unassign org + totals/summary/trend
+/api/alerts, /api/alerts/{totals,trend,stats,history,config}  active alerts + config + aggregates + history
+/api/alerts/silences/*                  cross-system silences (mute/unmute) — parallel to /systems/:id/alerts/silences
+/api/alerts/activity/:fingerprint       per-alert audit timeline (silence created/updated/removed)
+/api/filters/{systems,applications,users,alerts}  UI filter aggregation (alerts: static catalog + data-driven systems/severities/orgs)
+/api/rebranding/*                   organizations list/summary + enablement + per-org per-product assets
+/api/public/rebranding/*            unauthenticated, rate-limited asset binaries for <img> tags
+/api/organizations, /api/roles, /api/organization-roles  metadata
+/api/validators/vat/:entity_type    VAT validation
+/api/stats                          Owner-only platform stats
+
+# collect (:8081)
+POST /api/systems/inventory                   HTTP Basic
+POST /api/systems/heartbeat                   HTTP Basic
+ANY  /api/services/mimir/alertmanager/api/v2/{alerts,silences}[/*]   HTTP Basic (Mimir proxy)
+POST /api/alert_history                       Bearer (Alertmanager webhook)
+```
+
+If a route exists in `main.go` but isn't in `openapi.yaml`, that's the bug — fix `openapi.yaml`.
+
+---
+
+## 11. Component-specific pointers
+
+Operational runbooks and command cookbooks live with each component:
+
+- `backend/README.md` — backend-specific env, tooling, migrations.
+- `collect/README.md` — worker model, differ config, queue ops.
+- `sync/README.md` — init/sync/pull/prune workflows, Logto setup.
+- `services/mimir/README.md` — Mimir single-node setup, scripts.
+- `frontend/README.md` — Vue/Vite specifics.
+
+When implementing a feature, prefer consulting the component README over re-deriving from CLAUDE.md.
+
+---
+
+## 12. Common pitfalls
+
+- **Case-sensitivity on org_role**: JWT carries "Owner"/"Distributor"/etc.; middleware/jwt.go normalizes to lowercase. Always switch on lowercase values.
+- **`system_key` hidden for unregistered systems**: `GetSystem` blanks `SystemKey` when `RegisteredAt IS NULL`. Per-system alert endpoints return empty for unregistered systems — this is by design, not a bug.
+- **`X-Scope-OrgID` never from the request**: derived server-side from DB (collect) or JWT (backend). Treat any PR that lets it be set by the client as a security defect.
+- **Pre-commit OpenAPI validation**: uses `redocly` CLI. If missing, install via npm or the validate-docs target will fail silently in CI.
+- **`make audit` without trivy**: only the `npm audit` half runs, and Go modules and container layers are reported as skipped. Install it (`brew install trivy`) to get the same coverage CI has.
+- **`podman` vs `docker`**: local dev uses `podman`; Makefiles handle this but ad-hoc commands in docs examples may say `docker` — substitute accordingly.

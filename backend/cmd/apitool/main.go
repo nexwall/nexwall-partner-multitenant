@@ -1,0 +1,995 @@
+/*
+Copyright (C) 2026 Nethesis S.r.l.
+SPDX-License-Identifier: AGPL-3.0-or-later
+*/
+
+// apitool is a dev CLI that produces real, hierarchy-aware backend JWTs by
+// running the full OIDC login + /auth/exchange flow (the same a browser does).
+// It also creates test orgs/users autonomously and persists their credentials
+// in backend/.api-registry.json so subsequent token requests are one command.
+//
+// Replaces cmd/gentoken (which only signed locally and produced tokens whose
+// embedded org_id had no counterpart in the database).
+package main
+
+import (
+	"bufio"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"time"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(1)
+	}
+	cmd := os.Args[1]
+	args := os.Args[2:]
+
+	var err error
+	switch cmd {
+	case "init":
+		err = cmdInit(args)
+	case "token":
+		err = cmdToken(args)
+	case "create-org":
+		err = cmdCreateOrg(args)
+	case "set-apps":
+		err = cmdSetApps(args)
+	case "create-user":
+		err = cmdCreateUser(args)
+	case "list":
+		err = cmdList(args)
+	case "delete-user":
+		err = cmdDeleteUser(args)
+	case "delete-org":
+		err = cmdDeleteOrg(args)
+	case "create-system":
+		err = cmdCreateSystem(args)
+	case "register-system":
+		err = cmdRegisterSystem(args)
+	case "cleanup-orphans":
+		err = cmdCleanupOrphans(args)
+	case "oauth-probe":
+		err = cmdOAuthProbe(args)
+	case "refresh-roles":
+		err = cmdRefreshRoles(args)
+	case "authz":
+		err = cmdAuthz(args)
+	case "help", "-h", "--help":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
+		usage()
+		os.Exit(1)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, `apitool — manage real OIDC test tokens via login + exchange
+
+Usage:
+  apitool init
+      Set/refresh owner credentials and OIDC config.
+
+  apitool token <name>
+      Print a fresh JWT for a registered user. Use "owner" for the owner.
+
+  apitool create-org <type> <name> --vat=<12 digits> [--description=...]
+                                    [--data-<key>=<value>] [--as=<user-key>]
+                                    [--apps=<app,app,...>]
+      Create distributor|reseller|customer.
+      Repeat --data-<key>=<value> for any extra custom_data field
+      (e.g. --data-address='Via Roma 1' --data-language=it --data-email=...).
+      --as    acts as a non-owner user (e.g., the parent's admin), so the new
+              org becomes a child in the caller's hierarchy. Default: owner.
+      --apps  distributors only: the third-party portals its whole hierarchy
+              may use, by application name (e.g. nethshop.nethesis.it).
+              Omitted = no portal.
+
+  apitool set-apps <distributor-name|logto-id> --apps=<app,app,...>
+      Replace the portal list of a distributor (PUT /distributors/:id
+      third_party_apps) as the owner. --apps= (empty) clears it. Accepts a
+      registered org name or a raw Logto organization id, so it also serves
+      the one-off enablement on a shared environment.
+
+  apitool create-user --org=<name> --email=<email> --name=<name>
+                       [--role=Admin] [--username=...] [--key=<reg-name>]
+                       [--as=<user-key>]
+      Create a user under an org. Generates a strong password, fixes it via
+      PATCH /users/:id/password and saves credentials to the registry.
+      --key  alias under which the user is saved (default: email).
+      --as   acts as a non-owner user. Default: owner.
+
+  apitool list
+      Show registered config, owner, orgs and users.
+
+  apitool delete-user <key>
+      Soft-delete a registered user and remove from registry.
+
+  apitool delete-org <name>
+      Soft-delete a registered org and remove from registry. Will fail if it
+      still has child orgs/users; clean those out first.
+
+  apitool create-system --org=<name> <system-name> [--register]
+      Create a system under a customer org. Prints system_key + system_secret.
+      Pass --register to also complete the public registration handshake so the
+      system can immediately authenticate against collect (Mimir proxy,
+      heartbeat, inventory). Without --register an appliance must call
+      POST /systems/register before it can talk to collect.
+
+  apitool register-system <system_secret>
+      Complete the public registration handshake for an already-created system.
+      Returns the canonical system_key. Use this when --register was not passed
+      to create-system, or when re-registering after a credential rotation.
+
+  apitool cleanup-orphans --org=<name>
+      Soft-delete every user listed in <org> whose email is NOT in registry.
+      Useful to clean up users left over from earlier failed runs.
+
+  apitool oauth-probe <user-key> [--all | --app=<name>
+                                 | --client-id=<id> --redirect-uri=<uri>]
+                                [--scope=...]
+      Run a real OIDC authorization-code flow against third-party apps as
+      <user-key>, and compare two things:
+        portal — does the app appear in that user's /third-party-applications
+                 list (my filters it through access_control in custom_data)
+        IdP    — does Logto actually issue an authorization code
+      Only the second is a security boundary. "hidden + CODE ISSUED" means the
+      user can reach the app straight through its login URL and only the app's
+      own checks stand in the way. The client's redirect target is never
+      contacted: the Location header is inspected, not followed.
+      --all resolves the catalogue through the owner, so apps the probed user
+      cannot see are still targeted.
+
+  apitool refresh-roles
+      Fill in the technical role names (user_roles) of every registered user by
+      reading GET /users/:id as the owner. Needed for entries created before the
+      registry tracked roles; the authz suite keys its personas off them.
+
+  apitool authz <provision|run|coverage|teardown> [flags]
+      Authorization regression suite. See backend/authz/README.md.
+      Refuses to run against anything but a local backend unless
+      --i-know-this-is-not-local is passed: it creates orgs/users and fires
+      every endpoint of the API.
+
+Registry: backend/.api-registry.json (gitignored, file mode 0600)`)
+}
+
+func loadOrInit() (*Registry, error) {
+	return LoadRegistry()
+}
+
+// credsFor resolves the saved credentials for a registry key.
+// "" or "owner" means the saved owner credentials.
+func credsFor(r *Registry, key string) (email, password string, err error) {
+	if r.Config.LogtoEndpoint == "" {
+		return "", "", fmt.Errorf("not initialized; run: apitool init")
+	}
+	if key == "" || key == "owner" {
+		if r.Owner.Email == "" {
+			return "", "", fmt.Errorf("not initialized; run: apitool init")
+		}
+		return r.Owner.Email, r.Owner.Password, nil
+	}
+	u, ok := r.Users[key]
+	if !ok {
+		return "", "", fmt.Errorf("user %q not found in registry", key)
+	}
+	return u.Email, u.Password, nil
+}
+
+// loginAs returns an authenticated client logged in as the given registry key.
+// "" or "owner" means use the saved owner credentials.
+func loginAs(r *Registry, key string) (*Client, error) {
+	email, password, err := credsFor(r, key)
+	if err != nil {
+		return nil, err
+	}
+	client, err := NewClient(r.Config)
+	if err != nil {
+		return nil, err
+	}
+	if err := client.Login(email, password); err != nil {
+		return nil, fmt.Errorf("login as %q failed: %w", key, err)
+	}
+	return client, nil
+}
+
+func cmdInit(_ []string) error {
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Configuring apitool registry.")
+	fmt.Println("OIDC config + owner credentials will be saved (in cleartext) to", registryPath())
+	fmt.Println("Press Enter on any prompt to keep the value shown in [brackets].")
+	fmt.Println()
+
+	fmt.Println("=== OIDC config ===")
+	logtoEndpoint := prompt("Logto endpoint (e.g. https://your-tenant.logto.app)", r.Config.LogtoEndpoint)
+	logtoAppID := prompt("Logto app ID", r.Config.LogtoAppID)
+	logtoResource := prompt("Logto API resource indicator (backend LOGTO_API_RESOURCE)", r.Config.LogtoResource)
+	authBaseURL := prompt("Auth base URL (host that serves /login-redirect)", r.Config.AuthBaseURL)
+	backendURL := prompt("Backend URL (incl. /api suffix)", r.Config.BackendURL)
+	if logtoEndpoint == "" || logtoAppID == "" || logtoResource == "" || authBaseURL == "" || backendURL == "" {
+		return fmt.Errorf("all OIDC config fields are required")
+	}
+	r.Config = Config{
+		LogtoEndpoint: strings.TrimRight(logtoEndpoint, "/"),
+		LogtoAppID:    logtoAppID,
+		LogtoResource: logtoResource,
+		AuthBaseURL:   strings.TrimRight(authBaseURL, "/"),
+		BackendURL:    strings.TrimRight(backendURL, "/"),
+	}
+
+	fmt.Println()
+	fmt.Println("=== Owner credentials ===")
+	email := prompt("Owner email", r.Owner.Email)
+	pass := prompt("Owner password", "")
+	if email == "" || pass == "" {
+		return fmt.Errorf("email and password are required")
+	}
+	r.Owner.Email = email
+	r.Owner.Password = pass
+
+	fmt.Print("Verifying credentials... ")
+	client, err := NewClient(r.Config)
+	if err != nil {
+		fmt.Println("FAILED")
+		return err
+	}
+	if err := client.Login(email, pass); err != nil {
+		fmt.Println("FAILED")
+		return err
+	}
+	fmt.Println("OK")
+
+	if err := r.Save(); err != nil {
+		return err
+	}
+	fmt.Println("Registry saved to", registryPath())
+	return nil
+}
+
+func cmdToken(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: apitool token <name>")
+	}
+	name := args[0]
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+	client, err := loginAs(r, name)
+	if err != nil {
+		return err
+	}
+	fmt.Println(client.JWT())
+	return nil
+}
+
+func cmdCreateOrg(args []string) error {
+	flags, pos := parseFlags(args)
+	if len(pos) < 2 {
+		return fmt.Errorf("usage: apitool create-org <type> <name> [--vat=...] [--description=...]")
+	}
+	orgType := pos[0]
+	name := pos[1]
+	if !validOrgType(orgType) {
+		return fmt.Errorf("invalid org type %q (use distributor|reseller|customer)", orgType)
+	}
+
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+
+	customData := map[string]interface{}{}
+	if vat := flags["vat"]; vat != "" {
+		customData["vat"] = vat
+	}
+	if customData["vat"] == nil {
+		return fmt.Errorf("--vat=<12 digits> is required for all org types")
+	}
+	// Free-form custom_data fields via --data-<key>=<value>. Anything beyond
+	// the dedicated flags (vat, description, as) goes through this prefix so
+	// new fields don't require parser changes.
+	for k, v := range flags {
+		if key, ok := strings.CutPrefix(k, "data-"); ok && key != "" {
+			customData[key] = v
+		}
+	}
+
+	client, err := loginAs(r, flags["as"])
+	if err != nil {
+		return err
+	}
+
+	var apps []string
+	if raw, ok := flags["apps"]; ok {
+		if orgType != "distributor" {
+			return fmt.Errorf("--apps applies to distributors only: resellers and customers inherit the distributor's portals")
+		}
+		apps = splitApps(raw)
+	}
+
+	logtoID, err := client.CreateOrg(orgType, name, flags["description"], customData, apps)
+	if err != nil {
+		return err
+	}
+
+	r.Orgs[name] = Org{
+		Type:      orgType,
+		LogtoID:   logtoID,
+		Name:      name,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := r.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("Created %s %q (logto_id=%s) as %q\n", orgType, name, logtoID, defaultAs(flags["as"]))
+	return nil
+}
+
+// splitApps turns "a,b, c" into ["a","b","c"]; an empty string is an empty,
+// non-nil list, which the API reads as "clear the portals".
+func splitApps(raw string) []string {
+	apps := []string{}
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			apps = append(apps, part)
+		}
+	}
+	return apps
+}
+
+func cmdSetApps(args []string) error {
+	flags, pos := parseFlags(args)
+	if len(pos) < 1 {
+		return fmt.Errorf("usage: apitool set-apps <distributor-name|logto-id> --apps=<app,app,...>")
+	}
+	raw, ok := flags["apps"]
+	if !ok {
+		return fmt.Errorf("--apps=<app,app,...> is required (use --apps= to clear the list)")
+	}
+
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+
+	target := pos[0]
+	logtoID := target
+	if org, found := r.Orgs[target]; found {
+		if org.Type != "distributor" {
+			return fmt.Errorf("%q is a %s: portals are set on distributors only", target, org.Type)
+		}
+		logtoID = org.LogtoID
+	}
+
+	client, err := loginAs(r, "")
+	if err != nil {
+		return err
+	}
+	apps := splitApps(raw)
+	if err := client.SetDistributorThirdPartyApps(logtoID, apps); err != nil {
+		return err
+	}
+	fmt.Printf("Portals of distributor %s (logto_id=%s) set to [%s]\n", target, logtoID, strings.Join(apps, ", "))
+	return nil
+}
+
+func cmdCreateUser(args []string) error {
+	flags, _ := parseFlags(args)
+
+	orgKey := flags["org"]
+	email := flags["email"]
+	name := flags["name"]
+	roleName := flags["role"]
+	username := flags["username"]
+	regKey := flags["key"]
+
+	if orgKey == "" || email == "" || name == "" {
+		return fmt.Errorf("usage: apitool create-user --org=<name> --email=<email> --name=<name> [--role=Admin] [--username=...] [--key=<registry-name>]")
+	}
+	if roleName == "" {
+		roleName = "Admin"
+	}
+
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+	org, ok := r.Orgs[orgKey]
+	if !ok {
+		return fmt.Errorf("org %q not in registry (run: apitool list)", orgKey)
+	}
+
+	client, err := loginAs(r, flags["as"])
+	if err != nil {
+		return err
+	}
+
+	roles, err := client.GetRoles()
+	if err != nil {
+		return err
+	}
+	roleID, ok := roles[roleName]
+	if !ok {
+		var names []string
+		for k := range roles {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		return fmt.Errorf("role %q not found (available: %s)", roleName, strings.Join(names, ", "))
+	}
+
+	pw, err := generatePassword()
+	if err != nil {
+		return err
+	}
+
+	userID, err := client.CreateUser(email, name, username, org.LogtoID, []string{roleID})
+	if err != nil {
+		return err
+	}
+	if err := client.ResetPassword(userID, pw); err != nil {
+		return fmt.Errorf("user created (id=%s) but password reset failed: %w", userID, err)
+	}
+
+	if regKey == "" {
+		regKey = email
+	}
+	r.Users[regKey] = User{
+		Email:     email,
+		Username:  username,
+		Password:  pw,
+		LogtoID:   userID,
+		OrgRole:   org.Type,
+		UserRoles: []string{roleName},
+		OrgID:     org.LogtoID,
+		OrgName:   org.Name,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := r.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("Created user %q (logto_id=%s)\n", email, userID)
+	fmt.Printf("Registry key: %s\n", regKey)
+	return nil
+}
+
+func cmdList(_ []string) error {
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+	fmt.Println("Registry:", registryPath())
+	fmt.Println()
+	fmt.Println("=== Config ===")
+	if r.Config.LogtoEndpoint == "" {
+		fmt.Println("  (not initialized — run: apitool init)")
+	} else {
+		fmt.Printf("  logto_endpoint: %s\n", r.Config.LogtoEndpoint)
+		fmt.Printf("  logto_app_id:   %s\n", r.Config.LogtoAppID)
+		fmt.Printf("  logto_resource: %s\n", r.Config.LogtoResource)
+		fmt.Printf("  auth_base_url:  %s\n", r.Config.AuthBaseURL)
+		fmt.Printf("  backend_url:    %s\n", r.Config.BackendURL)
+	}
+	fmt.Println()
+	fmt.Println("=== Owner ===")
+	if r.Owner.Email != "" {
+		fmt.Printf("  email: %s\n", r.Owner.Email)
+	} else {
+		fmt.Println("  (not initialized — run: apitool init)")
+	}
+	fmt.Println()
+	fmt.Println("=== Orgs ===")
+	if len(r.Orgs) == 0 {
+		fmt.Println("  (none)")
+	} else {
+		var keys []string
+		for k := range r.Orgs {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			o := r.Orgs[k]
+			fmt.Printf("  %-30s %-12s %s\n", o.Name, o.Type, o.LogtoID)
+		}
+	}
+	fmt.Println()
+	fmt.Println("=== Users ===")
+	if len(r.Users) == 0 {
+		fmt.Println("  (none)")
+	} else {
+		var keys []string
+		for k := range r.Users {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			u := r.Users[k]
+			roles := strings.Join(u.UserRoles, ",")
+			if roles == "" {
+				roles = "?" // run: apitool refresh-roles
+			}
+			fmt.Printf("  %-30s %-30s %-12s %-12s in %s\n", k, u.Email, u.OrgRole, roles, u.OrgName)
+		}
+	}
+	return nil
+}
+
+func cmdDeleteUser(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: apitool delete-user <key>")
+	}
+	key := args[0]
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+	u, ok := r.Users[key]
+	if !ok {
+		return fmt.Errorf("user %q not in registry", key)
+	}
+	client, err := loginAs(r, "")
+	if err != nil {
+		return err
+	}
+	if err := client.DeleteUser(u.LogtoID); err != nil {
+		return err
+	}
+	delete(r.Users, key)
+	if err := r.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("Deleted user %q (logto_id=%s)\n", key, u.LogtoID)
+	return nil
+}
+
+func cmdDeleteOrg(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: apitool delete-org <name>")
+	}
+	name := args[0]
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+	org, ok := r.Orgs[name]
+	if !ok {
+		return fmt.Errorf("org %q not in registry", name)
+	}
+	client, err := loginAs(r, "")
+	if err != nil {
+		return err
+	}
+	if err := client.DeleteOrg(org.Type, org.LogtoID); err != nil {
+		return err
+	}
+	delete(r.Orgs, name)
+	if err := r.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("Deleted %s %q (logto_id=%s)\n", org.Type, name, org.LogtoID)
+	return nil
+}
+
+func cmdCreateSystem(args []string) error {
+	flags, pos := parseFlags(args)
+	orgKey := flags["org"]
+	if orgKey == "" || len(pos) < 1 {
+		return fmt.Errorf("usage: apitool create-system --org=<name> <system-name> [--register]")
+	}
+	systemName := pos[0]
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+	org, ok := r.Orgs[orgKey]
+	if !ok {
+		return fmt.Errorf("org %q not in registry", orgKey)
+	}
+	client, err := loginAs(r, flags["as"])
+	if err != nil {
+		return err
+	}
+	systemID, systemKey, systemSecret, err := client.CreateSystem(systemName, org.LogtoID)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Created system %q in org %q\n", systemName, orgKey)
+	fmt.Printf("  id=%s\n", systemID)
+	fmt.Printf("  system_key=%s\n", systemKey)
+	fmt.Printf("  system_secret=%s\n", systemSecret)
+
+	if flags["register"] == "true" {
+		if _, err := client.RegisterSystem(systemSecret); err != nil {
+			return fmt.Errorf("create succeeded but register failed: %w", err)
+		}
+		fmt.Println("  registered=true")
+	} else {
+		fmt.Println("  registered=false (pass --register to also complete the public registration handshake)")
+	}
+
+	fmt.Printf("\nPush alerts as this system (Basic Auth) through collect:\n")
+	fmt.Printf("  curl -u '%s:%s' http://localhost:18081/api/services/mimir/alertmanager/api/v2/alerts ...\n", systemKey, systemSecret)
+	return nil
+}
+
+func cmdRegisterSystem(args []string) error {
+	_, pos := parseFlags(args)
+	if len(pos) < 1 {
+		return fmt.Errorf("usage: apitool register-system <system_secret>")
+	}
+	secret := pos[0]
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+	// /systems/register is public — no JWT needed. Skip loginAs.
+	client, err := NewClient(r.Config)
+	if err != nil {
+		return err
+	}
+	systemKey, err := client.RegisterSystem(secret)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Registered system\n  system_key=%s\n", systemKey)
+	return nil
+}
+
+// cmdOAuthProbe runs a real OIDC authorization-code flow against a third-party
+// application as a registered user. It exists to separate two things that are
+// easy to conflate:
+//
+//   - whether the app shows up in the user's portal list, which my filters
+//     through the per-app access_control in Logto custom_data;
+//   - whether Logto itself authorizes that user for that client, which is the
+//     only actual security boundary.
+//
+// When "portal" says no and "IdP" says a code was issued, the access_control
+// entry is advisory: the user can reach the app straight through its login URL,
+// and only the app's own checks stand in the way.
+func cmdOAuthProbe(args []string) error {
+	flags, pos := parseFlags(args)
+	if len(pos) < 1 {
+		return fmt.Errorf("usage: apitool oauth-probe <user-key> [--all | --app=<name> | --client-id=<id> --redirect-uri=<uri>] [--scope=...]")
+	}
+	userKey := pos[0]
+
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+	email, password, err := credsFor(r, userKey)
+	if err != nil {
+		return err
+	}
+
+	scope := flags["scope"]
+	if scope == "" {
+		scope = ThirdPartyScope
+	}
+
+	// Build the target list.
+	var targets []ThirdPartyApp
+	if cid := flags["client-id"]; cid != "" {
+		redirect := flags["redirect-uri"]
+		if redirect == "" {
+			return fmt.Errorf("--client-id requires --redirect-uri")
+		}
+		targets = append(targets, ThirdPartyApp{ID: cid, Name: cid, RedirectURIs: []string{redirect}})
+	} else {
+		// Resolve through the owner, who sees more of the catalogue than the
+		// probed user: that is the point, we need to target apps the user
+		// cannot see.
+		ownerClient, err := loginAs(r, "owner")
+		if err != nil {
+			return fmt.Errorf("resolving app catalogue as owner: %w", err)
+		}
+		catalogue, err := ownerClient.ListThirdPartyApps()
+		if err != nil {
+			return err
+		}
+		want := flags["app"]
+		if want == "" && flags["all"] != "true" {
+			return fmt.Errorf("specify --all, --app=<name>, or --client-id with --redirect-uri\nowner sees: %s", appNames(catalogue))
+		}
+		for _, a := range catalogue {
+			if want == "" || a.Name == want {
+				targets = append(targets, a)
+			}
+		}
+		if len(targets) == 0 {
+			return fmt.Errorf("app %q not visible to owner; pass --client-id/--redirect-uri explicitly\nowner sees: %s", want, appNames(catalogue))
+		}
+	}
+
+	// What the probed user sees in the portal.
+	userClient, err := loginAs(r, userKey)
+	if err != nil {
+		return err
+	}
+	visibleApps, err := userClient.ListThirdPartyApps()
+	if err != nil {
+		return err
+	}
+	visible := map[string]bool{}
+	for _, a := range visibleApps {
+		visible[a.ID] = true
+	}
+
+	fmt.Printf("user: %s (%s)\n\n", userKey, email)
+	fmt.Printf("%-24s %-14s %-16s %s\n", "app", "portal", "IdP", "note")
+	fmt.Println(strings.Repeat("-", 92))
+
+	gap := 0
+	for _, app := range targets {
+		redirect := flags["redirect-uri"]
+		if redirect == "" {
+			if len(app.RedirectURIs) == 0 {
+				fmt.Printf("%-24s %-14s %-16s %s\n", trunc(app.Name, 24), yesNo(visible[app.ID]), "-", "no redirect URI registered")
+				continue
+			}
+			redirect = app.RedirectURIs[0]
+		}
+
+		// Fresh client per probe: its own cookie jar, so every run is a
+		// complete sign-in rather than riding an existing session.
+		probe, err := NewClient(r.Config)
+		if err != nil {
+			return err
+		}
+		out, err := probe.Authorize(email, password, AuthzRequest{
+			ClientID:    app.ID,
+			RedirectURI: redirect,
+			Scope:       scope,
+		})
+
+		idp, note := "", ""
+		switch {
+		case err != nil:
+			idp = "error"
+			note = err.Error()
+		case out.Code != "":
+			idp = "CODE ISSUED"
+			note = fmt.Sprintf("consent=%v", out.ConsentShown)
+		case out.OAuthError != "":
+			idp = "refused"
+			note = out.OAuthError
+		default:
+			idp = "no code"
+			note = "stopped at " + out.Stage
+		}
+		if !visible[app.ID] && out != nil && out.Code != "" {
+			gap++
+			note = "NOT in portal but IdP authorized -> " + note
+		}
+		fmt.Printf("%-24s %-14s %-16s %s\n", trunc(app.Name, 24), yesNo(visible[app.ID]), idp, trunc(note, 44))
+	}
+
+	fmt.Println(strings.Repeat("-", 92))
+	if gap > 0 {
+		fmt.Printf("%d app reachable at the IdP despite not being listed in the portal.\n", gap)
+		fmt.Println("access_control filters the portal only; the app's own checks are the real gate.")
+	} else {
+		fmt.Println("no gap: every app the IdP authorized is also listed in the portal.")
+	}
+	return nil
+}
+
+func appNames(apps []ThirdPartyApp) string {
+	names := make([]string, 0, len(apps))
+	for _, a := range apps {
+		names = append(names, a.Name)
+	}
+	return strings.Join(names, ", ")
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "visible"
+	}
+	return "hidden"
+}
+
+func trunc(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
+}
+
+func cmdCleanupOrphans(args []string) error {
+	flags, _ := parseFlags(args)
+	orgKey := flags["org"]
+	if orgKey == "" {
+		return fmt.Errorf("usage: apitool cleanup-orphans --org=<name>")
+	}
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+	org, ok := r.Orgs[orgKey]
+	if !ok {
+		return fmt.Errorf("org %q not in registry", orgKey)
+	}
+	client, err := loginAs(r, "")
+	if err != nil {
+		return err
+	}
+	known := map[string]bool{}
+	for _, u := range r.Users {
+		if u.OrgID == org.LogtoID {
+			known[strings.ToLower(u.Email)] = true
+		}
+	}
+	users, err := client.ListUsersInOrg(org.LogtoID)
+	if err != nil {
+		return err
+	}
+	for _, u := range users {
+		if known[strings.ToLower(u.Email)] {
+			continue
+		}
+		if err := client.DeleteUser(u.LogtoID); err != nil {
+			fmt.Printf("  FAILED to delete %s: %v\n", u.Email, err)
+			continue
+		}
+		fmt.Printf("  deleted %s (logto_id=%s)\n", u.Email, u.LogtoID)
+	}
+	return nil
+}
+
+// cmdRefreshRoles backfills User.UserRoles for registry entries that predate
+// the field. Roles are read one user at a time because the list endpoint does
+// not hydrate them.
+func cmdRefreshRoles(args []string) error {
+	flags, _ := parseFlags(args)
+
+	r, err := loadOrInit()
+	if err != nil {
+		return err
+	}
+	client, err := loginAs(r, flags["as"])
+	if err != nil {
+		return err
+	}
+
+	keys := make([]string, 0, len(r.Users))
+	for k := range r.Users {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	changed := 0
+	for _, k := range keys {
+		u := r.Users[k]
+		if u.LogtoID == "" {
+			fmt.Printf("  %-28s SKIP (no logto_id)\n", k)
+			continue
+		}
+		roles, err := client.GetUserRoles(u.LogtoID)
+		if err != nil {
+			fmt.Printf("  %-28s FAILED: %v\n", k, err)
+			continue
+		}
+		if len(roles) == 0 {
+			fmt.Printf("  %-28s no roles assigned\n", k)
+			continue
+		}
+		if strings.Join(u.UserRoles, ",") == strings.Join(roles, ",") {
+			fmt.Printf("  %-28s %s (unchanged)\n", k, strings.Join(roles, ","))
+			continue
+		}
+		u.UserRoles = roles
+		r.Users[k] = u
+		changed++
+		fmt.Printf("  %-28s %s\n", k, strings.Join(roles, ","))
+	}
+	if changed == 0 {
+		return nil
+	}
+	if err := r.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("\nUpdated %d user(s)\n", changed)
+	return nil
+}
+
+func defaultAs(s string) string {
+	if s == "" {
+		return "owner"
+	}
+	return s
+}
+
+// parseFlags splits "--key=value" args from positional ones. A bare "--flag"
+// becomes flags["flag"]="true".
+func parseFlags(args []string) (map[string]string, []string) {
+	flags := map[string]string{}
+	var pos []string
+	for _, a := range args {
+		if strings.HasPrefix(a, "--") {
+			kv := strings.SplitN(a[2:], "=", 2)
+			if len(kv) == 2 {
+				flags[kv[0]] = kv[1]
+			} else {
+				flags[kv[0]] = "true"
+			}
+		} else {
+			pos = append(pos, a)
+		}
+	}
+	return flags, pos
+}
+
+// generatePassword produces a strong password matching the backend policy
+// (12+ chars, upper/lower/digit/special, no 4+ repeats, no weak ascending
+// triplets like "abc" or "123" — case-insensitive). Fixed prefix supplies
+// the 4 character classes; entropy comes from random bytes encoded as
+// URL-safe base64. Retries until the candidate has no forbidden triplet.
+func generatePassword() (string, error) {
+	for attempt := 0; attempt < 64; attempt++ {
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		candidate := "Aa9!" + base64.RawURLEncoding.EncodeToString(b)
+		if !hasAscendingTriplet(candidate) {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("could not generate clean password after 64 attempts")
+}
+
+// hasAscendingTriplet reports whether the password (case-insensitive) contains
+// any 3-character ascending alphabetical or numeric sequence the backend's
+// password validator rejects (012-890, abc-xyz).
+func hasAscendingTriplet(s string) bool {
+	low := strings.ToLower(s)
+	for i := 0; i+2 < len(low); i++ {
+		a, b, c := low[i], low[i+1], low[i+2]
+		isAlpha := a >= 'a' && a <= 'z' && b >= 'a' && b <= 'z' && c >= 'a' && c <= 'z'
+		isDigit := a >= '0' && a <= '9' && b >= '0' && b <= '9' && c >= '0' && c <= '9'
+		if (isAlpha || isDigit) && b == a+1 && c == b+1 {
+			return true
+		}
+	}
+	return false
+}
+
+// stdinReader is shared across prompt() calls so a buffered Reader doesn't
+// swallow input that belongs to subsequent prompts when stdin is a pipe.
+var stdinReader = bufio.NewReader(os.Stdin)
+
+func prompt(label, def string) string {
+	if def != "" {
+		fmt.Printf("%s [%s]: ", label, def)
+	} else {
+		fmt.Printf("%s: ", label)
+	}
+	line, err := stdinReader.ReadString('\n')
+	if err != nil && line == "" {
+		return def
+	}
+	s := strings.TrimSpace(line)
+	if s == "" {
+		return def
+	}
+	return s
+}

@@ -1,0 +1,48 @@
+# Allowlist of known false positives and accepted risks.
+# Format: CVE-ID [expiration_date] [reason]
+#
+# Read natively by trivy (CI and `make audit`) and applied to `npm audit` by
+# ./vuln-check.sh, so a JS advisory needs its GHSA id here as well as its CVE
+# to be silenced by both tools. Every entry carries the reason it is accepted.
+
+# Alpine base image - common CVE that don't affect our use case
+CVE-2023-4039   # GCC related, not used in runtime
+CVE-2023-5156   # Glibc, minimal impact in containerized environment
+
+# Go standard library - often false positives for our use case
+CVE-2023-45283  # Go path/filepath, minimal risk in our context
+CVE-2023-45284  # Go path/filepath, minimal risk in our context
+
+# Development/test dependencies that don't affect production
+CVE-2023-29406  # Go testing package, dev only
+CVE-2023-29404  # Go testing package, dev only
+
+# Network related CVEs with minimal impact for our specific use case
+CVE-2023-45142  # OpenTelemetry, if using minimal telemetry
+
+# Docs site (Docusaurus) build/dev-time deps — never shipped in the statically
+# generated production site. No safe upgrade path. Added 2026-06-19.
+CVE-2026-55602  # http-proxy-middleware: runs only inside webpack-dev-server during local `docusaurus start`. Patched in v3+, which webpack-dev-server 5 is not API-compatible with. Absent from the static build.
+
+# golang.org/x/crypto/openpgp flagged as unmaintained (GO-2026-5932). The
+# advisory has no fixed version by design (the package is deprecated forever).
+# We never import the openpgp subpackage: x/crypto enters the graph only via
+# go-playground/validator/v10 -> x/crypto/sha3, and `go mod why` reports
+# "not needed" for openpgp in every module. Module-level false positive.
+# Added 2026-07-08.
+GO-2026-5932
+
+# image-size: DoS (infinite loop / huge allocation) on crafted ICNS, JXL and
+# HEIF buffers. Every published version (<= 2.0.2, the latest) is affected —
+# upstream has no fix. Reached only as @docusaurus/core -> @docusaurus/mdx-loader
+# -> image-size, which measures repo-authored images at `docusaurus build` time;
+# the input is never attacker-controlled and the package is absent from the
+# generated static site. Added 2026-08-28.
+CVE-2025-71329  # image-size: zero-valued size field, docs build-time only
+CVE-2025-71330  # image-size: crafted ICNS buffer, docs build-time only
+# The same two advisories under their npm/GitHub ids, for the npm audit side:
+GHSA-5p2g-fcmc-qvqq
+GHSA-w3rx-r6r6-pgpr
+
+# Note: Review this file regularly and update as needed
+# Always verify that ignored CVEs are truly not applicable to your use case

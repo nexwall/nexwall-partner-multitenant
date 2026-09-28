@@ -1,0 +1,139 @@
+name: PR - Remove Redirect URIs from Logto
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  remove-redirect-uris:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract PR number
+        id: pr
+        run: echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+
+      - name: Get Logto access token
+        id: logto-token
+        run: |
+          RESPONSE=$(curl -s -X POST "${{ secrets.LOGTO_BASE_URL }}/oidc/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=${{ secrets.LOGTO_M2M_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.LOGTO_M2M_CLIENT_SECRET }}" \
+            -d "resource=${{ secrets.LOGTO_BASE_URL }}/api" \
+            -d "scope=all")
+
+          ACCESS_TOKEN=$(echo $RESPONSE | jq -r '.access_token')
+          if [ "$ACCESS_TOKEN" = "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "Failed to get access token"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Get current application configuration
+        id: current-config
+        run: |
+          RESPONSE=$(curl -s -X GET "${{ secrets.LOGTO_BASE_URL }}/api/applications/${{ secrets.LOGTO_FRONTEND_APP_ID }}" \
+            -H "Authorization: Bearer ${{ steps.logto-token.outputs.token }}" \
+            -H "Content-Type: application/json")
+
+          echo "current_config<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESPONSE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Remove redirect URIs
+        run: |
+          # Extract current redirect URIs
+          CURRENT_REDIRECT_URIS=$(echo '${{ steps.current-config.outputs.current_config }}' | jq -r '.oidcClientMetadata.redirectUris // []')
+          CURRENT_POST_LOGOUT_URIS=$(echo '${{ steps.current-config.outputs.current_config }}' | jq -r '.oidcClientMetadata.postLogoutRedirectUris // []')
+
+          # Define URIs to remove for this PR (only proxy, services are private)
+          PR_PROXY_REDIRECT_URI="https://my-proxy-qa-pr-${{ steps.pr.outputs.number }}.onrender.com/login-redirect"
+          PR_PROXY_LOGOUT_URI="https://my-proxy-qa-pr-${{ steps.pr.outputs.number }}.onrender.com/login"
+
+          # Remove PR-specific URIs from existing ones
+          UPDATED_REDIRECT_URIS=$(echo "$CURRENT_REDIRECT_URIS" | jq --arg proxy "$PR_PROXY_REDIRECT_URI" '. - [$proxy]')
+          UPDATED_POST_LOGOUT_URIS=$(echo "$CURRENT_POST_LOGOUT_URIS" | jq --arg proxy "$PR_PROXY_LOGOUT_URI" '. - [$proxy]')
+
+          # Check if there are URIs to remove
+          REDIRECT_COUNT_BEFORE=$(echo "$CURRENT_REDIRECT_URIS" | jq 'length')
+          REDIRECT_COUNT_AFTER=$(echo "$UPDATED_REDIRECT_URIS" | jq 'length')
+          POST_LOGOUT_COUNT_BEFORE=$(echo "$CURRENT_POST_LOGOUT_URIS" | jq 'length')
+          POST_LOGOUT_COUNT_AFTER=$(echo "$UPDATED_POST_LOGOUT_URIS" | jq 'length')
+
+          if [ "$REDIRECT_COUNT_BEFORE" -eq "$REDIRECT_COUNT_AFTER" ] && [ "$POST_LOGOUT_COUNT_BEFORE" -eq "$POST_LOGOUT_COUNT_AFTER" ]; then
+            echo "ℹ️ No redirect URIs found for PR #${{ steps.pr.outputs.number }} to remove"
+            echo "Checked redirect URIs:"
+            echo "- $PR_PROXY_REDIRECT_URI"
+            echo "Checked post-logout redirect URIs:"
+            echo "- $PR_PROXY_LOGOUT_URI"
+            exit 0
+          fi
+
+          # Create the request body
+          REQUEST_BODY=$(jq -n \
+            --argjson redirectUris "$UPDATED_REDIRECT_URIS" \
+            --argjson postLogoutRedirectUris "$UPDATED_POST_LOGOUT_URIS" \
+            '{
+              oidcClientMetadata: {
+                redirectUris: $redirectUris,
+                postLogoutRedirectUris: $postLogoutRedirectUris
+              }
+            }')
+
+          echo "Request body:"
+          echo "$REQUEST_BODY" | jq .
+
+          # Update the application
+          RESPONSE=$(curl -s -X PATCH "${{ secrets.LOGTO_BASE_URL }}/api/applications/${{ secrets.LOGTO_FRONTEND_APP_ID }}" \
+            -H "Authorization: Bearer ${{ steps.logto-token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d "$REQUEST_BODY")
+
+          echo "Update response:"
+          echo "$RESPONSE" | jq .
+
+          # Check if the update was successful
+          if echo "$RESPONSE" | jq -e '.oidcClientMetadata.redirectUris' > /dev/null; then
+            echo "✅ Successfully removed redirect URIs for PR #${{ steps.pr.outputs.number }}"
+            echo "Removed redirect URIs:"
+            echo "- $PR_PROXY_REDIRECT_URI"
+            echo "Removed post-logout redirect URIs:"
+            echo "- $PR_PROXY_LOGOUT_URI"
+          else
+            echo "❌ Failed to update redirect URIs"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = '${{ steps.pr.outputs.number }}';
+            const proxyRedirectUri = `https://my-proxy-qa-pr-${prNumber}.onrender.com/login-redirect`;
+            const proxyLogoutUri = `https://my-proxy-qa-pr-${prNumber}.onrender.com/login`;
+
+            const body = [
+              '🗑️ **Redirect URIs Removed from Logto**',
+              '',
+              'The following redirect URIs have been automatically removed from the Logto application configuration:',
+              '',
+              '**Redirect URIs:**',
+              `- \`${proxyRedirectUri}\``,
+              '',
+              '**Post-logout redirect URIs:**',
+              `- \`${proxyLogoutUri}\``,
+              '',
+              `Cleanup completed for PR #${prNumber}.`
+            ].join('\n');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });

@@ -1,0 +1,609 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { CUSTOMERS_TABLE_ID, type Customer } from '@/lib/organizations/customers'
+import { PAGE_SIZE_OPTIONS } from '@/lib/tablePageSize'
+import { useCustomerFilters } from '@/queries/organizations/customerFilters'
+import {
+  faMagnifyingGlass,
+  faPenToSquare,
+  faBoxArchive,
+  faBuilding,
+  faCirclePause,
+  faCirclePlay,
+  faCircleCheck,
+  faRotateLeft,
+  faBomb,
+  faServer,
+  faEye,
+} from '@fortawesome/free-solid-svg-icons'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import {
+  NeTable,
+  NeTableHead,
+  NeTableHeadCell,
+  NeTableBody,
+  NeTableRow,
+  NeTableCell,
+  NePaginator,
+  NeButton,
+  NeEmptyState,
+  NeInlineNotification,
+  NeTextInput,
+  NeDropdown,
+  type SortEvent,
+  NeSortDropdown,
+  NeDropdownFilterV2,
+  type NeDropdownFilterV2Option,
+  type NeDropdownItem,
+} from '@nethesis/vue-components'
+import { computed, ref, watch } from 'vue'
+import UserAvatar from '@/components/users/UserAvatar.vue'
+import CreateOrEditCustomerDrawer from './CreateOrEditCustomerDrawer.vue'
+import { useI18n } from 'vue-i18n'
+import DeleteCustomerModal from './DeleteCustomerModal.vue'
+import SuspendCustomerModal from './SuspendCustomerModal.vue'
+import ReactivateCustomerModal from './ReactivateCustomerModal.vue'
+import RestoreCustomerModal from './RestoreCustomerModal.vue'
+import DestroyCustomerModal from './DestroyCustomerModal.vue'
+import { savePageSizeToStorage } from '@/lib/tablePageSize'
+import { useCustomers } from '@/queries/organizations/customers'
+import { canManageCustomers, canDestroyCustomers } from '@/lib/permissions'
+import router from '@/router'
+import UpdatingSpinner from '@/components/common/UpdatingSpinner.vue'
+import OrganizationDropdownFilter from '@/components/organizations/OrganizationDropdownFilter.vue'
+import CreatorOrganization from '@/components/organizations/CreatorOrganization.vue'
+
+const { isShownCreateCustomerDrawer = false } = defineProps<{
+  isShownCreateCustomerDrawer: boolean
+}>()
+
+const emit = defineEmits(['close-drawer'])
+
+const { t } = useI18n()
+const {
+  state,
+  asyncStatus,
+  pageNum,
+  pageSize,
+  textFilter,
+  statusFilter,
+  createdByFilter,
+  organizationFilter,
+  includeHierarchy,
+  sortBy,
+  sortDescending,
+  areDefaultFiltersApplied,
+  resetFilters,
+  resetStatusFilter,
+} = useCustomers()
+const { state: customerFiltersState } = useCustomerFilters()
+
+const currentCustomer = ref<Customer | undefined>()
+const isShownCreateOrEditCustomerDrawer = ref(false)
+const isShownDeleteCustomerDrawer = ref(false)
+const isShownSuspendCustomerModal = ref(false)
+const isShownReactivateCustomerModal = ref(false)
+const isShownRestoreCustomerModal = ref(false)
+const isShownDestroyCustomerModal = ref(false)
+
+const statusFilterOptions = ref<NeDropdownFilterV2Option[]>([
+  {
+    id: 'enabled',
+    label: t('common.enabled'),
+  },
+  {
+    id: 'suspended',
+    label: t('common.suspended'),
+  },
+  {
+    id: 'deleted',
+    label: t('common.archived'),
+  },
+])
+
+const createdByFilterOptions = computed<NeDropdownFilterV2Option[]>(() => {
+  if (!customerFiltersState.value.data || !customerFiltersState.value.data.created_by) {
+    return []
+  } else {
+    return customerFiltersState.value.data.created_by.map((createdBy) => ({
+      id: createdBy.user_id,
+      label: createdBy.name,
+      description: createdBy.organization_name,
+    }))
+  }
+})
+
+const customersPage = computed(() => {
+  return state.value.data?.customers
+})
+
+const pagination = computed(() => {
+  return state.value.data?.pagination
+})
+
+const isNoDataEmptyStateShown = computed(() => {
+  return (
+    !customersPage.value?.length &&
+    state.value.status === 'success' &&
+    areDefaultFiltersApplied.value
+  )
+})
+
+const isNoMatchEmptyStateShown = computed(() => {
+  return (
+    !customersPage.value?.length &&
+    state.value.status === 'success' &&
+    !areDefaultFiltersApplied.value
+  )
+})
+
+const noEmptyStateShown = computed(() => {
+  return !isNoDataEmptyStateShown.value && !isNoMatchEmptyStateShown.value
+})
+
+watch(
+  () => isShownCreateCustomerDrawer,
+  () => {
+    if (isShownCreateCustomerDrawer) {
+      showCreateCustomerDrawer()
+    }
+  },
+  { immediate: true },
+)
+
+function showCreateCustomerDrawer() {
+  currentCustomer.value = undefined
+  isShownCreateOrEditCustomerDrawer.value = true
+}
+
+function showEditCustomerDrawer(customer: Customer) {
+  currentCustomer.value = customer
+  isShownCreateOrEditCustomerDrawer.value = true
+}
+
+function showDeleteCustomerDrawer(customer: Customer) {
+  currentCustomer.value = customer
+  isShownDeleteCustomerDrawer.value = true
+}
+
+function showRestoreCustomerModal(customer: Customer) {
+  currentCustomer.value = customer
+  isShownRestoreCustomerModal.value = true
+}
+
+function showSuspendCustomerModal(customer: Customer) {
+  currentCustomer.value = customer
+  isShownSuspendCustomerModal.value = true
+}
+
+function showReactivateCustomerModal(customer: Customer) {
+  currentCustomer.value = customer
+  isShownReactivateCustomerModal.value = true
+}
+
+function showDestroyCustomerModal(customer: Customer) {
+  currentCustomer.value = customer
+  isShownDestroyCustomerModal.value = true
+}
+
+function onCloseDrawer() {
+  isShownCreateOrEditCustomerDrawer.value = false
+  emit('close-drawer')
+}
+
+function getKebabMenuItems(customer: Customer) {
+  const items: NeDropdownItem[] = []
+
+  if (canManageCustomers()) {
+    if (!customer.deleted_at) {
+      items.push({
+        id: 'editCustomer',
+        label: t('common.edit'),
+        icon: faPenToSquare,
+        action: () => showEditCustomerDrawer(customer),
+        disabled: asyncStatus.value === 'loading',
+      })
+    }
+
+    if (customer.suspended_at) {
+      items.push({
+        id: 'reactivateCustomer',
+        label: t('common.reactivate'),
+        icon: faCirclePlay,
+        action: () => showReactivateCustomerModal(customer),
+        disabled: asyncStatus.value === 'loading',
+      })
+
+      items.push({
+        id: 'deleteCustomer',
+        label: t('common.archive'),
+        icon: faBoxArchive,
+        danger: true,
+        action: () => showDeleteCustomerDrawer(customer),
+        disabled: asyncStatus.value === 'loading',
+      })
+    } else if (customer.deleted_at) {
+      items.push({
+        id: 'restoreCustomer',
+        label: t('common.restore'),
+        icon: faRotateLeft,
+        action: () => showRestoreCustomerModal(customer),
+        disabled: asyncStatus.value === 'loading',
+      })
+    } else {
+      items.push({
+        id: 'suspendCustomer',
+        label: t('common.suspend'),
+        icon: faCirclePause,
+        action: () => showSuspendCustomerModal(customer),
+        disabled: asyncStatus.value === 'loading',
+      })
+
+      items.push({
+        id: 'deleteCustomer',
+        label: t('common.archive'),
+        icon: faBoxArchive,
+        danger: true,
+        action: () => showDeleteCustomerDrawer(customer),
+        disabled: asyncStatus.value === 'loading',
+      })
+    }
+  }
+
+  if (canDestroyCustomers()) {
+    items.push({
+      id: 'destroyCustomer',
+      label: t('common.destroy'),
+      icon: faBomb,
+      danger: true,
+      action: () => showDestroyCustomerModal(customer),
+      disabled: asyncStatus.value === 'loading',
+    })
+  }
+  return items
+}
+
+const onSort = (payload: SortEvent) => {
+  sortBy.value = payload.key as keyof Customer
+  sortDescending.value = payload.descending
+}
+
+const goToCustomerDetails = (customer: Customer) => {
+  router
+    .push({ name: 'customer_detail', params: { companyId: customer.logto_id } })
+    .catch((error) => {
+      // router.push() swallows navigation failures by default; log them so an
+      // intermittent "URL changes but the page doesn't" report leaves a trace
+      console.error('[goToCustomerDetails]', error)
+    })
+}
+</script>
+
+<template>
+  <div>
+    <!-- get customers error notification -->
+    <NeInlineNotification
+      v-if="state.status === 'error'"
+      kind="error"
+      :title="$t('customers.cannot_retrieve_customers')"
+      :description="state.error.message"
+      class="mb-6"
+    />
+    <!-- company hierarchy filter notification -->
+    <NeInlineNotification
+      v-if="includeHierarchy && organizationFilter.length === 1"
+      kind="info"
+      :title="$t('customers.hierarchy_filter_title')"
+      :description="
+        $t('customers.hierarchy_filter_description', { name: organizationFilter[0].label })
+      "
+      :secondary-button-label="$t('customers.hierarchy_filter_exact')"
+      class="mb-6"
+      @secondary-click="includeHierarchy = false"
+    />
+    <!-- table toolbar -->
+    <div class="mb-6 flex items-center gap-4">
+      <div class="flex w-full items-end justify-between gap-4">
+        <!-- filters -->
+        <div class="flex flex-wrap items-center gap-4">
+          <!-- text filter -->
+          <NeTextInput
+            v-model="textFilter"
+            @blur="textFilter = textFilter.trim()"
+            is-search
+            :placeholder="$t('customers.filter_customers')"
+            class="max-w-48 sm:max-w-sm"
+          />
+          <!-- status filter -->
+          <NeDropdownFilterV2
+            v-model="statusFilter"
+            kind="checkbox"
+            :label="t('common.status')"
+            :options="statusFilterOptions"
+            :show-clear-filter="false"
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+            :custom-action-label="t('ne_dropdown_filter.reset_selection')"
+            @custom-action="resetStatusFilter"
+          />
+          <!-- parent company filter: the reseller or distributor the customer belongs to -->
+          <OrganizationDropdownFilter
+            v-model="organizationFilter"
+            :organization-types="['distributor', 'reseller']"
+            :label="t('organizations.parent_company')"
+          />
+          <!-- created by filter -->
+          <NeDropdownFilterV2
+            v-model="createdByFilter"
+            kind="checkbox"
+            :disabled="customerFiltersState.status === 'pending'"
+            :label="t('systems.created_by')"
+            :options="createdByFilterOptions"
+            show-options-filter
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+          />
+          <NeSortDropdown
+            v-model:sort-key="sortBy"
+            v-model:sort-descending="sortDescending"
+            :label="t('sort.sort')"
+            :options="[
+              { id: 'name', label: t('organizations.name') },
+              { id: 'creator_name', label: t('systems.created_by') },
+              { id: 'suspended_at', label: t('common.status') },
+            ]"
+            :open-menu-aria-label="t('ne_dropdown.open_menu')"
+            :sort-by-label="t('sort.sort_by')"
+            :sort-direction-label="t('sort.direction')"
+            :ascending-label="t('sort.ascending')"
+            :descending-label="t('sort.descending')"
+          />
+          <NeButton kind="tertiary" @click="resetFilters">
+            {{ t('common.reset_filters') }}
+          </NeButton>
+        </div>
+        <!-- update indicator -->
+        <UpdatingSpinner v-if="asyncStatus === 'loading' && state.status !== 'pending'" />
+      </div>
+    </div>
+    <!-- empty state -->
+    <NeEmptyState
+      v-if="isNoDataEmptyStateShown"
+      :title="$t('customers.no_customer')"
+      :icon="faBuilding"
+      class="bg-white dark:bg-gray-950"
+    />
+    <!-- no customer matching filter -->
+    <NeEmptyState
+      v-else-if="isNoMatchEmptyStateShown"
+      :title="$t('customers.no_customer_found')"
+      :description="$t('common.try_changing_search_filters')"
+      :icon="faMagnifyingGlass"
+      class="bg-white dark:bg-gray-950"
+    >
+      <NeButton kind="tertiary" @click="resetFilters"> {{ $t('common.reset_filters') }}</NeButton>
+    </NeEmptyState>
+    <NeTable
+      v-if="noEmptyStateShown"
+      :sort-key="sortBy"
+      :sort-descending="sortDescending"
+      :aria-label="$t('customers.title')"
+      card-breakpoint="2xl"
+      :loading="state.status === 'pending'"
+      :skeleton-columns="5"
+      :skeleton-rows="7"
+    >
+      <NeTableHead>
+        <NeTableHeadCell sortable column-key="name" @sort="onSort">{{
+          $t('organizations.name')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell>{{ $t('organizations.vat_number') }}</NeTableHeadCell>
+        <NeTableHeadCell>
+          {{ $t('systems.title') }}
+        </NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="creator_name" @sort="onSort">{{
+          $t('systems.created_by')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="suspended_at" @sort="onSort">{{
+          $t('common.status')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell>
+          <!-- no header for actions -->
+        </NeTableHeadCell>
+      </NeTableHead>
+      <NeTableBody>
+        <NeTableRow v-for="item in customersPage" :key="item.logto_id">
+          <NeTableCell :data-label="$t('organizations.name')">
+            <router-link
+              v-if="!item.deleted_at"
+              :to="{ name: 'customer_detail', params: { companyId: item.logto_id } }"
+              class="cursor-pointer font-medium hover:underline"
+            >
+              {{ item.name }}
+            </router-link>
+            <span v-else class="opacity-50">
+              {{ item.name }}
+            </span>
+          </NeTableCell>
+          <NeTableCell
+            :data-label="$t('organizations.vat_number')"
+            :class="{ 'opacity-50': item.deleted_at }"
+          >
+            {{ item.custom_data?.vat || '-' }}
+          </NeTableCell>
+          <NeTableCell :data-label="$t('systems.title')">
+            <router-link
+              v-if="!item.deleted_at"
+              :to="{
+                name: 'systems',
+                query: { organization_id: item.logto_id, organization_name: item.name },
+              }"
+              class="flex items-center gap-2 hover:underline"
+              :aria-label="$t('customers.show_customer_systems', { name: item.name })"
+            >
+              <FontAwesomeIcon
+                :icon="faServer"
+                class="text-icon-neutral size-4"
+                aria-hidden="true"
+              />
+              {{ item.systems_count }}
+            </router-link>
+            <div v-else class="flex items-center gap-2 opacity-50">
+              <FontAwesomeIcon
+                :icon="faServer"
+                class="text-icon-neutral size-4"
+                aria-hidden="true"
+              />
+              {{ item.systems_count }}
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('systems.created_by')">
+            <div :class="{ 'opacity-50': item.deleted_at }">
+              <template v-if="item.created_by">
+                <div class="flex items-center gap-2">
+                  <UserAvatar
+                    size="sm"
+                    :is-owner="item.created_by.username === 'owner'"
+                    :name="item.created_by.name"
+                    :logto-id="item.created_by.user_id"
+                  />
+                  <div class="space-y-0.5">
+                    <div>{{ item.created_by.name || '-' }}</div>
+                    <div
+                      v-if="item.created_by.organization_name"
+                      class="text-gray-500 dark:text-gray-400"
+                    >
+                      <CreatorOrganization :creator="item.created_by" />
+                    </div>
+                  </div>
+                </div>
+              </template>
+              <template v-else>-</template>
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('common.status')">
+            <div class="flex items-center gap-2">
+              <template v-if="item.deleted_at">
+                <FontAwesomeIcon
+                  :icon="faBoxArchive"
+                  class="text-icon-neutral size-4"
+                  aria-hidden="true"
+                />
+                <span>
+                  {{ t('common.archived') }}
+                </span>
+              </template>
+              <template v-else-if="item.suspended_at">
+                <FontAwesomeIcon
+                  :icon="faCirclePause"
+                  class="text-icon-neutral size-4"
+                  aria-hidden="true"
+                />
+                <span>
+                  {{ t('common.suspended') }}
+                </span>
+              </template>
+              <template v-else>
+                <FontAwesomeIcon
+                  :icon="faCircleCheck"
+                  class="text-icon-enabled size-4"
+                  aria-hidden="true"
+                />
+                <span>
+                  {{ t('common.enabled') }}
+                </span>
+              </template>
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('common.actions')">
+            <div class="-ml-2.5 flex gap-2 2xl:ml-0 2xl:justify-end">
+              <NeButton v-if="!item.deleted_at" kind="tertiary" @click="goToCustomerDetails(item)">
+                <template #prefix>
+                  <FontAwesomeIcon :icon="faEye" class="h-4 w-4" aria-hidden="true" />
+                </template>
+                {{ $t('common.details') }}
+              </NeButton>
+              <!-- kebab menu -->
+              <NeDropdown
+                v-if="canManageCustomers() || canDestroyCustomers()"
+                :items="getKebabMenuItems(item)"
+                :align-to-right="true"
+              />
+            </div>
+          </NeTableCell>
+        </NeTableRow>
+      </NeTableBody>
+      <template #paginator>
+        <NePaginator
+          :current-page="pageNum"
+          :total-rows="pagination?.total_count || 0"
+          :page-size="pageSize"
+          :page-sizes="PAGE_SIZE_OPTIONS"
+          :nav-pagination-label="$t('ne_table.pagination')"
+          :next-label="$t('ne_table.go_to_next_page')"
+          :previous-label="$t('ne_table.go_to_previous_page')"
+          :range-of-total-label="$t('ne_table.of')"
+          :page-size-label="$t('ne_table.show')"
+          @select-page="
+            (page: number) => {
+              pageNum = page
+            }
+          "
+          @select-page-size="
+            (size: number) => {
+              pageSize = size
+              savePageSizeToStorage(CUSTOMERS_TABLE_ID, size)
+            }
+          "
+        />
+      </template>
+    </NeTable>
+    <!-- side drawer -->
+    <CreateOrEditCustomerDrawer
+      :is-shown="isShownCreateOrEditCustomerDrawer"
+      :current-customer="currentCustomer"
+      @close="onCloseDrawer"
+    />
+    <!-- delete customer modal -->
+    <DeleteCustomerModal
+      :visible="isShownDeleteCustomerDrawer"
+      :customer="currentCustomer"
+      @close="isShownDeleteCustomerDrawer = false"
+    />
+    <!-- suspend customer modal -->
+    <SuspendCustomerModal
+      :visible="isShownSuspendCustomerModal"
+      :customer="currentCustomer"
+      @close="isShownSuspendCustomerModal = false"
+    />
+    <!-- reactivate customer modal -->
+    <ReactivateCustomerModal
+      :visible="isShownReactivateCustomerModal"
+      :customer="currentCustomer"
+      @close="isShownReactivateCustomerModal = false"
+    />
+    <!-- restore customer modal -->
+    <RestoreCustomerModal
+      :visible="isShownRestoreCustomerModal"
+      :customer="currentCustomer"
+      @close="isShownRestoreCustomerModal = false"
+    />
+    <!-- destroy customer modal -->
+    <DestroyCustomerModal
+      :visible="isShownDestroyCustomerModal"
+      :customer="currentCustomer"
+      @close="isShownDestroyCustomerModal = false"
+    />
+  </div>
+</template>

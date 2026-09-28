@@ -1,0 +1,310 @@
+<!--
+  Copyright (C) 2026 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import {
+  NeBadgeV2,
+  NeCard,
+  NeDropdown,
+  NeHeading,
+  NeLink,
+  NeSkeleton,
+  NeTooltip,
+  type NeDropdownItem,
+  formatDateTimeNoSeconds,
+} from '@nethesis/vue-components'
+import { useDistributorDetail } from '@/queries/organizations/distributorDetail'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import OrganizationIcon from '@/components/organizations/OrganizationIcon.vue'
+import DataItem from '../common/DataItem.vue'
+import { computed, ref } from 'vue'
+import NotesModal from '../common/NotesModal.vue'
+import EnabledStatus from '../common/EnabledStatus.vue'
+import { canManageDistributors } from '@/lib/permissions'
+import {
+  faPenToSquare,
+  faCirclePause,
+  faCirclePlay,
+  faCircleCheck,
+  faBoxArchive,
+} from '@fortawesome/free-solid-svg-icons'
+import { useI18n } from 'vue-i18n'
+import CreateOrEditDistributorDrawer from './CreateOrEditDistributorDrawer.vue'
+import SuspendDistributorModal from './SuspendDistributorModal.vue'
+import ReactivateDistributorModal from './ReactivateDistributorModal.vue'
+import UserAvatar from '../users/UserAvatar.vue'
+import { useLoginStore } from '@/stores/login'
+import { useQuery } from '@pinia/colada'
+import { getThirdPartyAppsCatalog, THIRD_PARTY_APPS_CATALOG_KEY } from '@/lib/thirdPartyApps'
+import CreatorOrganization from '@/components/organizations/CreatorOrganization.vue'
+import ParentCompanyLink from '@/components/organizations/ParentCompanyLink.vue'
+
+const { t, locale } = useI18n()
+const loginStore = useLoginStore()
+const { state: distributorDetail, asyncStatus } = useDistributorDetail()
+
+// The portal list is an Owner-organization matter: only the Owner sees the
+// row, and the catalogue (owner-only endpoint) turns names into display names.
+const canSeeThirdPartyApps = computed(() => loginStore.isOwner)
+const { state: catalog } = useQuery({
+  key: [THIRD_PARTY_APPS_CATALOG_KEY],
+  enabled: () => canSeeThirdPartyApps.value,
+  query: getThirdPartyAppsCatalog,
+})
+const portalLabel = (name: string) =>
+  catalog.value.data?.find((app) => app.name === name)?.display_name ?? name
+
+const rebrandingEnabled = computed(() => distributorDetail.value.data?.rebranding_enabled === true)
+const isNotesModalShown = ref(false)
+const isShownCreateOrEditDistributorDrawer = ref(false)
+const isShownSuspendDistributorModal = ref(false)
+const isShownReactivateDistributorModal = ref(false)
+
+function getKebabMenuItems() {
+  const items: NeDropdownItem[] = []
+  const distributor = distributorDetail.value.data
+
+  if (canManageDistributors() && distributor) {
+    if (!distributor.deleted_at) {
+      items.push({
+        id: 'editDistributor',
+        label: t('common.edit'),
+        icon: faPenToSquare,
+        action: () => (isShownCreateOrEditDistributorDrawer.value = true),
+        disabled: asyncStatus.value === 'loading',
+      })
+    }
+
+    if (distributor.suspended_at) {
+      items.push({
+        id: 'reactivateDistributor',
+        label: t('common.reactivate'),
+        icon: faCirclePlay,
+        action: () => (isShownReactivateDistributorModal.value = true),
+        disabled: asyncStatus.value === 'loading',
+      })
+    } else if (!distributor.deleted_at) {
+      items.push({
+        id: 'suspendDistributor',
+        label: t('common.suspend'),
+        icon: faCirclePause,
+        action: () => (isShownSuspendDistributorModal.value = true),
+        disabled: asyncStatus.value === 'loading',
+      })
+    }
+  }
+
+  return items
+}
+</script>
+
+<template>
+  <NeCard>
+    <NeSkeleton v-if="distributorDetail.status === 'pending'" :lines="10" />
+    <div v-else-if="distributorDetail.data">
+      <!-- logo and name -->
+      <div class="mb-4 flex items-center justify-between gap-4">
+        <div class="flex items-center gap-4">
+          <OrganizationIcon org-type="distributor" size="sm" />
+          <NeHeading tag="h6">
+            {{ distributorDetail.data.name }}
+          </NeHeading>
+        </div>
+        <!-- kebab menu -->
+        <NeDropdown
+          v-if="canManageDistributors()"
+          :items="getKebabMenuItems()"
+          :align-to-right="true"
+        />
+      </div>
+      <!-- distributor information -->
+      <div class="divide-y divide-gray-200 dark:divide-gray-700">
+        <!-- status -->
+        <DataItem>
+          <template #label>
+            {{ $t('common.status') }}
+          </template>
+          <template #data>
+            <div class="flex items-center gap-2">
+              <template v-if="distributorDetail.data.deleted_at">
+                <FontAwesomeIcon
+                  :icon="faBoxArchive"
+                  class="text-icon-neutral size-4"
+                  aria-hidden="true"
+                />
+                <span>{{ $t('common.archived') }}</span>
+              </template>
+              <template v-else-if="distributorDetail.data.suspended_at">
+                <FontAwesomeIcon
+                  :icon="faCirclePause"
+                  class="text-icon-neutral size-4"
+                  aria-hidden="true"
+                />
+                <span>{{ $t('common.suspended') }}</span>
+              </template>
+              <template v-else>
+                <FontAwesomeIcon
+                  :icon="faCircleCheck"
+                  class="text-icon-enabled size-4"
+                  aria-hidden="true"
+                />
+                <span>{{ $t('common.enabled') }}</span>
+              </template>
+            </div>
+          </template>
+        </DataItem>
+        <!-- vat number -->
+        <DataItem>
+          <template #label>
+            {{ $t('organizations.vat_number') }}
+          </template>
+          <template #data>
+            {{ distributorDetail.data.custom_data.vat || '-' }}
+          </template>
+        </DataItem>
+        <!-- portals (owner only) -->
+        <DataItem v-if="canSeeThirdPartyApps">
+          <template #label>
+            {{ $t('organizations.third_party_apps') }}
+          </template>
+          <template #data>
+            <div
+              v-if="distributorDetail.data.third_party_apps?.length"
+              class="flex flex-wrap justify-end gap-2"
+            >
+              <NeBadgeV2
+                v-for="name in distributorDetail.data.third_party_apps"
+                :key="name"
+                kind="gray"
+              >
+                {{ portalLabel(name) }}
+              </NeBadgeV2>
+            </div>
+            <template v-else>{{ $t('organizations.no_third_party_apps') }}</template>
+          </template>
+        </DataItem>
+        <!-- promoted to distributor -->
+        <DataItem v-if="distributorDetail.data.promoted_from">
+          <template #label>
+            {{ $t('organizations.promoted_to_distributor') }}
+          </template>
+          <template #data>
+            <div class="flex items-center gap-2">
+              <NeTooltip
+                v-if="distributorDetail.data.promoted_from.by"
+                trigger-event="mouseenter focus"
+                placement="top"
+              >
+                <template #trigger>
+                  <UserAvatar
+                    size="xs"
+                    :is-owner="distributorDetail.data.promoted_from.by.username === 'owner'"
+                    :name="distributorDetail.data.promoted_from.by.name"
+                    :logto-id="distributorDetail.data.promoted_from.by.user_id"
+                  />
+                </template>
+                <template #content>
+                  {{
+                    $t('organizations.promoted_by_name', {
+                      name: distributorDetail.data.promoted_from.by.name,
+                    })
+                  }}
+                </template>
+              </NeTooltip>
+              {{
+                formatDateTimeNoSeconds(new Date(distributorDetail.data.promoted_from.at), locale)
+              }}
+            </div>
+          </template>
+        </DataItem>
+        <!-- rebranding -->
+        <DataItem>
+          <template #label>
+            {{ $t('organizations.rebranding') }}
+          </template>
+          <template #data>
+            <EnabledStatus :enabled="rebrandingEnabled" />
+          </template>
+        </DataItem>
+        <!-- parent company -->
+        <DataItem>
+          <template #label>
+            {{ $t('organizations.parent_company') }}
+          </template>
+          <template #data>
+            <ParentCompanyLink :creator="distributorDetail.data.created_by" />
+          </template>
+        </DataItem>
+        <!-- created by -->
+        <DataItem>
+          <template #label>
+            {{ $t('systems.created_by') }}
+          </template>
+          <template #data>
+            <div v-if="distributorDetail.data.created_by" class="space-y-0.5 text-end">
+              <div class="flex items-center justify-end gap-2">
+                <UserAvatar
+                  size="xs"
+                  :is-owner="distributorDetail.data.created_by.username === 'owner'"
+                  :name="distributorDetail.data.created_by.name"
+                  :logto-id="distributorDetail.data.created_by.user_id"
+                />
+                <span>{{ distributorDetail.data.created_by.name || '-' }}</span>
+              </div>
+              <div
+                v-if="distributorDetail.data.created_by.organization_name"
+                class="text-tertiary-neutral"
+              >
+                <CreatorOrganization :creator="distributorDetail.data.created_by" />
+              </div>
+              <div v-if="distributorDetail.data.created_at" class="text-tertiary-neutral mt-1">
+                {{ formatDateTimeNoSeconds(new Date(distributorDetail.data.created_at), locale) }}
+              </div>
+            </div>
+            <template v-else>-</template>
+          </template>
+        </DataItem>
+        <!-- notes -->
+        <div v-if="distributorDetail.data.custom_data.notes">
+          <div class="text-tertiary-neutral dark:text-tertiary-neutral py-4 font-medium">
+            {{ $t('common.notes') }}
+          </div>
+          <pre ref="preElement" class="line-clamp-5 font-sans whitespace-pre-wrap">{{
+            distributorDetail.data.custom_data.notes
+          }}</pre>
+          <div class="mt-2">
+            <NeLink @click="isNotesModalShown = true">
+              {{ $t('common.show_notes') }}
+            </NeLink>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- notes modal -->
+    <NotesModal
+      :visible="isNotesModalShown"
+      :notes="distributorDetail.data?.custom_data.notes"
+      @close="isNotesModalShown = false"
+    />
+    <!-- edit drawer -->
+    <CreateOrEditDistributorDrawer
+      :is-shown="isShownCreateOrEditDistributorDrawer"
+      :current-distributor="distributorDetail.data ?? undefined"
+      @close="isShownCreateOrEditDistributorDrawer = false"
+    />
+    <!-- suspend distributor modal -->
+    <SuspendDistributorModal
+      :visible="isShownSuspendDistributorModal"
+      :distributor="distributorDetail.data ?? undefined"
+      @close="isShownSuspendDistributorModal = false"
+    />
+    <!-- reactivate distributor modal -->
+    <ReactivateDistributorModal
+      :visible="isShownReactivateDistributorModal"
+      :distributor="distributorDetail.data ?? undefined"
+      @close="isShownReactivateDistributorModal = false"
+    />
+  </NeCard>
+</template>

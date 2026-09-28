@@ -1,0 +1,722 @@
+/*
+ * Copyright (C) 2025 Nethesis S.r.l.
+ * http://www.nethesis.it - info@nethesis.it
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * author: Edoardo Spadoni <edoardo.spadoni@nethesis.it>
+ */
+
+package main
+
+import (
+	"context"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	// Embed the IANA timezone database in the binary. ALERTING_TIMEZONE is
+	// validated with time.LoadLocation at startup, and the runtime image is
+	// alpine without the tzdata package, so without this every zone name
+	// fails to resolve and the backend refuses to boot.
+	_ "time/tzdata"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-contrib/gzip"
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
+
+	"github.com/nethesis/my/backend/cache"
+	"github.com/nethesis/my/backend/configuration"
+	"github.com/nethesis/my/backend/database"
+	"github.com/nethesis/my/backend/helpers"
+	"github.com/nethesis/my/backend/logger"
+	"github.com/nethesis/my/backend/methods"
+	"github.com/nethesis/my/backend/methods/validators"
+	"github.com/nethesis/my/backend/middleware"
+	"github.com/nethesis/my/backend/models"
+	"github.com/nethesis/my/backend/pkg/version"
+	"github.com/nethesis/my/backend/response"
+	"github.com/nethesis/my/backend/services/local"
+)
+
+func main() {
+	// Load .env file if exists (optional, won't fail if missing)
+	envFile := os.Getenv("ENV_FILE")
+	if envFile == "" {
+		envFile = ".env"
+	}
+	err := godotenv.Load(envFile)
+
+	// Init logger with zerolog
+	loggerErr := logger.InitFromEnv("backend")
+	if loggerErr != nil {
+		logger.Fatal().Err(loggerErr).Msg("Failed to initialize logger")
+	}
+
+	// Log which environment file was loaded
+	if err == nil {
+		logger.Info().
+			Str("component", "env").
+			Str("operation", "config_load").
+			Str("config_type", "environment").
+			Str("env_file", envFile).
+			Bool("success", true).
+			Msg("environment configuration loaded")
+	} else {
+		logger.Warn().
+			Str("component", "env").
+			Str("operation", "config_load").
+			Str("config_type", "environment").
+			Str("env_file", envFile).
+			Bool("success", false).
+			Err(err).
+			Msg("environment configuration not loaded (using system environment)")
+	}
+
+	// Init configuration
+	configuration.Init()
+
+	// Initialize database connection
+	err = database.Init()
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Failed to initialize database connection")
+	}
+
+	// Refresh unified_organizations materialized view
+	if err := database.RefreshUnifiedOrganizations(); err != nil {
+		logger.Warn().Err(err).Msg("Failed to refresh unified_organizations materialized view")
+	}
+
+	// Initialize Redis cache
+	err = cache.InitRedis()
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Failed to initialize Redis cache")
+	}
+
+	// Initialize roles from Logto
+	roleNames := cache.GetRoleNames()
+	err = roleNames.LoadRoles()
+	if err != nil {
+		logger.Warn().Err(err).Msg("Failed to load roles from Logto - userRolesNames will be empty")
+	}
+
+	// Initialize domain validation from Logto
+	domainValidation := cache.GetDomainValidation()
+	err = domainValidation.LoadDomainValidation()
+	if err != nil {
+		logger.Warn().Err(err).Msg("Failed to load domain validation from Logto - will fallback to tenant ID")
+	}
+
+	// Wire up RBAC filter to use cached org ID lookups
+	helpers.GetAllowedOrgIDsForFilter = func(role, orgID string) []string {
+		svc := local.NewApplicationsService()
+		ids, err := svc.GetAllowedOrganizationIDs(role, orgID)
+		if err != nil {
+			return []string{orgID}
+		}
+		return ids
+	}
+
+	// Init router
+	router := gin.Default()
+
+	// Add request logging middleware
+	router.Use(logger.GinLogger())
+
+	// Add security monitoring middleware
+	router.Use(logger.SecurityMiddleware())
+
+	// Add compression
+	router.Use(gzip.Gzip(gzip.DefaultCompression))
+
+	// Global request-body ceiling. Sized for the largest legitimate upload
+	// (rebranding asset bundle); JSON endpoints that need less narrow it
+	// (/alerts/config) or are public and get a small budget below.
+	router.Use(middleware.MaxBodySize(16 << 20))
+
+	// CORS configuration in debug mode
+	if gin.Mode() == gin.DebugMode {
+		corsConf := cors.DefaultConfig()
+		corsConf.AllowHeaders = []string{"Authorization", "Content-Type", "Accept"}
+		corsConf.AllowAllOrigins = true
+		router.Use(cors.New(corsConf))
+	}
+
+	// Define API group
+	api := router.Group("/api")
+
+	// Health check endpoint
+	api.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, response.OK("service healthy", version.Get()))
+	})
+
+	// ===========================================
+	// PUBLIC ENDPOINTS
+	// ===========================================
+	api.GET("/public/users/:id/avatar", middleware.RateLimit(10, 30), methods.GetPublicAvatar)
+
+	// Rebranding assets, unauthenticated so a page can point an <img> at them.
+	// Branding is what a partner shows on its own login screens; the endpoint is
+	// rate-limited and serves nothing but the image.
+	api.GET("/public/rebranding/:org_id/products/:product_id/:asset", middleware.RateLimit(10, 30), methods.GetPublicRebrandingAsset)
+
+	// ===========================================
+	// PUBLIC AUTH ENDPOINTS
+	// ===========================================
+	// Unauthenticated entry points: each exchange costs several Logto
+	// Management API calls, so both carry a per-IP budget like the other
+	// public routes.
+	api.POST("/auth/exchange", middleware.RateLimit(5, 30), middleware.MaxBodySize(64<<10), methods.ExchangeToken)
+	api.POST("/auth/refresh", middleware.RateLimit(5, 30), middleware.MaxBodySize(64<<10), methods.RefreshToken)
+
+	// ===========================================
+	// PUBLIC SYSTEM REGISTRATION ENDPOINT
+	// ===========================================
+	api.POST("/systems/register", middleware.RateLimit(2, 10), middleware.MaxBodySize(64<<10), methods.RegisterSystem) // credential handshake: per-IP budget
+
+	// ===========================================
+	// CUSTOM JWT ROUTES (for resilient apps)
+	// Uses our enriched JWT - works offline when Logto is down
+	// Resource-based permissions: read:resource for GET, manage:resource for POST/PUT/PATCH/DELETE
+	// ===========================================
+	customAuth := api.Group("/", middleware.AuthMiddleware(), middleware.APIKeyRateLimit())
+
+	// Apply impersonation audit middleware to all routes EXCEPT the impersonation management routes
+	customAuthWithAudit := customAuth.Group("/", middleware.ImpersonationAuditMiddleware())
+
+	{
+		// Authentication endpoints
+		customAuth.POST("/auth/logout", middleware.RejectAPIKey(), middleware.DisableOnImpersonate(), methods.Logout)
+
+		// Consent-based impersonation endpoints (no audit to avoid recursion)
+		impersonateGroup := customAuth.Group("/impersonate", middleware.RejectAPIKey())
+		{
+			// Consent management endpoints
+			// Consent belongs to the account itself: with an impersonation token
+			// these would act as the target, letting the impersonator grant (or
+			// renew) the very consent the feature hinges on.
+			impersonateGroup.POST("/consent", middleware.DisableOnImpersonate(), methods.EnableImpersonationConsent)
+			impersonateGroup.DELETE("/consent", middleware.DisableOnImpersonate(), methods.DisableImpersonationConsent)
+			impersonateGroup.GET("/consent", middleware.DisableOnImpersonate(), methods.GetImpersonationConsentStatus)
+
+			// Impersonation endpoints
+			impersonateGroup.GET("/status", methods.GetImpersonationStatus)
+			impersonateGroup.POST("", middleware.RequirePermission("impersonate:users"), methods.ImpersonateUserWithConsent) // Only users with impersonate:users permission
+			impersonateGroup.DELETE("", methods.ExitImpersonationWithAudit)
+
+			// Session management endpoints
+			impersonateGroup.GET("/sessions", middleware.DisableOnImpersonate(), methods.GetImpersonationSessions)
+			impersonateGroup.GET("/sessions/:session_id", middleware.DisableOnImpersonate(), methods.GetImpersonationSession)
+			impersonateGroup.GET("/sessions/:session_id/audit", middleware.DisableOnImpersonate(), methods.GetSessionAudit)
+		}
+
+		// User profile endpoints using custom JWT (with audit for impersonation).
+		// The whole /me surface is interactive-session only: API keys are rejected,
+		// so a key can neither read/modify the owner's profile nor mint/revoke keys.
+		meGroup := customAuthWithAudit.Group("/me", middleware.RejectAPIKey())
+		{
+			meGroup.GET("", methods.GetCurrentUser)
+			meGroup.POST("/change-password", middleware.DisableOnImpersonate(), methods.ChangePassword)
+			meGroup.POST("/change-info", middleware.DisableOnImpersonate(), methods.ChangeInfo)
+			meGroup.POST("/change-info/verify-email", middleware.DisableOnImpersonate(), middleware.RateLimit(1, 10), methods.VerifyEmailChange)
+			meGroup.PUT("/avatar", middleware.DisableOnImpersonate(), methods.UploadMyAvatar)
+			meGroup.DELETE("/avatar", middleware.DisableOnImpersonate(), methods.DeleteMyAvatar)
+
+			// Personal API keys (self-service). Disabled while impersonating so an
+			// impersonator can neither mint nor revoke a user's keys; creation also
+			// requires a password step-up (see CreateAPIKey).
+			apiKeysGroup := meGroup.Group("/api-keys", middleware.DisableOnImpersonate())
+			{
+				apiKeysGroup.POST("", methods.CreateAPIKey)
+				apiKeysGroup.GET("", methods.ListAPIKeys)
+				apiKeysGroup.GET("/audit", methods.ListAPIKeyAudit)
+				apiKeysGroup.DELETE("/:id", methods.RevokeAPIKey)
+			}
+		}
+
+		// ===========================================
+		// SYSTEMS - resource-based permission validation (read:systems for GET, manage:systems for POST/PUT/DELETE)
+		// ===========================================
+		systemsGroup := customAuthWithAudit.Group("/systems", middleware.RequireResourcePermission("systems"))
+		{
+			// CRUD operations
+			systemsGroup.POST("", methods.CreateSystem)       // Create system (manage:systems required)
+			systemsGroup.GET("", methods.GetSystems)          // List systems (read:systems required)
+			systemsGroup.GET("/:id", methods.GetSystem)       // Get system (read:systems required)
+			systemsGroup.PUT("/:id", methods.UpdateSystem)    // Update system (manage:systems required)
+			systemsGroup.DELETE("/:id", methods.DeleteSystem) // Soft-delete system (manage:systems required)
+
+			// Restore and destroy endpoints
+			systemsGroup.PATCH("/:id/restore", methods.RestoreSystem)                                                   // Restore soft-deleted system (manage:systems required)
+			systemsGroup.DELETE("/:id/destroy", middleware.RequirePermission("destroy:systems"), methods.DestroySystem) // Permanently delete system (destroy:systems required)
+
+			// Suspend and reactivate endpoints
+			systemsGroup.PATCH("/:id/suspend", methods.SuspendSystem)       // Suspend system (manage:systems required)
+			systemsGroup.PATCH("/:id/reactivate", methods.ReactivateSystem) // Reactivate suspended system (manage:systems required)
+
+			// Entitlements (granular add-on licensing; writes need the dedicated manage:entitlements permission)
+			systemsGroup.GET("/:id/entitlements", methods.ListSystemEntitlements)
+			systemsGroup.POST("/:id/entitlements", methods.CreateSystemEntitlement)                // Owner organization only (handler-gated)
+			systemsGroup.PUT("/:id/entitlements/:entitlement", methods.UpdateSystemEntitlement)    // Owner organization only (handler-gated)
+			systemsGroup.DELETE("/:id/entitlements/:entitlement", methods.DeleteSystemEntitlement) // Owner organization only (handler-gated)
+		}
+
+		// LEGACY SYSTEMS - how many systems each organization still has on the old
+		// my. Written once per run by the proxy_sync cron on the legacy host with
+		// the owner API key; read back through the systems totals. Owner
+		// organization only: it is a picture of the whole fleet, and a partner
+		// must never be able to rewrite it. Transitional, removed with the legacy
+		// decommission.
+		legacySystemsGroup := customAuthWithAudit.Group("/legacy-systems", middleware.RequireOrgRole(models.OwnerOrgRole))
+		{
+			legacySystemsGroup.PUT("/counts", methods.ReplaceLegacySystemCounts) // Full replacement of the per-organization counts
+		}
+
+		// Entitlement catalog (DB-driven add-on types; writes need manage:entitlements — the licensing back-office duty)
+		entitlementsGroup := customAuthWithAudit.Group("/entitlements", middleware.RequireResourcePermission("entitlements"))
+		{
+			entitlementsGroup.GET("/catalog", methods.ListEntitlementCatalog)
+			entitlementsGroup.POST("/catalog", methods.CreateEntitlementCatalogItem)       // Owner organization only (handler-gated)
+			entitlementsGroup.PUT("/catalog/:id", methods.UpdateEntitlementCatalogItem)    // Owner organization only (handler-gated)
+			entitlementsGroup.DELETE("/catalog/:id", methods.DeleteEntitlementCatalogItem) // Owner organization only (handler-gated)
+
+			// Commercial availability (who may buy/self-activate a type)
+			entitlementsGroup.GET("/catalog/:id/availability", methods.ListEntitlementAvailability)
+			entitlementsGroup.POST("/catalog/:id/availability", methods.CreateEntitlementAvailability)            // Owner organization only (handler-gated)
+			entitlementsGroup.DELETE("/catalog/:id/availability/:rule_id", methods.DeleteEntitlementAvailability) // Owner organization only (handler-gated)
+
+			// What the caller's org may buy (drives my UI / shop)
+			entitlementsGroup.GET("/available", methods.ListAvailableEntitlements)
+
+			// Reporting: buyers see their hierarchy (expirations/renewals), owner/SA the fleet
+			entitlementsGroup.GET("/grants", methods.GetEntitlementGrants)
+			entitlementsGroup.GET("/stats", methods.GetEntitlementStats)
+			entitlementsGroup.GET("/report", methods.GetEntitlementReport)                            // aggregates scoped to the caller's hierarchy
+			entitlementsGroup.GET("/report/organizations", methods.GetEntitlementReportOrganizations) // aggregates scoped to the caller's hierarchy
+			entitlementsGroup.GET("/report/tiers", methods.GetEntitlementReportTiers)                 // aggregates scoped to the caller's hierarchy
+
+			// Shop webhook: activation/renewal + deactivation by system_key (owner API key)
+			entitlementsGroup.POST("/activate", middleware.RequirePermission("manage:entitlements"), methods.ActivateEntitlement)
+			entitlementsGroup.POST("/deactivate", middleware.RequirePermission("manage:entitlements"), methods.DeactivateEntitlement)
+			entitlementsGroup.POST("/pending", middleware.RequirePermission("manage:entitlements"), methods.PendingEntitlement) // checkout: order placed, payment not confirmed yet
+
+			// Systems totals and trend endpoints (read:systems required)
+			systemsGroup.GET("/totals", methods.GetSystemsTotals)
+			systemsGroup.GET("/trend", methods.GetSystemsTrend)
+
+			// System actions
+			systemsGroup.POST("/:id/regenerate-secret", methods.RegenerateSystemSecret) // Regenerate system secret
+			systemsGroup.GET("/:id/reachability", methods.CheckSystemReachability)      // Check if system web UI is reachable
+
+			// Export endpoint
+			systemsGroup.GET("/export", middleware.LimitExports(), middleware.ExtendDeadline(180*time.Second), methods.ExportSystems) // Export systems to CSV or PDF with applied filters
+
+			// Inventory endpoints
+			systemsGroup.GET("/:id/inventory", methods.GetSystemInventoryHistory)                      // Get paginated inventory history
+			systemsGroup.GET("/:id/inventory/:inventory_id", methods.GetSystemInventoryByID)           // Get specific inventory record by ID
+			systemsGroup.GET("/:id/inventory/latest", methods.GetSystemLatestInventory)                // Get latest inventory
+			systemsGroup.GET("/:id/inventory/changes", methods.GetSystemInventoryChanges)              // Get changes summary
+			systemsGroup.GET("/:id/inventory/changes/latest", methods.GetSystemLatestInventoryChanges) // Get latest batch changes summary
+			systemsGroup.GET("/:id/inventory/diffs", methods.GetSystemInventoryDiffs)                  // Get paginated diffs
+			systemsGroup.GET("/:id/inventory/diffs/latest", methods.GetSystemLatestInventoryDiff)      // Get latest diff
+			systemsGroup.GET("/:id/inventory/timeline", methods.GetSystemInventoryTimeline)            // Get date-grouped timeline with summary
+
+			// Alert endpoints (read:systems required for GET, manage:systems required for POST/DELETE)
+			systemsGroup.GET("/:id/alerts", methods.GetSystemAlerts)                                  // Get active alerts for a system
+			systemsGroup.GET("/:id/alerts/silences", methods.GetSystemAlertSilences)                  // List active silences for a system
+			systemsGroup.POST("/:id/alerts/silences", methods.CreateSystemAlertSilence)               // Create a silence for a system alert
+			systemsGroup.GET("/:id/alerts/silences/:silence_id", methods.GetSystemAlertSilence)       // Get a single silence
+			systemsGroup.PUT("/:id/alerts/silences/:silence_id", methods.UpdateSystemAlertSilence)    // Update a silence's end time / comment
+			systemsGroup.DELETE("/:id/alerts/silences/:silence_id", methods.DeleteSystemAlertSilence) // Disable a silence for a system alert
+			systemsGroup.GET("/:id/alerts/history", methods.GetSystemAlertHistory)                    // Get paginated alert history
+
+			// Backup endpoints — list stored backups, issue short-lived presigned
+			// download URLs, and delete backups. Ingest happens on collect.
+			systemsGroup.GET("/:id/backups", methods.GetSystemBackups)                         // List backups for a system
+			systemsGroup.GET("/:id/backups/:backup_id/download", methods.DownloadSystemBackup) // 200 with {download_url} presigned URL
+			systemsGroup.DELETE("/:id/backups/:backup_id", methods.DeleteSystemBackup)         // Delete a backup
+		}
+
+		// ===========================================
+		// ALERTS - operations on `systems` RBAC; config policy on `alerts` resource
+		// ===========================================
+		alertsGroup := customAuthWithAudit.Group("/alerts", middleware.RequireResourcePermission("systems"))
+		{
+			// Lists: active (Mimir live) + resolved (DB history); same scope rules + label filters
+			alertsGroup.GET("", methods.GetAlerts)                // List active alerts (cross-hierarchy paginated)
+			alertsGroup.GET("/history", methods.GetAlertsHistory) // List resolved alerts from DB (paginated, date range + filters)
+
+			// Aggregations: counts, trend over time, top-N + MTTR/MTBF
+			alertsGroup.GET("/totals", methods.GetAlertsTotals) // Alert counts by severity + history total
+			alertsGroup.GET("/trend", methods.GetAlertsTrend)   // Alert history trend with daily data points
+			alertsGroup.GET("/stats", methods.GetAlertsStats)   // Aggregate stats: severity buckets, top-N alertname/system_key, MTTR/MTBF
+
+			// Per-alert audit timeline; "activity" literal before the param to avoid colliding with /silences/{silence_id}
+			alertsGroup.GET("/activity/:fingerprint", methods.GetAlertActivity)
+
+			// Operator notes + assignment ("who is working on this"); both are
+			// orthogonal to silences. Assignment is self-assign with takeover,
+			// auto-released by collect when the alert resolves (no DELETE).
+			alertsGroup.POST("/notes", methods.CreateAlertNote)            // Append a note to the alert timeline (body: { fingerprint, text })
+			alertsGroup.POST("/assignment", methods.CreateAlertAssignment) // Take charge of an alert (body: { fingerprint })
+
+			// Cross-system silences; mirrors /systems/:id/alerts/silences*, ?organization_id= for per-id ops, RBAC on `systems`
+			alertsGroup.GET("/silences", methods.GetAlertSilences)                  // List active+pending silences across the caller's hierarchy
+			alertsGroup.POST("/silences", methods.CreateAlertSilence)               // Mute an alert (body: { fingerprint, end_at, comment, duration_minutes? })
+			alertsGroup.GET("/silences/:silence_id", methods.GetAlertSilence)       // Get a single silence (requires ?organization_id=)
+			alertsGroup.PUT("/silences/:silence_id", methods.UpdateAlertSilence)    // Update a silence's end time / comment (requires ?organization_id=)
+			alertsGroup.DELETE("/silences/:silence_id", methods.DeleteAlertSilence) // Unmute (requires ?organization_id=)
+
+			// Caller's own layer (read/manage:alerts); body capped at 1 MiB
+			configGroup := alertsGroup.Group("/config",
+				middleware.RequireResourcePermission("alerts"),
+				middleware.MaxBodySize(1<<20),
+			)
+			{
+				configGroup.GET("", methods.GetAlertingConfig) // Caller's own layer (no inherited / merged view leaks to descendants)
+				configGroup.POST("", methods.ConfigureAlerts)  // Save caller's layer + propagate to descendants (manage:alerts required)
+				configGroup.DELETE("", methods.DisableAlerts)  // Remove caller's layer + propagate to descendants (manage:alerts required)
+			}
+
+			// Merged effective config + Mimir YAML for ANY tenant, secrets redacted.
+			// Gated on config:alerts, which only the Owner and Staff user roles carry.
+			// Note this is deliberately not hierarchy-scoped: any Owner-organization user can
+			// read any organization's effective config, whatever org they sit in.
+			// Only an Owner can grant the Owner and Staff roles (see role access control).
+			alertsGroup.GET("/config/effective", middleware.RequirePermission("config:alerts"), methods.GetEffectiveAlertingConfig)
+		}
+
+		// ===========================================
+		// FILTERS - For UI dropdowns
+		// ===========================================
+		filtersGroup := customAuthWithAudit.Group("/filters")
+		{
+			// Systems filters (read:systems required)
+			systemsFiltersGroup := filtersGroup.Group("/systems", middleware.RequireResourcePermission("systems"))
+			{
+				systemsFiltersGroup.GET("", methods.GetSystemFilters) // Aggregated filters: products, created_by, versions, organizations
+			}
+
+			// Applications filters (read:applications required)
+			appsFiltersGroup := filtersGroup.Group("/applications", middleware.RequireResourcePermission("applications"))
+			{
+				appsFiltersGroup.GET("", methods.GetApplicationFilters) // Aggregated filters: types, versions, systems, organizations
+			}
+
+			// Users filters (read:users required)
+			usersFiltersGroup := filtersGroup.Group("/users", middleware.RequireResourcePermission("users"))
+			{
+				usersFiltersGroup.GET("", methods.GetUserFilters) // Aggregated filters: roles, organizations
+			}
+
+			// Alerts filters (read:systems required, mirrors the alerts views)
+			alertsFiltersGroup := filtersGroup.Group("/alerts", middleware.RequireResourcePermission("systems"))
+			{
+				alertsFiltersGroup.GET("", methods.GetAlertFilters) // Aggregated filters: systems, alerts, severities, organizations
+			}
+
+			// Distributors filters (read:distributors required)
+			distributorsFiltersGroup := filtersGroup.Group("/distributors", middleware.RequireResourcePermission("distributors"))
+			{
+				distributorsFiltersGroup.GET("", methods.GetDistributorFilters) // Aggregated filters: created_by
+			}
+
+			// Resellers filters (read:resellers required)
+			resellersFiltersGroup := filtersGroup.Group("/resellers", middleware.RequireResourcePermission("resellers"))
+			{
+				resellersFiltersGroup.GET("", methods.GetResellerFilters) // Aggregated filters: created_by
+			}
+
+			// Customers filters (read:customers required)
+			customersFiltersGroup := filtersGroup.Group("/customers", middleware.RequireResourcePermission("customers"))
+			{
+				customersFiltersGroup.GET("", methods.GetCustomerFilters) // Aggregated filters: created_by
+			}
+		}
+
+		// ===========================================
+		// BUSINESS HIERARCHY - Permission-based with org_permissions
+		// Owner > Distributor > Reseller > Customer
+		// ===========================================
+
+		// Distributors - resource-based permission validation (read:distributors for GET, manage:distributors for POST/PUT/DELETE)
+		// Self-access: GET on own organization ID is always allowed (object-level RBAC in handlers)
+		distributorsGroup := customAuthWithAudit.Group("/distributors", middleware.RequireResourcePermissionOrSelf("distributors"))
+		{
+			// CRUD operations
+			distributorsGroup.POST("", methods.CreateDistributor)       // Create distributor (manage:distributors required)
+			distributorsGroup.GET("", methods.GetDistributors)          // List distributors (read:distributors required)
+			distributorsGroup.GET("/:id", methods.GetDistributor)       // Get distributor (read:distributors required)
+			distributorsGroup.PUT("/:id", methods.UpdateDistributor)    // Update distributor (manage:distributors required)
+			distributorsGroup.DELETE("/:id", methods.DeleteDistributor) // Soft-delete distributor (manage:distributors required)
+
+			// Restore and destroy endpoints (cascade to users and systems)
+			distributorsGroup.PATCH("/:id/restore", methods.RestoreDistributor)                                                        // Restore soft-deleted distributor and cascade-deleted users/systems
+			distributorsGroup.DELETE("/:id/destroy", middleware.RequirePermission("destroy:distributors"), methods.DestroyDistributor) // Permanently delete distributor and all hierarchy (destroy:distributors required)
+
+			// Suspend and reactivate endpoints (cascade to users)
+			distributorsGroup.PATCH("/:id/suspend", methods.SuspendDistributor)       // Suspend distributor and all its users
+			distributorsGroup.PATCH("/:id/reactivate", methods.ReactivateDistributor) // Reactivate distributor and cascade-suspended users
+
+			// Distributors totals and trend endpoints (read:distributors required)
+			distributorsGroup.GET("/totals", methods.GetDistributorsTotals)
+			distributorsGroup.GET("/trend", methods.GetDistributorsTrend)
+
+			// Stats endpoint (users and systems count)
+			distributorsGroup.GET("/:id/stats", methods.GetDistributorStats)
+
+			// Export endpoint
+			distributorsGroup.GET("/export", middleware.LimitExports(), middleware.ExtendDeadline(180*time.Second), methods.ExportDistributors) // Export distributors to CSV or PDF with applied filters
+
+			// Import endpoints
+			distributorsGroup.GET("/import/template", methods.GetDistributorsImportTemplate)                                         // Download CSV import template
+			distributorsGroup.POST("/import/validate", methods.ValidateDistributorsImport)                                           // Validate CSV file and return row-by-row report
+			distributorsGroup.POST("/import/confirm", middleware.ExtendDeadline(180*time.Second), methods.ConfirmDistributorsImport) // Confirm and execute validated import (slow: one Logto create per row)
+		}
+
+		// Resellers - resource-based permission validation (read:resellers for GET, manage:resellers for POST/PUT/DELETE)
+		// Self-access: GET on own organization ID is always allowed (object-level RBAC in handlers)
+		resellersGroup := customAuthWithAudit.Group("/resellers", middleware.RequireResourcePermissionOrSelf("resellers"))
+		{
+			// CRUD operations
+			resellersGroup.POST("", methods.CreateReseller)       // Create reseller (manage:resellers required)
+			resellersGroup.GET("", methods.GetResellers)          // List resellers (read:resellers required)
+			resellersGroup.GET("/:id", methods.GetReseller)       // Get reseller (read:resellers required)
+			resellersGroup.PUT("/:id", methods.UpdateReseller)    // Update reseller (manage:resellers required)
+			resellersGroup.DELETE("/:id", methods.DeleteReseller) // Soft-delete reseller (manage:resellers required)
+
+			// Restore and destroy endpoints (cascade to users and systems)
+			resellersGroup.PATCH("/:id/restore", methods.RestoreReseller)                                                     // Restore soft-deleted reseller and cascade-deleted users/systems
+			resellersGroup.DELETE("/:id/destroy", middleware.RequirePermission("destroy:resellers"), methods.DestroyReseller) // Permanently delete reseller and all hierarchy (destroy:resellers required)
+
+			// Suspend and reactivate endpoints (cascade to users)
+			resellersGroup.PATCH("/:id/suspend", methods.SuspendReseller)       // Suspend reseller and all its users
+			resellersGroup.PATCH("/:id/reactivate", methods.ReactivateReseller) // Reactivate reseller and cascade-suspended users
+
+			// Resellers totals and trend endpoints (read:resellers required)
+			resellersGroup.GET("/totals", methods.GetResellersTotals)
+			resellersGroup.GET("/trend", methods.GetResellersTrend)
+
+			// Stats endpoint (users and systems count)
+			resellersGroup.GET("/:id/stats", methods.GetResellerStats)
+
+			// Export endpoint
+			resellersGroup.GET("/export", middleware.LimitExports(), middleware.ExtendDeadline(180*time.Second), methods.ExportResellers) // Export resellers to CSV or PDF with applied filters
+
+			// Import endpoints
+			resellersGroup.GET("/import/template", methods.GetResellersImportTemplate)                                         // Download CSV import template
+			resellersGroup.POST("/import/validate", methods.ValidateResellersImport)                                           // Validate CSV file and return row-by-row report
+			resellersGroup.POST("/import/confirm", middleware.ExtendDeadline(180*time.Second), methods.ConfirmResellersImport) // Confirm and execute validated import (slow: one Logto create per row)
+		}
+
+		// Reseller promotion sits outside the resellers permission group on
+		// purpose: the authority to move an organization between levels is the
+		// Owner-organization gate in the handler, not manage:resellers, which every
+		// distributor holds.
+		customAuthWithAudit.PATCH("/resellers/:id/promote", middleware.RequirePermission("manage:resellers"), middleware.ExtendDeadline(60*time.Second), methods.PromoteReseller) // Promote reseller to distributor keeping its hierarchy (slow: one Logto role switch per member); the handler additionally requires the Owner organization
+
+		// Customers - resource-based permission validation (read:customers for GET, manage:customers for POST/PUT/DELETE)
+		// Self-access: GET on own organization ID is always allowed (object-level RBAC in handlers)
+		customersGroup := customAuthWithAudit.Group("/customers", middleware.RequireResourcePermissionOrSelf("customers"))
+		{
+			// CRUD operations
+			customersGroup.POST("", methods.CreateCustomer)       // Create customer (manage:customers required)
+			customersGroup.GET("", methods.GetCustomers)          // List customers (read:customers required)
+			customersGroup.GET("/:id", methods.GetCustomer)       // Get customer (read:customers required)
+			customersGroup.PUT("/:id", methods.UpdateCustomer)    // Update customer (manage:customers required)
+			customersGroup.DELETE("/:id", methods.DeleteCustomer) // Soft-delete customer (manage:customers required)
+
+			// Restore and destroy endpoints (cascade to users and systems)
+			customersGroup.PATCH("/:id/restore", methods.RestoreCustomer)                                                     // Restore soft-deleted customer and cascade-deleted users/systems
+			customersGroup.DELETE("/:id/destroy", middleware.RequirePermission("destroy:customers"), methods.DestroyCustomer) // Permanently delete customer and all hierarchy (destroy:customers required)
+
+			// Suspend and reactivate endpoints (cascade to users)
+			customersGroup.PATCH("/:id/suspend", methods.SuspendCustomer)       // Suspend customer and all its users
+			customersGroup.PATCH("/:id/reactivate", methods.ReactivateCustomer) // Reactivate customer and cascade-suspended users
+
+			// Customers totals and trend endpoints (read:customers required)
+			customersGroup.GET("/totals", methods.GetCustomersTotals)
+			customersGroup.GET("/trend", methods.GetCustomersTrend)
+
+			// Stats endpoint (users and systems count)
+			customersGroup.GET("/:id/stats", methods.GetCustomerStats)
+
+			// Export endpoint
+			customersGroup.GET("/export", middleware.LimitExports(), middleware.ExtendDeadline(180*time.Second), methods.ExportCustomers) // Export customers to CSV or PDF with applied filters
+
+			// Import endpoints
+			customersGroup.GET("/import/template", methods.GetCustomersImportTemplate)                                         // Download CSV import template
+			customersGroup.POST("/import/validate", methods.ValidateCustomersImport)                                           // Validate CSV file and return row-by-row report
+			customersGroup.POST("/import/confirm", middleware.ExtendDeadline(180*time.Second), methods.ConfirmCustomersImport) // Confirm and execute validated import (slow: one Logto create per row)
+		}
+
+		// ===========================================
+		// USERS - resource-based permission validation (read:users for GET, manage:users for POST/PUT/PATCH/DELETE)
+		// ===========================================
+		usersGroup := customAuthWithAudit.Group("/users", middleware.RequireResourcePermission("users"))
+		{
+			// CRUD operations
+			usersGroup.POST("", methods.CreateUser)                                             // Create user (manage:users required)
+			usersGroup.GET("", methods.GetUsers)                                                // List users (read:users required)
+			usersGroup.GET("/:id", methods.GetUser)                                             // Get user (read:users required)
+			usersGroup.PUT("/:id", middleware.PreventSelfModification(), methods.UpdateUser)    // Update user (manage:users required, prevent self-modification)
+			usersGroup.DELETE("/:id", middleware.PreventSelfModification(), methods.DeleteUser) // Soft-delete user (manage:users required, prevent self-modification)
+
+			// Restore and destroy endpoints
+			usersGroup.PATCH("/:id/restore", middleware.PreventSelfModification(), methods.RestoreUser)                                                 // Restore soft-deleted user (manage:users required, prevent self-modification)
+			usersGroup.DELETE("/:id/destroy", middleware.RequirePermission("destroy:users"), middleware.PreventSelfModification(), methods.DestroyUser) // Permanently delete user (destroy:users required, prevent self-modification)
+
+			// Suspend and reactivate endpoints (manage:users required, prevent self-modification)
+			usersGroup.PATCH("/:id/suspend", middleware.PreventSelfModification(), methods.SuspendUser)       // Suspend user
+			usersGroup.PATCH("/:id/reactivate", middleware.PreventSelfModification(), methods.ReactivateUser) // Reactivate suspended user
+
+			// Users totals and trend endpoints (read:users required)
+			usersGroup.GET("/totals", methods.GetUsersTotals)
+			usersGroup.GET("/trend", methods.GetUsersTrend)
+
+			// User actions (manage:users required, prevent self-modification)
+			usersGroup.PATCH("/:id/password", middleware.PreventSelfModification(), methods.ResetUserPassword)
+
+			// Avatar management (manage:users required, prevent self-modification)
+			usersGroup.PUT("/:id/avatar", middleware.PreventSelfModification(), methods.UploadUserAvatar)
+			usersGroup.DELETE("/:id/avatar", middleware.PreventSelfModification(), methods.DeleteUserAvatar)
+
+			// Export endpoint
+			usersGroup.GET("/export", middleware.LimitExports(), middleware.ExtendDeadline(180*time.Second), methods.ExportUsers) // Export users to CSV or PDF with applied filters
+
+			// Import endpoints
+			usersGroup.GET("/import/template", methods.GetUsersImportTemplate)                                         // Download CSV import template
+			usersGroup.POST("/import/validate", methods.ValidateUsersImport)                                           // Validate CSV file and return row-by-row report
+			usersGroup.POST("/import/confirm", middleware.ExtendDeadline(180*time.Second), methods.ConfirmUsersImport) // Confirm and execute validated import (slow: one Logto create per row)
+		}
+
+		// ===========================================
+		// APPLICATIONS - resource-based permission validation (read:applications for GET, manage:applications for POST/PUT/PATCH/DELETE)
+		// ===========================================
+		appsGroup := customAuthWithAudit.Group("/applications", middleware.RequireResourcePermission("applications"))
+		{
+			// CRUD operations
+			appsGroup.GET("", methods.GetApplications)          // List applications (read:applications required)
+			appsGroup.GET("/:id", methods.GetApplication)       // Get application (read:applications required)
+			appsGroup.PUT("/:id", methods.UpdateApplication)    // Update application (manage:applications required)
+			appsGroup.DELETE("/:id", methods.DeleteApplication) // Soft-delete application (manage:applications required)
+
+			// Applications totals, summary and trend endpoints (read:applications required)
+			appsGroup.GET("/totals", methods.GetApplicationTotals)
+			appsGroup.GET("/summary", methods.GetApplicationTypeSummary)
+			appsGroup.GET("/trend", methods.GetApplicationsTrend)
+
+			// Application actions (manage:applications required)
+			appsGroup.PATCH("/:id/assign", methods.AssignApplicationOrganization)     // Assign organization to application
+			appsGroup.PATCH("/:id/unassign", methods.UnassignApplicationOrganization) // Remove organization from application
+		}
+
+		// ===========================================
+		// REBRANDING - per-product rebranding management
+		// ===========================================
+		rebrandingGroup := customAuthWithAudit.Group("/rebranding", middleware.RequireResourcePermission("rebranding"))
+		{
+			// Rebrandable products list
+			rebrandingGroup.GET("/products", methods.GetRebrandingProducts)
+
+			// Organizations with rebranding: the list, its counters, and the
+			// organizations that can still be added
+			rebrandingGroup.GET("/organizations", methods.GetRebrandingOrganizations)
+			rebrandingGroup.GET("/organizations/available", methods.GetAvailableRebrandingOrganizations)
+			rebrandingGroup.GET("/summary", methods.GetRebrandingSummary)
+
+			// Enable/disable rebranding (Owner only, checked in handler)
+			rebrandingGroup.POST("/organizations", methods.EnableRebrandingBulk)
+			rebrandingGroup.PATCH("/:org_id/enable", methods.EnableRebranding)
+			rebrandingGroup.PATCH("/:org_id/disable", methods.DisableRebranding)
+
+			// Rebranding status and products for an organization
+			rebrandingGroup.GET("/:org_id/status", methods.GetRebrandingStatus)
+			rebrandingGroup.GET("/:org_id/products", methods.GetRebrandingOrgProducts)
+
+			// The configuration form: products, brand name and assets in one write
+			rebrandingGroup.PUT("/:org_id/config", methods.SaveRebrandingConfig)
+
+			// Asset management
+			rebrandingGroup.PUT("/:org_id/products/:product_id", methods.UploadRebrandingAssets)
+			rebrandingGroup.DELETE("/:org_id/products/:product_id", methods.DeleteRebrandingProduct)
+			rebrandingGroup.DELETE("/:org_id/products/:product_id/:asset", methods.DeleteRebrandingAsset)
+			rebrandingGroup.GET("/:org_id/products/:product_id/:asset", methods.GetRebrandingAsset)
+		}
+
+		// ===========================================
+		// METADATA - roles, organizations, third-party apps
+		// ===========================================
+		customAuthWithAudit.GET("/roles", methods.GetRoles)                                                                                                                   // Get available user roles
+		customAuthWithAudit.GET("/organization-roles", methods.GetOrganizationRoles)                                                                                          // Get available organization roles
+		customAuthWithAudit.GET("/organizations", methods.GetOrganizations)                                                                                                   // Get organizations for user assignment
+		customAuthWithAudit.GET("/third-party-applications", methods.GetThirdPartyApplications)                                                                               // Get third-party applications filtered by user access and by the distributor portal list
+		customAuthWithAudit.GET("/third-party-applications/catalog", middleware.RequireOrgRole(models.OwnerOrgRole), methods.GetThirdPartyApplicationsCatalog)                // Portals a distributor can be granted (Owner organization only)
+		customAuthWithAudit.POST("/third-party-applications/reconcile-access", middleware.RequireOrgRole(models.OwnerOrgRole), methods.ReconcileThirdPartyApplicationsAccess) // Align Logto app-level access control with the portal lists (Owner organization only)
+
+		// ===========================================
+		// VALIDATORS - validation endpoints
+		// ===========================================
+		validatorsGroup := customAuth.Group("/validators")
+		{
+			validatorsGroup.GET("/vat/:entity_type", validators.ValidateVAT) // Validate VAT number for entity type
+		}
+
+	}
+
+	// Handle missing endpoints
+	router.NoRoute(func(c *gin.Context) {
+		c.JSON(http.StatusNotFound, response.NotFound("api not found", nil))
+	})
+
+	// Create HTTP server with timeouts to prevent slowloris attacks
+	srv := &http.Server{
+		Addr:         configuration.Config.ListenAddress,
+		Handler:      router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	// Keep Logto app-level access control of the idp_enforced third-party
+	// applications aligned with the distributor portal lists.
+	local.StartIdPAccessReconciler(configuration.Config.ThirdPartyAppsIdPReconcileInterval)
+
+	// Start server in a goroutine
+	go func() {
+		logger.LogServiceStart("backend", version.Version, configuration.Config.ListenAddress)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatal().Err(err).Msg("Failed to start server")
+		}
+	}()
+
+	// Wait for interrupt signal for graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	logger.Info().Msg("Shutting down server...")
+
+	// Give outstanding requests 30 seconds to complete
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		logger.Error().Err(err).Msg("Server forced to shutdown")
+	}
+
+	// Close Redis connections
+	if err := cache.CloseRedis(); err != nil {
+		logger.Error().Err(err).Msg("Failed to close Redis connection")
+	}
+
+	// Close database connections
+	if err := database.Close(); err != nil {
+		logger.Error().Err(err).Msg("Failed to close database connection")
+	}
+
+	logger.Info().Msg("Server exited")
+}

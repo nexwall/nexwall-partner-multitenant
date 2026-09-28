@@ -1,0 +1,342 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script lang="ts" setup>
+import { ProfileInfoSchema, postChangeInfo, type ProfileInfo } from '@/lib/account'
+import { getValidationIssues, isValidationError } from '@/lib/validation'
+import { useLoginStore } from '@/stores/login'
+import { useNotificationsStore } from '@/stores/notifications'
+import { faCircleXmark, faPenToSquare } from '@fortawesome/free-solid-svg-icons'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import {
+  NeButton,
+  NeCard,
+  NeCombobox,
+  NeDropdown,
+  NeFormItemLabel,
+  NeInlineNotification,
+  NeSkeleton,
+  NeTextInput,
+} from '@nethesis/vue-components'
+import { combinePhoneParts, countryCodeComboOptions, parsePhoneForForm } from '@/lib/phone'
+import { useMutation, useQueryCache } from '@pinia/colada'
+import type { AxiosError } from 'axios'
+import { computed, ref, useTemplateRef, watch, type ShallowRef } from 'vue'
+import { useI18n } from 'vue-i18n'
+import * as v from 'valibot'
+import { USERS_KEY } from '@/lib/users/users'
+import UserRoleBadge from '../users/UserRoleBadge.vue'
+import UserAvatar from '../users/UserAvatar.vue'
+import ChangePictureDrawer from './ChangePictureDrawer.vue'
+import RemoveAvatarModal from './RemoveAvatarModal.vue'
+import VerifyEmailModal from './VerifyEmailModal.vue'
+
+const { t } = useI18n()
+const loginStore = useLoginStore()
+const notificationsStore = useNotificationsStore()
+
+const {
+  mutate: editUserMutate,
+  isLoading: editUserLoading,
+  reset: editUserReset,
+  error: editUserError,
+} = useMutation({
+  mutation: (profile: ProfileInfo) => {
+    return postChangeInfo(profile)
+  },
+  onSuccess(res) {
+    // A changed email is not saved yet: the backend mailed a code to the new
+    // address and applies it only once that code comes back. Name and phone
+    // were applied regardless.
+    if (res.data.data.email_verification_required && res.data.data.pending_email) {
+      pendingEmail.value = res.data.data.pending_email
+      isVerifyEmailModalShown.value = true
+    } else {
+      notificationsStore.createNotification({
+        kind: 'success',
+        title: t('account.profile_saved'),
+      })
+    }
+
+    loginStore.fetchTokenAndUserInfo()
+  },
+  onError: (error) => {
+    console.error('Error editing user:', error)
+    validationIssues.value = getValidationIssues(error as AxiosError, 'users')
+  },
+  onSettled: () => {
+    queryCache.invalidateQueries({ key: [USERS_KEY] })
+  },
+})
+
+const isChangePictureDrawerShown = ref(false)
+const isRemoveAvatarModalShown = ref(false)
+const isVerifyEmailModalShown = ref(false)
+const pendingEmail = ref('')
+// The profile payload already says whether a picture is stored, so there is no
+// need to probe the avatar endpoint just to enable/disable "Remove picture".
+const hasCustomAvatar = computed(() => loginStore.userInfo?.has_avatar ?? false)
+const name = ref('')
+const nameRef = useTemplateRef<HTMLInputElement>('nameRef')
+const email = ref('')
+const emailRef = useTemplateRef<HTMLInputElement>('emailRef')
+const phone = ref('')
+const phoneRef = useTemplateRef<HTMLInputElement>('phoneRef')
+const countryCode = ref('it')
+const validationIssues = ref<Record<string, string[]>>({})
+const queryCache = useQueryCache()
+
+const fieldRefs: Record<string, Readonly<ShallowRef<HTMLInputElement | null>>> = {
+  name: nameRef,
+  email: emailRef,
+  phone: phoneRef,
+}
+
+watch(
+  () => loginStore.userInfo,
+  (userInfo) => {
+    if (userInfo) {
+      name.value = userInfo.name || ''
+      email.value = userInfo.email || ''
+      if (userInfo.phone) {
+        const parsed = parsePhoneForForm(userInfo.phone)
+        countryCode.value = parsed.countryCode
+        phone.value = parsed.phone
+      } else {
+        countryCode.value = 'it'
+        phone.value = ''
+      }
+    }
+  },
+  { immediate: true },
+)
+
+function clearErrors() {
+  editUserReset()
+  validationIssues.value = {}
+}
+
+async function saveProfile() {
+  clearErrors()
+
+  if (loginStore.userInfo?.id) {
+    const profile = {
+      name: name.value,
+      email: email.value,
+      phone: combinePhoneParts(countryCode.value, phone.value),
+    }
+
+    const isValidationOk = validate(profile)
+    if (!isValidationOk) {
+      return
+    }
+    editUserMutate(profile)
+  }
+}
+
+function validate(profile: ProfileInfo): boolean {
+  validationIssues.value = {}
+  const validation = v.safeParse(ProfileInfoSchema, profile)
+
+  if (validation.success) {
+    // no validation issues
+    return true
+  } else {
+    const issues = v.flatten(validation.issues)
+
+    if (issues.nested) {
+      validationIssues.value = issues.nested as Record<string, string[]>
+
+      // focus the first field with error
+
+      const firstErrorFieldName = Object.keys(validationIssues.value)[0]
+      fieldRefs[firstErrorFieldName].value?.focus()
+    }
+    return false
+  }
+}
+
+function onEmailVerified() {
+  isVerifyEmailModalShown.value = false
+  loginStore.fetchTokenAndUserInfo()
+}
+
+function onVerifyEmailClosed() {
+  // Abandoned: the account still carries the old address, show that.
+  isVerifyEmailModalShown.value = false
+  email.value = loginStore.userInfo?.email || ''
+}
+
+function getKebabMenuItems() {
+  return [
+    {
+      id: 'removePicture',
+      label: t('account.remove_picture'),
+      icon: faCircleXmark,
+      action: () => {
+        isRemoveAvatarModalShown.value = true
+      },
+      disabled: !hasCustomAvatar.value,
+    },
+  ]
+}
+</script>
+
+<template>
+  <div>
+    <NeSkeleton v-if="loginStore.loadingUserInfo || editUserLoading" :lines="12" class="w-full" />
+    <form v-else @submit.prevent class="space-y-7">
+      <!-- avatar -->
+      <NeCard>
+        <div class="flex items-center justify-between gap-4">
+          <UserAvatar
+            size="3xl"
+            :name="loginStore.userDisplayName"
+            :is-owner="loginStore.isOwnerAccount"
+            :logto-id="loginStore.userInfo?.logto_id || ''"
+            :cache-key="loginStore.avatarVersion"
+            :has-avatar="hasCustomAvatar"
+          />
+          <div class="flex shrink-0 items-center gap-2">
+            <NeButton
+              kind="secondary"
+              type="button"
+              size="lg"
+              :disabled="loginStore.isOwnerAccount || loginStore.isImpersonating"
+              @click="isChangePictureDrawerShown = true"
+            >
+              <template #prefix>
+                <FontAwesomeIcon :icon="faPenToSquare" class="size-4" aria-hidden="true" />
+              </template>
+              {{ $t('account.change_picture') }}
+            </NeButton>
+            <!-- kebab menu -->
+            <NeDropdown
+              :items="getKebabMenuItems()"
+              :align-to-right="true"
+              :disabled="
+                loginStore.isOwnerAccount || loginStore.isImpersonating || !hasCustomAvatar
+              "
+            />
+          </div>
+        </div>
+      </NeCard>
+
+      <!-- name -->
+      <NeTextInput
+        ref="nameRef"
+        v-model="name"
+        @blur="name = name.trim()"
+        :label="$t('users.name')"
+        :invalid-message="validationIssues.name?.[0] ? $t(validationIssues.name[0]) : ''"
+        :disabled="editUserLoading || loginStore.isOwnerAccount || loginStore.isImpersonating"
+      />
+      <!-- email -->
+      <NeTextInput
+        ref="emailRef"
+        v-model="email"
+        @blur="email = email.trim()"
+        :label="$t('users.email')"
+        :invalid-message="validationIssues.email?.[0] ? $t(validationIssues.email[0]) : ''"
+        :disabled="editUserLoading || loginStore.isOwnerAccount || loginStore.isImpersonating"
+      />
+      <!-- phone -->
+      <div>
+        <div class="flex items-center justify-between gap-4">
+          <NeFormItemLabel>{{ $t('users.phone_number') }}</NeFormItemLabel>
+          <NeFormItemLabel>{{ $t('common.optional') }}</NeFormItemLabel>
+        </div>
+        <div class="flex gap-4">
+          <!-- country code -->
+          <NeCombobox
+            v-model="countryCode"
+            :options="countryCodeComboOptions"
+            :disabled="editUserLoading || loginStore.isOwnerAccount || loginStore.isImpersonating"
+            :no-results-label="$t('ne_combobox.no_results')"
+            :limited-options-label="$t('ne_combobox.limited_options_label')"
+            :no-options-label="$t('ne_combobox.no_options_label')"
+            :selected-label="$t('ne_combobox.selected')"
+            :user-input-label="$t('ne_combobox.user_input_label')"
+            :optional-label="$t('common.optional')"
+            custom-options-width="20rem"
+          />
+          <!-- local part -->
+          <NeTextInput
+            ref="phoneRef"
+            v-model="phone"
+            @blur="phone = phone.trim()"
+            :invalid-message="validationIssues.phone?.[0] ? $t(validationIssues.phone[0]) : ''"
+            :disabled="editUserLoading || loginStore.isOwnerAccount || loginStore.isImpersonating"
+            :optional="true"
+            :optional-label="t('common.optional')"
+          />
+        </div>
+      </div>
+      <!-- organization -->
+      <div>
+        <NeFormItemLabel>
+          {{ $t('users.organization') }}
+        </NeFormItemLabel>
+        <div>
+          <router-link
+            v-if="loginStore.ownOrganizationRoute"
+            :to="loginStore.ownOrganizationRoute"
+            class="cursor-pointer hover:underline"
+          >
+            {{ loginStore.userInfo?.organization_name }}
+          </router-link>
+          <span v-else>{{ loginStore.userInfo?.organization_name || '-' }}</span>
+          <span v-if="loginStore.userInfo?.org_role"> ({{ loginStore.userInfo?.org_role }})</span>
+        </div>
+      </div>
+      <!-- roles -->
+      <div>
+        <NeFormItemLabel>
+          {{ $t('users.role') }}
+        </NeFormItemLabel>
+        <div class="flex flex-wrap gap-1">
+          <UserRoleBadge
+            v-for="role in loginStore.userInfo?.user_roles.sort()"
+            :key="role"
+            :role="role"
+          />
+        </div>
+      </div>
+      <!-- edit user error notification -->
+      <NeInlineNotification
+        v-if="editUserError?.message && !isValidationError(editUserError)"
+        kind="error"
+        :title="t('account.cannot_save_profile_data')"
+        :description="editUserError.message"
+      />
+      <!-- save button -->
+      <NeButton
+        type="submit"
+        kind="primary"
+        size="lg"
+        :disabled="editUserLoading || loginStore.isOwnerAccount || loginStore.isImpersonating"
+        :loading="editUserLoading"
+        @click.prevent="saveProfile"
+      >
+        {{ $t('account.save_profile') }}
+      </NeButton>
+    </form>
+  </div>
+  <!-- change picture drawer -->
+  <ChangePictureDrawer
+    :is-shown="isChangePictureDrawerShown"
+    @close="isChangePictureDrawerShown = false"
+  />
+  <RemoveAvatarModal
+    :visible="isRemoveAvatarModalShown"
+    @close="isRemoveAvatarModalShown = false"
+  />
+  <VerifyEmailModal
+    :visible="isVerifyEmailModalShown"
+    :pending-email="pendingEmail"
+    @close="onVerifyEmailClosed"
+    @verified="onEmailVerified"
+  />
+</template>

@@ -1,0 +1,124 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import AlertsCounterCard from '@/components/dashboard/AlertsCounterCard.vue'
+import ApplicationsCounterCard from '@/components/dashboard/ApplicationsCounterCard.vue'
+import CustomersCounterCard from '@/components/dashboard/CustomersCounterCard.vue'
+import DistributorsCounterCard from '@/components/dashboard/DistributorsCounterCard.vue'
+import LegacySystemsCounterCard from '@/components/dashboard/LegacySystemsCounterCard.vue'
+import ResellersCounterCard from '@/components/dashboard/ResellersCounterCard.vue'
+import SystemsCounterCard from '@/components/dashboard/SystemsCounterCard.vue'
+import UsersCounterCard from '@/components/dashboard/UsersCounterCard.vue'
+import ThirdPartyAppInfo from '@/components/dashboard/ThirdPartyAppInfo.vue'
+import {
+  canReadApplications,
+  canReadCustomers,
+  canReadDistributors,
+  canReadResellers,
+  canReadSystems,
+  canReadUsers,
+  isEntitlementAdmin,
+} from '@/lib/permissions'
+import {
+  getThirdPartyApps,
+  getThirdPartyAppIcon,
+  getThirdPartyAppDescription,
+  openThirdPartyApp,
+  THIRD_PARTY_APPS_KEY,
+  isEnabled,
+  getButtonLabel,
+} from '@/lib/thirdPartyApps'
+import { useLoginStore } from '@/stores/login'
+import { faArrowUpRightFromSquare } from '@fortawesome/free-solid-svg-icons'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import { NeButton, NeCard, NeHeading, NeRoundedIcon, NeSkeleton } from '@nethesis/vue-components'
+import { useQuery } from '@pinia/colada'
+
+const loginStore = useLoginStore()
+const { state: thirdPartyApps } = useQuery({
+  key: [THIRD_PARTY_APPS_KEY],
+  enabled: () => !!loginStore.jwtToken,
+  query: getThirdPartyApps,
+})
+</script>
+
+<template>
+  <div>
+    <NeHeading tag="h3" class="mb-7">{{ $t('dashboard.title') }}</NeHeading>
+    <!-- organizations and users counters -->
+    <template v-if="!loginStore.userInfo">
+      <div class="grid grid-cols-1 gap-x-6 gap-y-6 sm:grid-cols-2 2xl:grid-cols-4">
+        <NeCard v-for="i in 6" :key="i">
+          <NeSkeleton :lines="3" class="w-full" />
+        </NeCard>
+      </div>
+    </template>
+    <template v-else>
+      <div class="grid grid-cols-1 gap-x-6 gap-y-6 sm:grid-cols-2 2xl:grid-cols-4">
+        <AlertsCounterCard v-if="canReadSystems()" />
+        <SystemsCounterCard v-if="canReadSystems()" />
+        <LegacySystemsCounterCard v-if="canReadSystems()" />
+        <ApplicationsCounterCard v-if="canReadApplications()" />
+      </div>
+      <div class="mt-6 grid grid-cols-1 gap-x-6 gap-y-6 sm:grid-cols-2 2xl:grid-cols-4">
+        <DistributorsCounterCard v-if="canReadDistributors()" />
+        <ResellersCounterCard v-if="canReadResellers()" />
+        <CustomersCounterCard v-if="canReadCustomers()" />
+        <UsersCounterCard v-if="canReadUsers()" />
+      </div>
+    </template>
+    <div class="mt-6 grid grid-cols-1 gap-x-6 gap-y-6 sm:grid-cols-2 2xl:grid-cols-4">
+      <!-- loading third party apps -->
+      <template v-if="thirdPartyApps.status === 'pending'">
+        <NeCard v-for="i in 4" :key="i">
+          <div class="flex flex-col items-start gap-4">
+            <NeSkeleton :lines="3" class="w-full" />
+          </div>
+        </NeCard>
+      </template>
+      <!-- third party apps -->
+      <NeCard v-else v-for="thirdPartyApp in thirdPartyApps.data" :key="thirdPartyApp.id">
+        <div class="flex h-full flex-col justify-between gap-4">
+          <div class="flex flex-col items-start gap-4">
+            <div class="flex items-center gap-3">
+              <NeRoundedIcon kind="gray" :customIcon="getThirdPartyAppIcon(thirdPartyApp)" />
+              <NeHeading tag="h6">
+                {{ thirdPartyApp.branding.display_name }}
+              </NeHeading>
+            </div>
+            <p>
+              {{ $t(getThirdPartyAppDescription(thirdPartyApp)) }}
+            </p>
+            <!--
+              App-provided summary widget (info_url), rendered generically.
+              Hidden for the Owner organization (Nethesis-internal): the shop
+              account data is meaningful for the transacting partners
+              (distributor/reseller/customer), not for platform admins.
+            -->
+            <ThirdPartyAppInfo
+              v-if="isEnabled(thirdPartyApp) && !isEntitlementAdmin()"
+              :app="thirdPartyApp"
+              class="w-full"
+            />
+          </div>
+          <NeButton
+            kind="secondary"
+            :disabled="!isEnabled(thirdPartyApp)"
+            class="self-end"
+            @click="openThirdPartyApp(thirdPartyApp)"
+          >
+            <template #prefix>
+              <FontAwesomeIcon :icon="faArrowUpRightFromSquare" aria-hidden="true" />
+            </template>
+            {{ getButtonLabel(thirdPartyApp) }}
+          </NeButton>
+        </div>
+      </NeCard>
+    </div>
+  </div>
+</template>
+
+<style scoped></style>

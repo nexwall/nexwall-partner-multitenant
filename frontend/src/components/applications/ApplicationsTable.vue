@@ -1,0 +1,437 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import {
+  faBuilding,
+  faMagnifyingGlass,
+  faEye,
+  faPenToSquare,
+} from '@fortawesome/free-solid-svg-icons'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import {
+  NeTable,
+  NeTableHead,
+  NeTableHeadCell,
+  NeTableBody,
+  NeTableRow,
+  NeTableCell,
+  NePaginator,
+  NeButton,
+  NeEmptyState,
+  NeInlineNotification,
+  NeTextInput,
+  NeDropdown,
+  type SortEvent,
+  type NeDropdownItem,
+  NeDropdownFilterV2,
+  NeSortDropdown,
+} from '@nethesis/vue-components'
+import { computed, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { savePageSizeToStorage, PAGE_SIZE_OPTIONS } from '@/lib/tablePageSize'
+import { canManageApplications } from '@/lib/permissions'
+import { isUserCustomer } from '@/lib/organizations/organizations'
+import { APPLICATIONS_TABLE_ID } from '@/lib/applications/applications'
+import OrganizationIconAndLink from '@/components/organizations/OrganizationIconAndLink.vue'
+import { useApplications } from '@/queries/applications/applications'
+import { getDisplayName, type Application } from '@/lib/applications/applications'
+import ApplicationLogo from './ApplicationLogo.vue'
+import { faGridOne } from '@nethesis/nethesis-solid-svg-icons'
+import AssignOrganizationDrawer from './AssignOrganizationDrawer.vue'
+import SetNotesDrawer from './SetNotesDrawer.vue'
+import { useApplicationFilters } from '@/queries/applications/applicationFilters'
+import { buildVersionFilterOptions } from '@/lib/applications/applicationFilters'
+import router from '@/router'
+import UpdatingSpinner from '@/components/common/UpdatingSpinner.vue'
+import SystemDropdownFilter from '@/components/systems/SystemDropdownFilter.vue'
+import OrganizationDropdownFilter from '@/components/organizations/OrganizationDropdownFilter.vue'
+import SystemLogoAndLink from '../systems/SystemLogoAndLink.vue'
+
+const { t } = useI18n()
+const {
+  state,
+  asyncStatus,
+  pageNum,
+  pageSize,
+  textFilter,
+  debouncedTextFilter,
+  typeFilter,
+  versionFilter,
+  systemFilter,
+  organizationFilter,
+  includeHierarchy,
+  sortBy,
+  sortDescending,
+  clearFilters,
+} = useApplications()
+
+const { state: applicationFiltersState } = useApplicationFilters()
+
+const currentApplication = ref<Application | undefined>()
+const isShownAssignOrgDrawer = ref(false)
+const isShownSetNotesDrawer = ref(false)
+
+const applicationsPage = computed(() => {
+  return state.value.data?.applications || []
+})
+
+const pagination = computed(() => {
+  return state.value.data?.pagination
+})
+
+const typeFilterOptions = computed(() => {
+  if (!applicationFiltersState.value.data?.types) {
+    return []
+  } else {
+    return applicationFiltersState.value.data.types.map((appType) => ({
+      id: appType.instance_of,
+      label: appType.name,
+    }))
+  }
+})
+
+const versionFilterOptions = computed(() => {
+  if (!applicationFiltersState.value.data?.versions) {
+    return []
+  } else {
+    if (typeFilter.value.length === 0) {
+      // no application selected, show all versions
+      return buildVersionFilterOptions(applicationFiltersState.value.data.versions)
+    }
+
+    // filter versions based on selected applications
+    const selectedTypeIds = typeFilter.value.map((o) => o.id)
+    const applicationVersions = applicationFiltersState.value.data.versions.filter((el) =>
+      selectedTypeIds.includes(el.application),
+    )
+    return buildVersionFilterOptions(applicationVersions)
+  }
+})
+
+const isFiltered = computed(() => {
+  return (
+    !!debouncedTextFilter.value ||
+    !!typeFilter.value.length ||
+    !!versionFilter.value.length ||
+    !!systemFilter.value.length ||
+    !!organizationFilter.value.length
+  )
+})
+
+const isNoDataEmptyStateShown = computed(() => {
+  return !applicationsPage.value?.length && state.value.status === 'success' && !isFiltered.value
+})
+
+const isNoMatchEmptyStateShown = computed(() => {
+  return !applicationsPage.value?.length && state.value.status === 'success' && !!isFiltered.value
+})
+
+const noEmptyStateShown = computed(() => {
+  return !isNoDataEmptyStateShown.value && !isNoMatchEmptyStateShown.value
+})
+
+watch(
+  () => typeFilter.value,
+  () => {
+    // reset version filter when product filter changes
+    versionFilter.value = []
+  },
+)
+
+function showAssignOrgDrawer(application: Application) {
+  currentApplication.value = application
+  isShownAssignOrgDrawer.value = true
+}
+
+function showSetNotesDrawer(application: Application) {
+  currentApplication.value = application
+  isShownSetNotesDrawer.value = true
+}
+
+function getKebabMenuItems(application: Application) {
+  const items: NeDropdownItem[] = []
+
+  if (canManageApplications()) {
+    items.push({
+      id: 'assignOrganization',
+      label: application.organization?.logto_id
+        ? t('applications.reassign_organization')
+        : t('applications.assign_organization'),
+      icon: faBuilding,
+      action: () => showAssignOrgDrawer(application),
+    })
+
+    items.push({
+      id: 'setNotes',
+      label: application?.notes ? t('applications.edit_notes') : t('applications.add_notes'),
+      icon: faPenToSquare,
+      action: () => showSetNotesDrawer(application),
+    })
+  }
+  return items
+}
+
+const onSort = (payload: SortEvent) => {
+  sortBy.value = payload.key as keyof Application
+  sortDescending.value = payload.descending
+}
+
+const goToApplicationDetails = (application: Application) => {
+  router
+    .push({ name: 'application_detail', params: { applicationId: application.id } })
+    .catch((error) => {
+      // router.push() swallows navigation failures by default; log them so an
+      // intermittent "URL changes but the page doesn't" report leaves a trace
+      console.error('[goToApplicationDetails]', error)
+    })
+}
+</script>
+
+<template>
+  <div>
+    <!-- get applications error notification -->
+    <NeInlineNotification
+      v-if="state.status === 'error'"
+      kind="error"
+      :title="$t('applications.cannot_retrieve_applications')"
+      :description="state.error.message"
+      class="mb-6"
+    />
+    <!-- company hierarchy filter notification -->
+    <NeInlineNotification
+      v-if="includeHierarchy && organizationFilter.length === 1"
+      kind="info"
+      :title="$t('applications.hierarchy_filter_title')"
+      :description="
+        $t('applications.hierarchy_filter_description', { name: organizationFilter[0].label })
+      "
+      :secondary-button-label="$t('applications.hierarchy_filter_exact')"
+      class="mb-6"
+      @secondary-click="includeHierarchy = false"
+    />
+    <!-- empty state -->
+    <NeEmptyState
+      v-if="isNoDataEmptyStateShown"
+      :title="$t('applications.no_applications')"
+      :description="$t('applications.no_applications_description')"
+      :icon="faGridOne"
+      class="bg-white dark:bg-gray-950"
+    />
+    <template v-if="!isNoDataEmptyStateShown">
+      <!-- table toolbar -->
+      <div class="mb-6 flex items-center gap-4">
+        <div class="flex w-full items-end justify-between gap-4">
+          <!-- filters -->
+          <div class="flex flex-wrap items-center gap-4">
+            <!-- text filter -->
+            <NeTextInput
+              v-model="textFilter"
+              @blur="textFilter = textFilter.trim()"
+              is-search
+              :placeholder="$t('applications.filter_applications')"
+              class="max-w-48 sm:max-w-sm"
+            />
+            <NeDropdownFilterV2
+              v-model="typeFilter"
+              kind="checkbox"
+              :disabled="applicationFiltersState.status === 'pending'"
+              :label="t('applications.type')"
+              :options="typeFilterOptions"
+              show-options-filter
+              :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+              :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+              :no-options-label="t('ne_dropdown_filter.no_options')"
+              :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+              :clear-search-label="t('ne_dropdown_filter.clear_search')"
+              :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+            />
+            <NeDropdownFilterV2
+              v-model="versionFilter"
+              kind="checkbox"
+              :disabled="applicationFiltersState.status === 'pending'"
+              :label="t('applications.version')"
+              :options="versionFilterOptions"
+              show-options-filter
+              :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+              :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+              :no-options-label="t('ne_dropdown_filter.no_options')"
+              :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+              :clear-search-label="t('ne_dropdown_filter.clear_search')"
+              :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+            />
+            <SystemDropdownFilter v-model="systemFilter" id-field="id" />
+            <OrganizationDropdownFilter
+              v-if="!isUserCustomer()"
+              v-model="organizationFilter"
+              show-no-company-option
+            />
+            <!-- sort dropdown -->
+            <NeSortDropdown
+              v-model:sort-key="sortBy"
+              v-model:sort-descending="sortDescending"
+              :label="t('sort.sort')"
+              :options="[
+                { id: 'display_name', label: t('applications.name') },
+                { id: 'instance_of', label: t('applications.type') },
+                { id: 'version', label: t('applications.version') },
+                { id: 'system_name', label: t('systems.system') },
+                { id: 'organization_name', label: t('organizations.organization') },
+              ]"
+              :open-menu-aria-label="t('ne_dropdown.open_menu')"
+              :sort-by-label="t('sort.sort_by')"
+              :sort-direction-label="t('sort.direction')"
+              :ascending-label="t('sort.ascending')"
+              :descending-label="t('sort.descending')"
+            />
+            <NeButton kind="tertiary" @click="clearFilters">
+              {{ t('common.clear_filters') }}
+            </NeButton>
+          </div>
+          <!-- update indicator -->
+          <UpdatingSpinner v-if="asyncStatus === 'loading' && state.status !== 'pending'" />
+        </div>
+      </div>
+      <!-- no application matching filter -->
+      <NeEmptyState
+        v-if="isNoMatchEmptyStateShown"
+        :title="$t('applications.no_applications_found')"
+        :description="$t('common.try_changing_search_filters')"
+        :icon="faMagnifyingGlass"
+        class="bg-white dark:bg-gray-950"
+      >
+        <NeButton kind="tertiary" @click="clearFilters">
+          {{ $t('common.clear_filters') }}
+        </NeButton>
+      </NeEmptyState>
+      <NeTable
+        v-if="noEmptyStateShown"
+        :sort-key="sortBy"
+        :sort-descending="sortDescending"
+        :aria-label="$t('applications.title')"
+        card-breakpoint="2xl"
+        :loading="state.status === 'pending'"
+        :skeleton-columns="5"
+        :skeleton-rows="7"
+      >
+        <NeTableHead>
+          <NeTableHeadCell sortable column-key="display_name" @sort="onSort">{{
+            $t('applications.name')
+          }}</NeTableHeadCell>
+          <NeTableHeadCell sortable column-key="instance_of" @sort="onSort">{{
+            $t('applications.type')
+          }}</NeTableHeadCell>
+          <NeTableHeadCell sortable column-key="version" @sort="onSort">{{
+            $t('applications.version')
+          }}</NeTableHeadCell>
+          <NeTableHeadCell sortable column-key="system_name" @sort="onSort">{{
+            $t('systems.system')
+          }}</NeTableHeadCell>
+          <NeTableHeadCell sortable column-key="organization_name" @sort="onSort">{{
+            $t('organizations.organization')
+          }}</NeTableHeadCell>
+          <NeTableHeadCell>
+            <!-- no header for actions -->
+          </NeTableHeadCell>
+        </NeTableHead>
+        <NeTableBody>
+          <NeTableRow v-for="item in applicationsPage" :key="item.id">
+            <NeTableCell :data-label="$t('applications.name')">
+              <router-link
+                :to="{ name: 'application_detail', params: { applicationId: item.id } }"
+                class="cursor-pointer font-medium hover:underline"
+              >
+                {{ getDisplayName(item) }}
+              </router-link>
+            </NeTableCell>
+            <NeTableCell :data-label="$t('applications.type')">
+              <div class="flex items-center gap-2">
+                <ApplicationLogo :app="item.instance_of" />
+                <span class="font-medium">
+                  {{ item.name || '-' }}
+                </span>
+              </div>
+            </NeTableCell>
+            <NeTableCell
+              :data-label="$t('applications.version')"
+              class="break-all 2xl:break-normal"
+            >
+              <div>
+                {{ item.version || '-' }}
+              </div>
+            </NeTableCell>
+            <NeTableCell :data-label="$t('systems.system')">
+              <SystemLogoAndLink
+                :system-id="item.system.id"
+                :system-name="item.system.name"
+                system-type="ns8"
+              />
+            </NeTableCell>
+            <NeTableCell :data-label="$t('organizations.organization')">
+              <OrganizationIconAndLink v-if="item.organization" :organization="item.organization" />
+              <span v-else>-</span>
+            </NeTableCell>
+            <NeTableCell :data-label="$t('common.actions')">
+              <div class="-ml-2.5 flex gap-2 2xl:ml-0 2xl:justify-end">
+                <NeButton
+                  v-if="item.status !== 'deleted'"
+                  kind="tertiary"
+                  @click="goToApplicationDetails(item)"
+                >
+                  <template #prefix>
+                    <FontAwesomeIcon :icon="faEye" class="h-4 w-4" aria-hidden="true" />
+                  </template>
+                  {{ $t('common.details') }}
+                </NeButton>
+                <!-- kebab menu -->
+                <NeDropdown
+                  v-if="canManageApplications()"
+                  :items="getKebabMenuItems(item)"
+                  :align-to-right="true"
+                />
+              </div>
+            </NeTableCell>
+          </NeTableRow>
+        </NeTableBody>
+        <template #paginator>
+          <NePaginator
+            :current-page="pageNum"
+            :total-rows="pagination?.total_count || 0"
+            :page-size="pageSize"
+            :page-sizes="PAGE_SIZE_OPTIONS"
+            :nav-pagination-label="$t('ne_table.pagination')"
+            :next-label="$t('ne_table.go_to_next_page')"
+            :previous-label="$t('ne_table.go_to_previous_page')"
+            :range-of-total-label="$t('ne_table.of')"
+            :page-size-label="$t('ne_table.show')"
+            @select-page="
+              (page: number) => {
+                pageNum = page
+              }
+            "
+            @select-page-size="
+              (size: number) => {
+                pageSize = size
+                savePageSizeToStorage(APPLICATIONS_TABLE_ID, size)
+              }
+            "
+          />
+        </template>
+      </NeTable>
+    </template>
+    <!-- assign organization drawer -->
+    <AssignOrganizationDrawer
+      :is-shown="isShownAssignOrgDrawer"
+      :current-application="currentApplication"
+      @close="isShownAssignOrgDrawer = false"
+    />
+    <!-- set notes drawer -->
+    <SetNotesDrawer
+      :is-shown="isShownSetNotesDrawer"
+      :current-application="currentApplication"
+      @close="isShownSetNotesDrawer = false"
+    />
+  </div>
+</template>

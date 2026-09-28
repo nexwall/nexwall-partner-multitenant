@@ -1,0 +1,176 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import {
+  NeBadgeV2,
+  NeHeading,
+  NeInlineNotification,
+  NeSkeleton,
+  NeTabs,
+} from '@nethesis/vue-components'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+/*//// import { faArrowUpRightFromSquare } from '@fortawesome/free-solid-svg-icons' */
+import PageBreadcrumb from '@/components/common/PageBreadcrumb.vue'
+import OrganizationLink from '@/components/organizations/OrganizationLink.vue'
+import { getOrganizationIcon } from '@/lib/organizations/organizations'
+import { canReadAddons, canReadSystems } from '@/lib/permissions'
+import { useSystemDetail } from '@/queries/systems/systemDetail'
+import { useTabs } from '@/composables/useTabs'
+import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
+import type { Tab } from '@nethesis/vue-components'
+import SystemOverviewPanel from '@/components/systems/SystemOverviewPanel.vue'
+import SystemHardwarePanel from '@/components/systems/SystemHardwarePanel.vue'
+import SystemChangeHistoryPanel from '@/components/systems/SystemChangeHistoryPanel.vue'
+import SystemBackupsPanel from '@/components/systems/SystemBackupsPanel.vue'
+import SystemAlertsPanel from '@/components/systems/SystemAlertsPanel.vue'
+import SystemAddonsPanel from '@/components/systems/SystemAddonsPanel.vue'
+import { useLatestInventory } from '@/queries/systems/latestInventory'
+import { useLoginStore } from '@/stores/login'
+
+const { t } = useI18n()
+const loginStore = useLoginStore()
+const { state: systemDetail } = useSystemDetail()
+const { state: latestInventory } = useLatestInventory()
+// const { state: reachabilityState, asyncStatus: reachabilityAsyncStatus } = useSystemReachability() ////
+
+// Add-ons are only listed to companies allowed to see what they hold; every
+// other tab is available to anyone who can read the system.
+const tabsConfig = computed((): Tab[] => {
+  const tabs: Tab[] = [
+    { name: 'overview', label: t('system_detail.overview') },
+    { name: 'hardware', label: t('system_detail.hardware') },
+    { name: 'change_history', label: t('system_detail.change_history') },
+    { name: 'alert_history', label: t('alerts.title') },
+    { name: 'backups', label: t('backups.title') },
+  ]
+
+  if (canReadAddons()) {
+    tabs.push({ name: 'addons', label: t('addons.title') })
+  }
+  return tabs
+})
+
+const { tabs, selectedTab } = useTabs(tabsConfig)
+
+////
+// const isSystemReachable = computed(() => !!reachabilityState.value.data?.reachable)
+// const isCheckingReachability = computed(() => reachabilityAsyncStatus.value === 'loading')
+// const isGoToSystemDisabled = computed(
+//   () => isCheckingReachability.value || !isSystemReachable.value,
+// )
+
+// const openSystem = () => {
+//   const url = reachabilityState.value.data?.url
+//   if (url) {
+//     window.open(url, '_blank')
+//   }
+// }
+</script>
+
+<template>
+  <div>
+    <PageBreadcrumb
+      :section="$t('systems.title')"
+      :to="canReadSystems() ? '/systems' : undefined"
+      :current="systemDetail.data?.name"
+      :loading="systemDetail.status === 'pending'"
+    />
+    <!-- get system detail error notification -->
+    <NeInlineNotification
+      v-if="systemDetail.status === 'error'"
+      kind="error"
+      :title="$t('system_detail.cannot_retrieve_system_detail')"
+      :description="systemDetail.error.message"
+      class="mb-6"
+    />
+    <NeSkeleton v-else-if="systemDetail.status === 'pending'" size="lg" class="mb-9 w-xs" />
+    <div v-else class="flex items-start justify-between gap-4">
+      <div class="mb-7 flex flex-wrap items-center gap-4">
+        <NeHeading tag="h3">
+          {{ systemDetail.data?.name }}
+        </NeHeading>
+        <!-- owning company -->
+        <NeBadgeV2 v-if="systemDetail.data?.organization" kind="indigo">
+          <div class="flex items-center gap-1.5">
+            <FontAwesomeIcon
+              :icon="getOrganizationIcon(systemDetail.data.organization.type)"
+              class="size-4"
+              aria-hidden="true"
+            />
+            <OrganizationLink :organization="systemDetail.data.organization" />
+          </div>
+        </NeBadgeV2>
+      </div>
+      <div class="flex shrink-0 items-center gap-2">
+        <!-- go to system button ////
+        <NeSpinner v-if="reachabilityState.status === 'pending'" color="white" />
+        <NeTooltip
+          v-if="!isSystemReachable"
+          placement="left"
+          trigger-event="mouseenter focus"
+          class="shrink-0"
+        >
+          <template #trigger>
+            <NeButton kind="primary" :disabled="isGoToSystemDisabled">
+              <template #prefix>
+                <FontAwesomeIcon :icon="faArrowUpRightFromSquare" aria-hidden="true" />
+              </template>
+              {{ $t('system_detail.go_to_system') }}
+            </NeButton>
+          </template>
+          <template #content>
+            {{
+              isCheckingReachability
+                ? $t('system_detail.checking_reachability')
+                : $t('system_detail.system_unreachable')
+            }}
+          </template>
+        </NeTooltip>
+        <NeButton
+          v-else
+          kind="primary"
+          :disabled="isGoToSystemDisabled"
+          class="shrink-0"
+          @click="openSystem()"
+        >
+          <template #prefix>
+            <FontAwesomeIcon :icon="faArrowUpRightFromSquare" aria-hidden="true" />
+          </template>
+          {{ $t('system_detail.go_to_system') }}
+        </NeButton>
+        -->
+      </div>
+    </div>
+    <!-- no inventory notification -->
+    <NeInlineNotification
+      v-if="latestInventory.status === 'success' && !latestInventory.data"
+      kind="warning"
+      :title="$t('system_detail.no_inventory_available')"
+      :description="$t('system_detail.no_inventory_available_description')"
+      class="mb-4"
+    />
+    <!-- The tab list is not final until permissions are in: NeTabs falls back
+         to the first tab when the selected one is missing, which would turn a
+         ?tab=addons deep link into ?tab=overview on a cold load. -->
+    <NeSkeleton v-if="loginStore.loadingUserInfo" size="sm" class="mb-8 w-md" />
+    <NeTabs
+      v-else
+      :tabs="tabs"
+      :selected="selectedTab"
+      :sr-tabs-label="t('ne_tabs.tabs')"
+      :sr-select-tab-label="t('ne_tabs.select_a_tab')"
+      class="mb-8"
+      @select-tab="selectedTab = $event"
+    />
+    <SystemOverviewPanel v-if="selectedTab === 'overview'" />
+    <SystemHardwarePanel v-else-if="selectedTab === 'hardware'" />
+    <SystemChangeHistoryPanel v-else-if="selectedTab === 'change_history'" />
+    <SystemAlertsPanel v-else-if="selectedTab === 'alert_history'" />
+    <SystemBackupsPanel v-else-if="selectedTab === 'backups'" />
+    <SystemAddonsPanel v-else-if="selectedTab === 'addons'" />
+  </div>
+</template>

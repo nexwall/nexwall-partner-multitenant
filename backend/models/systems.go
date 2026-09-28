@@ -1,0 +1,191 @@
+/*
+Copyright (C) 2025 Nethesis S.r.l.
+SPDX-License-Identifier: AGPL-3.0-or-later
+*/
+
+package models
+
+import "time"
+
+// Organization represents an organization with its type
+type Organization struct {
+	ID      string `json:"id" structs:"id"`             // Database UUID
+	LogtoID string `json:"logto_id" structs:"logto_id"` // Logto organization ID
+	Name    string `json:"name" structs:"name"`
+	Type    string `json:"type" structs:"type"` // owner, distributor, reseller, customer
+}
+
+// SystemCreator represents the user who created the system. The user identity
+// fields are point-in-time; OrganizationName is kept in sync on org renames by
+// propagateCreatorOrgRename.
+type SystemCreator struct {
+	UserID           string `json:"user_id" structs:"user_id"`
+	Username         string `json:"username" structs:"username"`
+	Name             string `json:"name" structs:"name"`
+	Email            string `json:"email" structs:"email"`
+	OrganizationID   string `json:"organization_id" structs:"organization_id"`
+	OrganizationName string `json:"organization_name" structs:"organization_name"`
+	// OrganizationType is the creator organization's current level, resolved at
+	// read time rather than stored, so a promotion is reflected without a
+	// backfill of the snapshots. The Owner organization is labelled "owner";
+	// only a deleted organization leaves the field omitted. See
+	// models.CreatorOrgRef.
+	OrganizationType string `json:"organization_type,omitempty" structs:"-"`
+	// OnBehalfOf is true when the system was attributed to a different org via
+	// created_by_organization_id: the user acted on behalf of organization_name
+	// rather than belonging to it. Omitted (false) on the default own-org path.
+	OnBehalfOf bool `json:"on_behalf_of,omitempty" structs:"on_behalf_of,omitempty"`
+}
+
+// AttributeToOrg re-points the system creator snapshot's organization to an
+// attributed owner org (resolved from created_by_organization_id) while keeping
+// the user identity that actually performed the action. The system's ownership
+// and RBAC are governed by its organization_id, not by this snapshot, so this is
+// display/audit only. No-op when orgID/orgName are empty or already match.
+func (c *SystemCreator) AttributeToOrg(orgID, orgName string) {
+	if c == nil || orgID == "" || orgName == "" || orgID == c.OrganizationID {
+		return
+	}
+	c.OrganizationID = orgID
+	c.OrganizationName = orgName
+	c.OnBehalfOf = true
+}
+
+// CreatorOrgID implements CreatorOrgRef.
+func (c *SystemCreator) CreatorOrgID() string {
+	if c == nil {
+		return ""
+	}
+	return c.OrganizationID
+}
+
+// SetCreatorOrgType implements CreatorOrgRef.
+func (c *SystemCreator) SetCreatorOrgType(orgType string) {
+	if c == nil {
+		return
+	}
+	c.OrganizationType = orgType
+}
+
+// System represents a managed system in the infrastructure
+type System struct {
+	ID               string            `json:"id" structs:"id"`
+	Name             string            `json:"name" structs:"name"`
+	Type             *string           `json:"type" structs:"type"`     // ns8, nsec, etc. - nullable until first inventory
+	Status           string            `json:"status" structs:"status"` // Unified status: unknown, active, inactive, suspended, deleted
+	FQDN             string            `json:"fqdn" structs:"fqdn"`
+	IPv4Address      string            `json:"ipv4_address" structs:"ipv4_address"`
+	IPv6Address      string            `json:"ipv6_address" structs:"ipv6_address"`
+	Version          string            `json:"version" structs:"version"`
+	CustomData       map[string]string `json:"custom_data" structs:"custom_data"`
+	Organization     Organization      `json:"organization" structs:"organization"` // Organization details with type
+	SystemKey        string            `json:"system_key" structs:"system_key"`
+	SystemSecret     string            `json:"system_secret,omitempty" structs:"system_secret"` // Returned during creation and regeneration
+	Notes            string            `json:"notes" structs:"notes"`
+	CreatedAt        time.Time         `json:"created_at" structs:"created_at"`
+	UpdatedAt        time.Time         `json:"updated_at" structs:"updated_at"`
+	DeletedAt        *time.Time        `json:"deleted_at" structs:"deleted_at"`                   // Soft delete timestamp
+	RegisteredAt     *time.Time        `json:"registered_at" structs:"registered_at"`             // Registration timestamp
+	UnregisteredAt   *time.Time        `json:"unregistered_at" structs:"unregistered_at"`         // Terminal: the system gave up its credentials
+	SuspendedAt      *time.Time        `json:"suspended_at" structs:"suspended_at"`               // Suspension timestamp
+	SuspendedByOrgID *string           `json:"suspended_by_org_id" structs:"suspended_by_org_id"` // Organization that caused cascade suspension
+	DeletedByOrgID   *string           `json:"deleted_by_org_id" structs:"deleted_by_org_id"`     // Organization that caused cascade soft-deletion
+	CreatedBy        SystemCreator     `json:"created_by" structs:"created_by"`
+	LastHeartbeat    *time.Time        `json:"last_heartbeat,omitempty"` // Last heartbeat timestamp
+	LastInventory    *time.Time        `json:"last_inventory,omitempty"` // Last inventory timestamp (NULL = never received)
+
+	// First contact timestamps, populated by the single-system read only
+	// (GetByID): they need per-system lookups that a list query cannot
+	// afford. NULL = that kind of data never arrived.
+	FirstHeartbeat *time.Time `json:"first_heartbeat,omitempty"` // First heartbeat received
+	FirstInventory *time.Time `json:"first_inventory,omitempty"` // First inventory received
+
+	// Rebranding info (populated by handler)
+	RebrandingEnabled bool    `json:"rebranding_enabled"`
+	RebrandingOrgID   *string `json:"rebranding_org_id,omitempty"`
+
+	// Addons lists the catalog ids of the add-ons granted and still valid on
+	// the system. The list endpoint fills it only when asked
+	// (include_addons=true): it costs one extra query per page, which an
+	// export over tens of thousands of rows has no use for.
+	Addons []string `json:"addons,omitempty"`
+}
+
+// SystemListFilters carries the column filters of the systems list. They all
+// narrow the result within the caller's RBAC scope, which is resolved
+// separately and can never be widened from here. Multiple values of the same
+// filter match any of them (OR), different filters are ANDed.
+type SystemListFilters struct {
+	Name            string   // substring match on the system name
+	SystemKeys      []string // exact system keys
+	Types           []string // product: nsec, ns8, …
+	CreatedBy       []string // user id or organization id of the creator
+	Versions        []string // "product:version", or a bare version
+	OrganizationIDs []string // owning organization (logto id)
+	Statuses        []string // unified status, including suspended/no_inventory
+	Addons          []string // catalog ids of add-ons the system must hold
+}
+
+// IsSuspended returns true if the system is suspended
+func (s *System) IsSuspended() bool {
+	return s.SuspendedAt != nil
+}
+
+// CreateSystemRequest represents the request payload for creating a new system
+type CreateSystemRequest struct {
+	Name           string            `json:"name" binding:"required" structs:"name"`
+	OrganizationID string            `json:"organization_id" binding:"required" structs:"organization_id"`
+	CustomData     map[string]string `json:"custom_data" structs:"custom_data"`
+	Notes          string            `json:"notes" structs:"notes"`
+	// CreatedByOrganizationID, when set by an owner or distributor, attributes the
+	// new system's created_by display org to an ancestor org in their hierarchy
+	// (e.g. a bulk import creating systems on behalf of a reseller) instead of the
+	// caller's own org. Display/audit only — system ownership and visibility stay
+	// governed by OrganizationID. Resolved via
+	// LocalOrganizationService.ResolveCreatedByOrg.
+	CreatedByOrganizationID string `json:"created_by_organization_id,omitempty" structs:"-"`
+	// CreatedAt/RegisteredAt, when set by an owner or distributor, carry the
+	// timestamps a system already has in an external source of record (e.g. a bulk
+	// import), instead of stamping the API call time. RegisteredAt makes the system
+	// born registered: /api/systems/register is not needed and would return 409.
+	// Neither may be in the future.
+	CreatedAt    *time.Time `json:"created_at,omitempty" structs:"-"`
+	RegisteredAt *time.Time `json:"registered_at,omitempty" structs:"-"`
+}
+
+// UpdateSystemRequest represents the request payload for updating an existing system
+type UpdateSystemRequest struct {
+	Name           string            `json:"name" structs:"name"`
+	OrganizationID string            `json:"organization_id" structs:"organization_id"`
+	CustomData     map[string]string `json:"custom_data" structs:"custom_data"`
+	Notes          string            `json:"notes" structs:"notes"`
+}
+
+// RegisterSystemRequest represents the request payload for registering a system
+type RegisterSystemRequest struct {
+	SystemSecret string `json:"system_secret" binding:"required" structs:"system_secret"`
+}
+
+// RegisterSystemResponse represents the response for successful system registration
+type RegisterSystemResponse struct {
+	SystemKey    string    `json:"system_key" structs:"system_key"`
+	RegisteredAt time.Time `json:"registered_at" structs:"registered_at"`
+}
+
+// TrendDataPoint represents a single data point in a trend chart
+type TrendDataPoint struct {
+	Date  string `json:"date"`
+	Count int    `json:"count"`
+}
+
+// TrendResponse represents the trend data for a given period
+type TrendResponse struct {
+	Period          int              `json:"period"`
+	PeriodLabel     string           `json:"period_label"`
+	CurrentTotal    int              `json:"current_total"`
+	PreviousTotal   int              `json:"previous_total"`
+	Delta           int              `json:"delta"`
+	DeltaPercentage float64          `json:"delta_percentage"`
+	Trend           string           `json:"trend"` // "up", "down", "stable"
+	DataPoints      []TrendDataPoint `json:"data_points"`
+}

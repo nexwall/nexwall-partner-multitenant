@@ -1,0 +1,383 @@
+//  Copyright (C) 2025 Nethesis S.r.l.
+//  SPDX-License-Identifier: GPL-3.0-or-later
+
+import axios from 'axios'
+import { API_URL } from '../config'
+import { useLoginStore } from '@/stores/login'
+import * as v from 'valibot'
+import { type Pagination } from '../common'
+import type { ImportValidationResult, ImportConfirmResult } from './organizations'
+
+export const CUSTOMERS_KEY = 'customers'
+export const CUSTOMERS_TOTAL_KEY = 'customersTotal'
+export const CUSTOMERS_TABLE_ID = 'customersTable'
+
+export type CustomerStatus = 'enabled' | 'suspended' | 'deleted'
+
+export const CreateCustomerSchema = v.object({
+  name: v.pipe(v.string(), v.nonEmpty('organizations.name_cannot_be_empty')),
+  custom_data: v.object({
+    vat: v.pipe(v.string(), v.nonEmpty('organizations.custom_data_vat_cannot_be_empty')),
+    address: v.optional(v.string()),
+    city: v.optional(v.string()),
+    main_contact: v.optional(v.string()),
+    email: v.optional(
+      v.union([
+        v.literal(''),
+        v.pipe(v.string(), v.email('organizations.custom_data_email_invalid')),
+      ]),
+    ),
+    phone: v.optional(
+      v.union([
+        v.literal(''),
+        v.pipe(
+          v.string(),
+          v.regex(/^\+?[\d\s\-\(\)]{7,20}$/, 'organizations.custom_data_phone_invalid_format'),
+        ),
+      ]),
+    ),
+    language: v.optional(v.string()),
+    notes: v.optional(v.string()),
+  }),
+  // Optional: attribute the new customer to an ancestor org (instead of the
+  // caller's own org) to preserve hierarchical ownership when an upper tier
+  // creates it on behalf of a lower one. Empty = owned by the caller's org.
+  created_by_organization_id: v.optional(v.string()),
+})
+
+export const EditCustomerSchema = v.object({
+  ...CreateCustomerSchema.entries,
+  logto_id: v.string(),
+})
+
+export const CustomerSchema = v.object({
+  ...CreateCustomerSchema.entries,
+  ...EditCustomerSchema.entries,
+  created_at: v.optional(v.string()),
+  suspended_at: v.optional(v.string()),
+  deleted_at: v.optional(v.string()),
+  systems_count: v.number(),
+  customers_count: v.number(),
+  // Resolved rebranding flag: true when this organization inherits or holds a
+  // rebranding grant. Populated by the detail and list handlers alike.
+  rebranding_enabled: v.optional(v.boolean()),
+  created_by: v.optional(
+    v.object({
+      user_id: v.string(),
+      username: v.string(),
+      name: v.string(),
+      email: v.string(),
+      organization_id: v.string(),
+      organization_name: v.string(),
+      // Level of organization_id, resolved live by the backend (it is not part
+      // of the stored snapshot: an organization can be promoted after the fact).
+      // Absent for the Owner organization and for deleted ones, which have no
+      // detail page to link to.
+      organization_type: v.optional(v.string()),
+      // True when the creator acted on behalf of organization_name (attributed
+      // via created_by_organization_id) rather than belonging to it. Omitted
+      // (falsy) on the default own-org path.
+      on_behalf_of: v.optional(v.boolean()),
+    }),
+  ),
+})
+
+export type CreateCustomer = v.InferOutput<typeof CreateCustomerSchema>
+export type EditCustomer = v.InferOutput<typeof EditCustomerSchema>
+export type Customer = v.InferOutput<typeof CustomerSchema>
+
+interface CustomersResponse {
+  code: number
+  message: string
+  data: {
+    customers: Customer[]
+    pagination: Pagination
+  }
+}
+
+export const getQueryStringParams = (
+  pageNum: number,
+  pageSize: number,
+  textFilter: string | null,
+  statusFilter: CustomerStatus[],
+  createdByFilter: string[],
+  organizationFilter: string[],
+  includeHierarchy: boolean,
+  sortBy: string | null,
+  sortDescending: boolean,
+) => {
+  const searchParams = new URLSearchParams({
+    page: pageNum.toString(),
+    page_size: pageSize.toString(),
+    sort_by: sortBy || '',
+    sort_direction: sortDescending ? 'desc' : 'asc',
+    // The table renders the per-row counters, so it asks for them. They are
+    // opt-in because they cost a query each: everything that only needs the
+    // rows (the exports, the legacy-counts sync) leaves this out. 'all' would
+    // add applications_count, which no column shows and which is slow on the
+    // reseller list.
+    include_counts: 'true',
+  })
+
+  if (textFilter?.trim()) {
+    searchParams.append('search', textFilter)
+  }
+
+  statusFilter.forEach((status) => {
+    searchParams.append('status', status)
+  })
+
+  createdByFilter.forEach((userId) => {
+    searchParams.append('created_by', userId)
+  })
+
+  // Parent company filter: matched exactly against the customer's owning
+  // organization, so selecting a reseller in the dropdown never pulls in the
+  // customers of its descendants. include_hierarchy widens it to the whole
+  // subtree, and only the explicit hierarchy entry points set that flag.
+  organizationFilter.forEach((organizationId) => {
+    searchParams.append('organization_id', organizationId)
+  })
+
+  if (includeHierarchy) {
+    searchParams.append('include_hierarchy', 'true')
+  }
+
+  return searchParams.toString()
+}
+
+export const getCustomers = (
+  pageNum: number,
+  pageSize: number,
+  textFilter: string,
+  statusFilter: CustomerStatus[],
+  createdByFilter: string[],
+  organizationFilter: string[],
+  includeHierarchy: boolean,
+  sortBy: string,
+  sortDescending: boolean,
+) => {
+  const loginStore = useLoginStore()
+  const params = getQueryStringParams(
+    pageNum,
+    pageSize,
+    textFilter,
+    statusFilter,
+    createdByFilter,
+    organizationFilter,
+    includeHierarchy,
+    sortBy,
+    sortDescending,
+  )
+
+  return axios
+    .get<CustomersResponse>(`${API_URL}/customers?${params}`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data.data)
+}
+
+export const postCustomer = (customer: CreateCustomer) => {
+  const loginStore = useLoginStore()
+
+  return axios.post(`${API_URL}/customers`, customer, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const putCustomer = (customer: EditCustomer) => {
+  const loginStore = useLoginStore()
+
+  return axios.put(`${API_URL}/customers/${customer.logto_id}`, customer, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const deleteCustomer = (customer: Customer) => {
+  const loginStore = useLoginStore()
+
+  return axios.delete(`${API_URL}/customers/${customer.logto_id}`, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const destroyCustomer = (customer: Customer) => {
+  const loginStore = useLoginStore()
+
+  return axios.delete(`${API_URL}/customers/${customer.logto_id}/destroy`, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const getCustomersTotal = () => {
+  const loginStore = useLoginStore()
+
+  return axios
+    .get(`${API_URL}/customers/totals`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data.data.total as number)
+}
+
+export const suspendCustomer = (customer: Customer) => {
+  const loginStore = useLoginStore()
+
+  return axios.patch(
+    `${API_URL}/customers/${customer.logto_id}/suspend`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const reactivateCustomer = (customer: Customer) => {
+  const loginStore = useLoginStore()
+
+  return axios.patch(
+    `${API_URL}/customers/${customer.logto_id}/reactivate`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const restoreCustomer = (customer: Customer) => {
+  const loginStore = useLoginStore()
+
+  return axios.patch(
+    `${API_URL}/customers/${customer.logto_id}/restore`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const getQueryStringParamsForExport = (
+  format: string,
+  textFilter: string | undefined,
+  statusFilter: CustomerStatus[] | undefined,
+  createdByFilter: string[] | undefined,
+  organizationFilter: string[] | undefined,
+  includeHierarchy: boolean | undefined,
+  sortBy: string | undefined,
+  sortDescending: boolean | undefined,
+) => {
+  const searchParams = new URLSearchParams({
+    format: format,
+  })
+
+  if (textFilter?.trim()) {
+    searchParams.append('search', textFilter)
+  }
+
+  if (statusFilter) {
+    statusFilter.forEach((status) => {
+      searchParams.append('status', status)
+    })
+  }
+
+  if (createdByFilter) {
+    createdByFilter.forEach((userId) => {
+      searchParams.append('created_by', userId)
+    })
+  }
+
+  // Parent company filter: same exact match as the list query, widened to the
+  // whole subtree only when the hierarchy entry point set includeHierarchy.
+  if (organizationFilter) {
+    organizationFilter.forEach((organizationId) => {
+      searchParams.append('organization_id', organizationId)
+    })
+  }
+
+  if (includeHierarchy) {
+    searchParams.append('include_hierarchy', 'true')
+  }
+
+  if (sortBy) {
+    searchParams.append('sort_by', sortBy)
+  }
+
+  if (sortDescending !== undefined) {
+    searchParams.append('sort_direction', sortDescending ? 'desc' : 'asc')
+  }
+
+  return searchParams.toString()
+}
+
+export const getExport = (
+  format: 'csv' | 'pdf',
+  textFilter: string | undefined = undefined,
+  statusFilter: CustomerStatus[] | undefined = undefined,
+  createdByFilter: string[] | undefined = undefined,
+  organizationFilter: string[] | undefined = undefined,
+  includeHierarchy: boolean | undefined = undefined,
+  sortBy: string | undefined = undefined,
+  sortDescending: boolean | undefined = undefined,
+) => {
+  const loginStore = useLoginStore()
+  const params = getQueryStringParamsForExport(
+    format,
+    textFilter,
+    statusFilter,
+    createdByFilter,
+    organizationFilter,
+    includeHierarchy,
+    sortBy,
+    sortDescending,
+  )
+
+  return axios
+    .get(`${API_URL}/customers/export?${params}`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data)
+}
+
+// ============================================================
+// Import API functions
+// ============================================================
+
+export const getImportTemplate = () => {
+  const loginStore = useLoginStore()
+  return axios
+    .get<Blob>(`${API_URL}/customers/import/template`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+      responseType: 'blob',
+    })
+    .then((res) => res.data)
+}
+
+export const validateCustomersImport = (file: File) => {
+  const loginStore = useLoginStore()
+  const formData = new FormData()
+  formData.append('file', file)
+  return axios
+    .post<{ code: number; message: string; data: ImportValidationResult }>(
+      `${API_URL}/customers/import/validate`,
+      formData,
+      {
+        headers: {
+          Authorization: `Bearer ${loginStore.jwtToken}`,
+          'Content-Type': null,
+        },
+      },
+    )
+    .then((res) => res.data.data)
+}
+
+export const confirmCustomersImport = (importId: string, override: boolean) => {
+  const loginStore = useLoginStore()
+  return axios
+    .post<{ code: number; message: string; data: ImportConfirmResult }>(
+      `${API_URL}/customers/import/confirm`,
+      { import_id: importId, override },
+      {
+        headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+      },
+    )
+    .then((res) => res.data.data)
+}

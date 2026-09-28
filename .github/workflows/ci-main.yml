@@ -1,0 +1,224 @@
+name: CI - Main Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ===========================================================================
+  # GO TESTS (backend, sync, collect) - matrix strategy
+  # ===========================================================================
+  go-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [backend, sync, collect]
+
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+        cache: false
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ matrix.component }}-${{ hashFiles(format('{0}/go.sum', matrix.component)) }}
+        restore-keys: |
+          ${{ runner.os }}-go-${{ matrix.component }}-
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Sync email templates from backend (sync only)
+      if: matrix.component == 'sync'
+      run: make sync-templates
+
+    - name: Run tests with coverage
+      run: go test -coverprofile=coverage.out -coverpkg=./... ./...
+
+    - name: Check the authorization spec (backend only)
+      if: matrix.component == 'backend'
+      run: |
+        # `apitool authz coverage` compares the route inventory in main.go with
+        # the hand-authored intents in authz/routes.yml, and validates the
+        # fixture against the role vocabulary. Offline: no tenant, no running
+        # backend, seconds. The rest of the suite needs both and stays local.
+        #
+        # This is the check that catches a role added to authz/fixture.yml that
+        # no config defines, or an endpoint added with no declared intent —
+        # both of which otherwise surface much later, in a job that costs
+        # minutes or in someone's `make test-authz`.
+        cp ../sync/configs/config.ci.yml ../sync/configs/config.yml
+        # coverage reads only the spec and main.go, so a stub registry is
+        # enough; assertLocal still insists the target is local.
+        printf '{"config":{"backend_url":"http://127.0.0.1:8080/api"}}' > .api-registry.json
+        make apitool
+        ./apitool authz coverage
+
+    - name: Upload coverage artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.component }}-coverage
+        path: ${{ matrix.component }}/coverage.out
+        retention-days: 30
+
+    - name: Run go vet
+      run: go vet ./...
+
+    - name: Check formatting
+      run: |
+        if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+          echo "Code is not formatted properly:"
+          gofmt -s -l .
+          exit 1
+        fi
+
+    - name: Run linting
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: v2.11.4
+        working-directory: ${{ matrix.component }}
+        args: --timeout=10m
+
+  # ===========================================================================
+  # FRONTEND TESTS
+  # ===========================================================================
+  frontend-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version-file: .nvmrc
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Check formatting
+      run: npm run format
+
+    - name: Run linting
+      run: npm run lint
+
+    - name: Run type checking
+      run: npm run type-check
+
+    - name: Run tests
+      run: npm run test:unit
+
+    - name: Run build (test compilation)
+      run: npm run build
+
+  # ===========================================================================
+  # DOCKER BUILD & PUSH (all components) - matrix strategy
+  # ===========================================================================
+  build:
+    runs-on: ubuntu-latest
+    needs: [go-tests, frontend-tests]
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      actions: read
+
+    strategy:
+      matrix:
+        include:
+          - component: backend
+            context: backend
+          - component: sync
+            context: .
+            dockerfile: sync/Containerfile
+          - component: collect
+            context: collect
+          - component: frontend
+            context: frontend
+          - component: proxy
+            context: proxy
+          - component: mimir
+            context: services/mimir
+            image_description: Mimir alertmanager backend for My Nethesis
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.component }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ matrix.context }}
+        file: ${{ matrix.dockerfile || format('{0}/Containerfile', matrix.context) }}
+        platforms: linux/amd64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: |
+          ${{ steps.meta.outputs.labels }}
+          ${{ matrix.image_description != '' && format('org.opencontainers.image.description={0}', matrix.image_description) || '' }}
+        cache-from: type=gha,scope=${{ matrix.component }}
+        cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+        build-args: |
+          VERSION=${{ github.ref_name != 'main' && format('dev-{0}', github.sha) || github.ref_name }}
+          COMMIT=${{ github.sha }}
+          BUILD_TIME=${{ steps.meta.outputs.labels['org.opencontainers.image.created'] }}
+
+    # Security scanning (only on main)
+    - name: Generate Trivy SARIF report
+      uses: aquasecurity/trivy-action@v0.36.0
+      if: github.ref == 'refs/heads/main'
+      with:
+        scan-type: 'fs'
+        scan-ref: './${{ matrix.context }}'
+        format: 'sarif'
+        output: 'trivy-${{ matrix.component }}-results.sarif'
+        github-pat: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload SARIF
+      uses: github/codeql-action/upload-sarif@v4
+      if: github.ref == 'refs/heads/main'
+      with:
+        sarif_file: 'trivy-${{ matrix.component }}-results.sarif'
+        category: 'trivy-${{ matrix.component }}'

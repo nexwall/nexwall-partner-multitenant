@@ -1,0 +1,163 @@
+<!--
+  Copyright (C) 2026 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { NeBadgeV2, NeHeading, NeInlineNotification, NeSkeleton } from '@nethesis/vue-components'
+import { faCity, faServer } from '@fortawesome/free-solid-svg-icons'
+import PageBreadcrumb from '@/components/common/PageBreadcrumb.vue'
+import { useIsOwnCompany } from '@/composables/useIsOwnCompany'
+import { useDistributorDetail } from '@/queries/organizations/distributorDetail'
+import DistributorInfoCard from '@/components/distributors/DistributorInfoCard.vue'
+import OrganizationContactsCard from '@/components/organizations/OrganizationContactsCard.vue'
+import LegacySystemsCard from '@/components/systems/LegacySystemsCard.vue'
+import CounterCard from '@/components/common/CounterCard.vue'
+import { useDistributorStats } from '@/queries/organizations/distributorStats'
+import { faGridOne } from '@nethesis/nethesis-solid-svg-icons'
+import { useDistributorSystems } from '@/queries/systems/distributorSystems'
+import { useApplicationsSummaryByCompany } from '@/queries/applications/applicationsSummaryByCompany'
+import OrganizationSystemsCard from '@/components/organizations/OrganizationSystemsCard.vue'
+import OrganizationApplicationsCard from '@/components/organizations/OrganizationApplicationsCard.vue'
+import { canReadDistributors } from '@/lib/permissions'
+import { computed } from 'vue'
+
+const { state: distributorDetail } = useDistributorDetail()
+const isOwnCompany = useIsOwnCompany()
+const { state: distributorStats } = useDistributorStats()
+const { state: distributorSystems } = useDistributorSystems()
+const { state: applicationsSummary } = useApplicationsSummaryByCompany()
+
+// link to the Resellers page filtered by this distributor as parent company.
+// No include_hierarchy: the parent company filter matches exactly, so only the
+// resellers this distributor owns are listed.
+const resellersRoute = computed(() => {
+  if (!distributorDetail.value.data) {
+    return undefined
+  }
+
+  return {
+    name: 'resellers',
+    query: {
+      organization_id: distributorDetail.value.data.logto_id,
+      organization_name: distributorDetail.value.data.name,
+    },
+  }
+})
+
+// link to the Systems page filtered by the whole distributor hierarchy
+const hierarchySystemsRoute = computed(() => {
+  if (!distributorDetail.value.data) {
+    return undefined
+  }
+
+  return {
+    name: 'systems',
+    query: {
+      organization_id: distributorDetail.value.data.logto_id,
+      organization_name: distributorDetail.value.data.name,
+      include_hierarchy: 'true',
+    },
+  }
+})
+
+// link to the Applications page filtered by the whole distributor hierarchy
+const hierarchyApplicationsRoute = computed(() => {
+  if (!distributorDetail.value.data) {
+    return undefined
+  }
+
+  return {
+    name: 'applications',
+    query: {
+      organization_id: distributorDetail.value.data.logto_id,
+      organization_name: distributorDetail.value.data.name,
+      include_hierarchy: 'true',
+    },
+  }
+})
+</script>
+
+<template>
+  <div>
+    <!-- no list to go back to from the user's own company -->
+    <PageBreadcrumb
+      v-if="!isOwnCompany"
+      :section="$t('distributors.title')"
+      :to="canReadDistributors() ? '/distributors' : undefined"
+      :current="distributorDetail.data?.name"
+      :loading="distributorDetail.status === 'pending'"
+    />
+    <!-- get distributor detail error notification -->
+    <NeInlineNotification
+      v-if="distributorDetail.status === 'error'"
+      kind="error"
+      :title="$t('distributor_detail.cannot_retrieve_distributor_detail')"
+      :description="distributorDetail.error.message"
+      class="mb-6"
+    />
+    <NeSkeleton v-else-if="distributorDetail.status === 'pending'" size="lg" class="mb-9 w-xs" />
+    <div class="mb-7 flex flex-wrap items-center gap-4">
+      <NeHeading tag="h3">
+        {{ distributorDetail.data?.name }}
+      </NeHeading>
+      <NeBadgeV2 v-if="isOwnCompany && distributorDetail.data" kind="indigo">
+        {{ $t('organizations.your_company') }}
+      </NeBadgeV2>
+    </div>
+    <div class="3xl:grid-cols-4 grid grid-cols-1 gap-x-6 gap-y-6 md:grid-cols-2">
+      <!-- distributor info -->
+      <DistributorInfoCard class="row-span-4" />
+      <!-- distributor contacts -->
+      <OrganizationContactsCard
+        :contacts="distributorDetail.data?.custom_data"
+        :loading="distributorDetail.status === 'pending'"
+        class="row-span-4"
+      />
+      <!-- total systems -->
+      <CounterCard
+        :title="$t('systems.total_systems')"
+        :counter="distributorStats.data?.systems_hierarchy_count ?? 0"
+        :icon="faServer"
+        :loading="distributorStats.status === 'pending'"
+        :to="hierarchySystemsRoute"
+      />
+      <!-- total legacy systems -->
+      <LegacySystemsCard
+        :counter="distributorStats.data?.legacy_systems_hierarchy_count ?? 0"
+        :loading="distributorStats.status === 'pending'"
+      />
+      <!-- total applications -->
+      <CounterCard
+        :title="$t('applications.total_applications')"
+        :counter="distributorStats.data?.applications_hierarchy_count ?? 0"
+        :icon="faGridOne"
+        :loading="distributorStats.status === 'pending'"
+        :to="hierarchyApplicationsRoute"
+      />
+      <!-- organization systems -->
+      <OrganizationSystemsCard
+        :systems-count="distributorStats.data?.systems_count ?? 0"
+        :systems-status="distributorSystems.status"
+        :systems-data="distributorSystems.data"
+        :stats-status="distributorStats.status"
+        :organization-name="distributorDetail.data?.name"
+      />
+      <!-- organization applications -->
+      <OrganizationApplicationsCard
+        :applications-count="applicationsSummary.data?.total ?? 0"
+        :applications-status="applicationsSummary.status"
+        :summary-data="applicationsSummary.data"
+        :organization-name="distributorDetail.data?.name"
+      />
+      <!-- resellers -->
+      <CounterCard
+        :title="$t('resellers.title')"
+        :counter="distributorStats.data?.resellers_count ?? 0"
+        :icon="faCity"
+        :loading="distributorStats.status === 'pending'"
+        :to="resellersRoute"
+      />
+    </div>
+  </div>
+</template>

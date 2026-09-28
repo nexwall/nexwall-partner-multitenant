@@ -1,0 +1,426 @@
+/*
+ * Copyright (C) 2025 Nethesis S.r.l.
+ * http://www.nethesis.it - info@nethesis.it
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * author: Edoardo Spadoni <edoardo.spadoni@nethesis.it>
+ */
+
+package configuration
+
+import (
+	"fmt"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/nethesis/my/collect/logger"
+)
+
+type Configuration struct {
+	ListenAddress string `json:"listen_address"`
+
+	// APIBaseURL is the public path prefix where collect's API is reachable
+	// behind the proxy ("/api" locally, "/collect/api" in qa/prod). Used to
+	// build asset URLs (e.g. rebranding) returned to systems.
+	APIBaseURL string `json:"api_base_url"`
+
+	// Database configuration
+	DatabaseURL      string `json:"database_url"`
+	DatabaseMaxConns int    `json:"database_max_conns"`
+	DatabaseMaxIdle  int    `json:"database_max_idle"`
+
+	// Redis configuration
+	RedisURL          string        `json:"redis_url"`
+	RedisDB           int           `json:"redis_db"`
+	RedisPassword     string        `json:"redis_password"`
+	RedisMaxRetries   int           `json:"redis_max_retries"`
+	RedisDialTimeout  time.Duration `json:"redis_dial_timeout"`
+	RedisReadTimeout  time.Duration `json:"redis_read_timeout"`
+	RedisWriteTimeout time.Duration `json:"redis_write_timeout"`
+	RedisPoolSize     int           `json:"redis_pool_size"`
+	RedisMinIdleConns int           `json:"redis_min_idle_conns"`
+	RedisPoolTimeout  time.Duration `json:"redis_pool_timeout"`
+
+	// Queue configuration
+	QueueInventoryName    string        `json:"queue_inventory_name"`
+	QueueProcessingName   string        `json:"queue_processing_name"`
+	QueueNotificationName string        `json:"queue_notification_name"`
+	QueueHeartbeatName    string        `json:"queue_heartbeat_name"`
+	QueueAlertHistoryName string        `json:"queue_alert_history_name"`
+	QueueBatchSize        int           `json:"queue_batch_size"`
+	QueueRetryAttempts    int           `json:"queue_retry_attempts"`
+	QueueRetryDelay       time.Duration `json:"queue_retry_delay"`
+
+	// AlertHistoryRetryAttempts is deliberately higher than QueueRetryAttempts:
+	// the retry queue exists to survive a Postgres outage of many minutes
+	// (the delayed-queue backoff caps at 5 minutes per attempt), and giving up
+	// early silently loses history rows.
+	AlertHistoryRetryAttempts int `json:"alert_history_retry_attempts"`
+
+	// Worker configuration
+	WorkerInventoryCount    int           `json:"worker_inventory_count"`
+	WorkerProcessingCount   int           `json:"worker_processing_count"`
+	WorkerNotificationCount int           `json:"worker_notification_count"`
+	WorkerShutdownTimeout   time.Duration `json:"worker_shutdown_timeout"`
+	WorkerHeartbeatInterval time.Duration `json:"worker_heartbeat_interval"`
+
+	// Scalable worker configuration
+	BatchProcessorSize      int           `json:"batch_processor_size"`
+	BatchProcessorTimeout   time.Duration `json:"batch_processor_timeout"`
+	BackpressureThreshold   float64       `json:"backpressure_threshold"`
+	CircuitBreakerThreshold int           `json:"circuit_breaker_threshold"`
+	CircuitBreakerTimeout   time.Duration `json:"circuit_breaker_timeout"`
+
+	// Inventory processing configuration
+	InventoryCleanupInterval time.Duration `json:"inventory_cleanup_interval"`
+	InventoryDiffDepth       int           `json:"inventory_diff_depth"`
+
+	// System authentication configuration
+	SystemSecretMinLength int           `json:"system_secret_min_length"`
+	SystemAuthCacheTTL    time.Duration `json:"system_auth_cache_ttl"`
+
+	// API configuration
+	APIMaxRequestSize int64         `json:"api_max_request_size"`
+	APIRequestTimeout time.Duration `json:"api_request_timeout"`
+
+	// Monitoring configuration
+	HealthCheckInterval time.Duration `json:"health_check_interval"`
+
+	// Notification configuration
+	NotificationRetryAttempts int `json:"notification_retry_attempts"`
+
+	// Heartbeat monitoring configuration
+	HeartbeatTimeoutMinutes       int `json:"heartbeat_timeout_minutes"`
+	HeartbeatCheckIntervalSeconds int `json:"heartbeat_check_interval_seconds"`
+
+	// Mimir configuration
+	MimirURL string `json:"mimir_url"`
+
+	// Alertmanager webhook authentication
+	AlertmanagerWebhookSecret string `json:"alertmanager_webhook_secret"`
+
+	// Cross-service plumbing — must match backend's APP_ENV / INTERNAL_HMAC_SECRET.
+	AppEnv             string `json:"app_env"`
+	InternalHMACSecret string `json:"internal_hmac_secret"`
+
+	// Backup storage — S3 client credentials used to reach the DigitalOcean
+	// Spaces bucket that holds appliance configuration backups. The same
+	// Spaces account also hosts the Mimir buckets; values for endpoint,
+	// access key, and secret key are the shared S3 credentials.
+	S3Endpoint             string `json:"s3_endpoint"`
+	BackupS3Region         string `json:"backup_s3_region"`
+	BackupS3Bucket         string `json:"backup_s3_bucket"`
+	S3AccessKey            string `json:"s3_access_key"`
+	S3SecretKey            string `json:"s3_secret_key"`
+	BackupS3UsePathStyle   bool   `json:"backup_s3_use_path_style"`
+	BackupMaxUploadSize    int64  `json:"backup_max_upload_size"`
+	BackupMaxPerSystem     int    `json:"backup_max_per_system"`
+	BackupMaxSizePerSystem int64  `json:"backup_max_size_per_system"`
+	// Aggregate cap across every system owned by the same
+	// organization. 0 disables the check. Useful to contain blast
+	// radius when a single org's credentials are compromised.
+	BackupMaxSizePerOrg int64 `json:"backup_max_size_per_org"`
+	// Ingest rate limits (per system_id, Redis-backed). Legitimate
+	// appliances upload on a daily timer, so these numbers are set
+	// generously — their job is to block flood-style abuse, not to
+	// shape normal traffic.
+	BackupRateLimitPerMinute int `json:"backup_rate_limit_per_minute"`
+	BackupRateLimitPerHour   int `json:"backup_rate_limit_per_hour"`
+}
+
+var Config = Configuration{}
+
+func Init() {
+	if os.Getenv("LISTEN_ADDRESS") != "" {
+		Config.ListenAddress = os.Getenv("LISTEN_ADDRESS")
+	} else {
+		Config.ListenAddress = "127.0.0.1:8081"
+	}
+
+	// API_BASE_URL is the public path prefix where collect is reachable behind
+	// the proxy: "/api" when hit directly (local), "/collect/api" in qa/prod.
+	Config.APIBaseURL = getStringWithDefault("API_BASE_URL", "/api")
+
+	// Database configuration
+	if os.Getenv("DATABASE_URL") != "" {
+		Config.DatabaseURL = os.Getenv("DATABASE_URL")
+	} else {
+		logger.LogConfigLoad("env", "DATABASE_URL", false, fmt.Errorf("DATABASE_URL variable is empty"))
+	}
+
+	// Pool kept small on purpose: the managed Postgres tier has 256MB RAM where
+	// each backend process costs a few MB, so an oversized pool OOMs the DB long
+	// before it adds throughput. Both values feed the live pool in database.go.
+	Config.DatabaseMaxConns = parseIntWithDefault("DATABASE_MAX_CONNS", 10)
+	Config.DatabaseMaxIdle = parseIntWithDefault("DATABASE_MAX_IDLE", 3)
+
+	// Redis configuration with defaults
+	if os.Getenv("REDIS_URL") != "" {
+		Config.RedisURL = os.Getenv("REDIS_URL")
+	} else {
+		Config.RedisURL = "redis://localhost:6379"
+	}
+
+	Config.RedisDB = parseIntWithDefault("REDIS_DB", 1) // Use DB 1 to separate from backend
+	Config.RedisPassword = os.Getenv("REDIS_PASSWORD")
+	Config.RedisMaxRetries = parseIntWithDefault("REDIS_MAX_RETRIES", 3)
+	Config.RedisDialTimeout = parseDurationWithDefault("REDIS_DIAL_TIMEOUT", 5*time.Second)
+	Config.RedisReadTimeout = parseDurationWithDefault("REDIS_READ_TIMEOUT", 3*time.Second)
+	Config.RedisWriteTimeout = parseDurationWithDefault("REDIS_WRITE_TIMEOUT", 3*time.Second)
+	Config.RedisPoolSize = parseIntWithDefault("REDIS_POOL_SIZE", 50)
+	Config.RedisMinIdleConns = parseIntWithDefault("REDIS_MIN_IDLE_CONNS", 10)
+	Config.RedisPoolTimeout = parseDurationWithDefault("REDIS_POOL_TIMEOUT", 10*time.Second)
+
+	// Queue configuration
+	Config.QueueInventoryName = getStringWithDefault("QUEUE_INVENTORY_NAME", "collect:inventory")
+	Config.QueueProcessingName = getStringWithDefault("QUEUE_PROCESSING_NAME", "collect:processing")
+	Config.QueueNotificationName = getStringWithDefault("QUEUE_NOTIFICATION_NAME", "collect:notifications")
+	Config.QueueHeartbeatName = getStringWithDefault("QUEUE_HEARTBEAT_NAME", "collect:heartbeat")
+	Config.QueueAlertHistoryName = getStringWithDefault("QUEUE_ALERT_HISTORY_NAME", "collect:alert_history")
+	Config.QueueBatchSize = parseIntWithDefault("QUEUE_BATCH_SIZE", 10)
+	Config.QueueRetryAttempts = parseIntWithDefault("QUEUE_RETRY_ATTEMPTS", 3)
+	Config.QueueRetryDelay = parseDurationWithDefault("QUEUE_RETRY_DELAY", 5*time.Second)
+	Config.AlertHistoryRetryAttempts = parseIntWithDefault("ALERT_HISTORY_RETRY_ATTEMPTS", 20)
+
+	// Worker configuration
+	Config.WorkerInventoryCount = parseIntWithDefault("WORKER_INVENTORY_COUNT", 5)
+	Config.WorkerProcessingCount = parseIntWithDefault("WORKER_PROCESSING_COUNT", 3)
+	Config.WorkerNotificationCount = parseIntWithDefault("WORKER_NOTIFICATION_COUNT", 2)
+	Config.WorkerShutdownTimeout = parseDurationWithDefault("WORKER_SHUTDOWN_TIMEOUT", 30*time.Second)
+	Config.WorkerHeartbeatInterval = parseDurationWithDefault("WORKER_HEARTBEAT_INTERVAL", 10*time.Second)
+
+	// Scalable worker configuration
+	Config.BatchProcessorSize = parseIntWithDefault("BATCH_PROCESSOR_SIZE", 100)
+	Config.BatchProcessorTimeout = parseDurationWithDefault("BATCH_PROCESSOR_TIMEOUT", 5*time.Second)
+	Config.BackpressureThreshold = parseFloatWithDefault("BACKPRESSURE_THRESHOLD", 0.8)
+	Config.CircuitBreakerThreshold = parseIntWithDefault("CIRCUIT_BREAKER_THRESHOLD", 5)
+	Config.CircuitBreakerTimeout = parseDurationWithDefault("CIRCUIT_BREAKER_TIMEOUT", 30*time.Second)
+
+	// Inventory processing configuration
+	Config.InventoryCleanupInterval = parseDurationWithDefault("INVENTORY_CLEANUP_INTERVAL", 6*time.Hour)
+	Config.InventoryDiffDepth = parseIntWithDefault("INVENTORY_DIFF_DEPTH", 10) // Max diff levels
+
+	// System authentication configuration
+	Config.SystemSecretMinLength = parseIntWithDefault("SYSTEM_SECRET_MIN_LENGTH", 32)
+	// Cache positive auth results for 10 minutes by default. Shorter
+	// than a day so that credential rotations and system deletions
+	// done on the backend propagate to collect within that window
+	// without a dedicated invalidation bus. Each cache miss falls
+	// through to Redis and then to Postgres.
+	Config.SystemAuthCacheTTL = parseDurationWithDefault("SYSTEM_AUTH_CACHE_TTL", 10*time.Minute)
+
+	// API configuration
+	Config.APIMaxRequestSize = parseInt64WithDefault("API_MAX_REQUEST_SIZE", 10*1024*1024) // 10MB
+	Config.APIRequestTimeout = parseDurationWithDefault("API_REQUEST_TIMEOUT", 30*time.Second)
+
+	// Monitoring configuration
+	Config.HealthCheckInterval = parseDurationWithDefault("HEALTH_CHECK_INTERVAL", 30*time.Second)
+
+	// Notification configuration
+	Config.NotificationRetryAttempts = parseIntWithDefault("NOTIFICATION_RETRY_ATTEMPTS", 3)
+
+	// Heartbeat monitoring configuration.
+	// Timeout is 2x the ~10min client send interval: at 10min (== the interval)
+	// the synchronized heartbeat waves straddle the cutoff and the fleet flaps
+	// active<->inactive en masse, churning LinkFailed fire/resolve. 20min absorbs
+	// a late/missed beat; genuinely-down systems still alert within 20min.
+	Config.HeartbeatTimeoutMinutes = parseIntWithDefault("HEARTBEAT_TIMEOUT_MINUTES", 20)
+	Config.HeartbeatCheckIntervalSeconds = parseIntWithDefault("HEARTBEAT_CHECK_INTERVAL_SECONDS", 300)
+
+	// Mimir configuration
+	if mimirURL := os.Getenv("MIMIR_URL"); mimirURL != "" {
+		Config.MimirURL = mimirURL
+	} else {
+		Config.MimirURL = "http://localhost:9009"
+	}
+
+	// Alerting history webhook authentication. Refuse weak secrets at boot:
+	// the secret is also pushed into Mimir's Alertmanager YAML so anyone
+	// with read on the Mimir S3 bucket recovers it; a short value reduces
+	// brute-force resistance to nothing. An empty value is permitted (the
+	// webhook receiver returns 503 in that case) for dev configurations
+	// that don't run Alertmanager locally.
+	Config.AlertmanagerWebhookSecret = os.Getenv("ALERTING_HISTORY_WEBHOOK_SECRET")
+	if Config.AlertmanagerWebhookSecret != "" && len(Config.AlertmanagerWebhookSecret) < 32 {
+		logger.Fatal().
+			Int("length", len(Config.AlertmanagerWebhookSecret)).
+			Msg("ALERTING_HISTORY_WEBHOOK_SECRET must be at least 32 characters; refusing to start with a weak secret")
+	}
+
+	// Internal cross-service plumbing — must match backend's settings.
+	Config.AppEnv = getStringWithDefault("APP_ENV", "dev")
+	Config.InternalHMACSecret = os.Getenv("INTERNAL_HMAC_SECRET")
+	if Config.InternalHMACSecret != "" && len(Config.InternalHMACSecret) < 32 {
+		logger.Fatal().
+			Int("length", len(Config.InternalHMACSecret)).
+			Msg("INTERNAL_HMAC_SECRET must be at least 32 characters; refusing to start with a weak secret")
+	}
+
+	// Backup storage — S3 client credentials (DigitalOcean Spaces)
+	Config.S3Endpoint = validateBackupEndpoint("S3_ENDPOINT", os.Getenv("S3_ENDPOINT"))
+	Config.BackupS3Region = getStringWithDefault("BACKUP_S3_REGION", "us-east-1")
+	Config.BackupS3Bucket = os.Getenv("BACKUP_S3_BUCKET")
+	Config.S3AccessKey = os.Getenv("S3_ACCESS_KEY")
+	Config.S3SecretKey = os.Getenv("S3_SECRET_KEY")
+	Config.BackupS3UsePathStyle = parseBoolWithDefault("BACKUP_S3_USE_PATH_STYLE", false)
+	Config.BackupMaxUploadSize = parseInt64WithDefault("BACKUP_MAX_UPLOAD_SIZE", 2*1024*1024*1024)
+	Config.BackupMaxPerSystem = parseIntWithDefault("BACKUP_MAX_PER_SYSTEM", 10)
+	Config.BackupMaxSizePerSystem = parseInt64WithDefault("BACKUP_MAX_SIZE_PER_SYSTEM", 500*1024*1024)
+	// Default 100 GiB per organization. An unset env var would otherwise
+	// leave the aggregate quota disabled, making a compromised system_key
+	// capable of saturating the backing bucket on behalf of its org.
+	// Set BACKUP_MAX_SIZE_PER_ORG=0 explicitly to disable.
+	Config.BackupMaxSizePerOrg = parseInt64WithDefault("BACKUP_MAX_SIZE_PER_ORG", 100*1024*1024*1024)
+	if os.Getenv("BACKUP_MAX_SIZE_PER_ORG") == "0" {
+		logger.Warn().Msg("BACKUP_MAX_SIZE_PER_ORG=0: per-organization aggregate backup quota disabled")
+	}
+	Config.BackupRateLimitPerMinute = parseIntWithDefault("BACKUP_RATE_LIMIT_PER_MINUTE", 6)
+	Config.BackupRateLimitPerHour = parseIntWithDefault("BACKUP_RATE_LIMIT_PER_HOUR", 60)
+
+	// Log successful configuration load
+	logger.LogConfigLoad("env", "configuration", true, nil)
+}
+
+// validateBackupEndpoint refuses HTTP endpoints unless the host is a
+// well-known dev loopback name; misconfigured prod deployments would
+// otherwise send signed S3 traffic in plaintext. Empty values are
+// returned unchanged (the storage package surfaces a clearer error).
+//
+// A bare hostname (e.g. "ams3.digitaloceanspaces.com") is accepted and
+// rewritten to "https://<host>" so the env var format is coherent with
+// Mimir's S3 endpoint config (which takes a bare host) and the AWS SDK
+// still receives a parseable URL for BaseEndpoint.
+func validateBackupEndpoint(name, raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		logger.LogConfigLoad("env", name, false, fmt.Errorf("invalid URL %q", raw))
+		return ""
+	}
+	// Reject userinfo (https://attacker:pw@host) — the AWS SDK ignores it but
+	// some HTTP clients down the chain may not, and there is no legitimate
+	// reason to embed credentials in the bucket endpoint URL.
+	if u.User != nil {
+		logger.LogConfigLoad("env", name, false, fmt.Errorf("userinfo in endpoint URL is not allowed"))
+		return ""
+	}
+	// The endpoint must be the bucket service root, not a sub-path. The S3
+	// SDK appends `/<bucket>/<key>` to whatever is given, so a non-root path
+	// silently mis-targets traffic.
+	if u.Path != "" && u.Path != "/" {
+		logger.LogConfigLoad("env", name, false, fmt.Errorf("non-root path %q in endpoint URL is not allowed", u.Path))
+		return ""
+	}
+	if u.Scheme == "https" {
+		return raw
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		// Allowlist exact loopback hosts only. Suffix-matching `.local` /
+		// `.localtest.me` would otherwise admit `evil.local` /
+		// `evil.localtest.me` shipped over plaintext.
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" ||
+			host == "my.localtest.me" ||
+			os.Getenv("BACKUP_S3_ALLOW_INSECURE") == "true" {
+			return raw
+		}
+		logger.LogConfigLoad("env", name, false, fmt.Errorf("HTTP endpoint to non-loopback host %q rejected; set BACKUP_S3_ALLOW_INSECURE=true to override", host))
+		return ""
+	}
+	logger.LogConfigLoad("env", name, false, fmt.Errorf("unsupported scheme %q", u.Scheme))
+	return ""
+}
+
+// parseDurationWithDefault parses a duration from environment variable or returns default
+func parseDurationWithDefault(envVar string, defaultValue time.Duration) time.Duration {
+	envValue := os.Getenv(envVar)
+	if envValue == "" {
+		return defaultValue
+	}
+
+	if duration, err := time.ParseDuration(envValue); err == nil {
+		return duration
+	}
+
+	logger.LogConfigLoad("env", envVar, false, fmt.Errorf("invalid duration format, using default %v", defaultValue))
+	return defaultValue
+}
+
+// parseIntWithDefault parses an integer from environment variable or returns default
+func parseIntWithDefault(envVar string, defaultValue int) int {
+	envValue := os.Getenv(envVar)
+	if envValue == "" {
+		return defaultValue
+	}
+
+	if value, err := strconv.Atoi(envValue); err == nil {
+		return value
+	}
+
+	logger.LogConfigLoad("env", envVar, false, fmt.Errorf("invalid integer format, using default %d", defaultValue))
+	return defaultValue
+}
+
+// parseInt64WithDefault parses an int64 from environment variable or returns default
+func parseInt64WithDefault(envVar string, defaultValue int64) int64 {
+	envValue := os.Getenv(envVar)
+	if envValue == "" {
+		return defaultValue
+	}
+
+	if value, err := strconv.ParseInt(envValue, 10, 64); err == nil {
+		return value
+	}
+
+	logger.LogConfigLoad("env", envVar, false, fmt.Errorf("invalid int64 format, using default %d", defaultValue))
+	return defaultValue
+}
+
+// parseFloatWithDefault parses a float64 from environment variable or returns default
+func parseFloatWithDefault(envVar string, defaultValue float64) float64 {
+	envValue := os.Getenv(envVar)
+	if envValue == "" {
+		return defaultValue
+	}
+
+	if value, err := strconv.ParseFloat(envValue, 64); err == nil {
+		return value
+	}
+
+	logger.LogConfigLoad("env", envVar, false, fmt.Errorf("invalid float format, using default %f", defaultValue))
+	return defaultValue
+}
+
+// getStringWithDefault gets a string from environment variable or returns default
+func getStringWithDefault(envVar string, defaultValue string) string {
+	if envValue := os.Getenv(envVar); envValue != "" {
+		return envValue
+	}
+	return defaultValue
+}
+
+// parseBoolWithDefault parses a boolean from an env var or returns the default.
+// Accepts the same set of literals as strconv.ParseBool ("1"/"true"/"True"/"t"
+// /"TRUE" for true; "0"/"false"/"False"/"f"/"FALSE" for false). Aligning on
+// this helper keeps backend and collect from disagreeing on the same env value
+// (e.g. "1" being true on backend but false on collect).
+func parseBoolWithDefault(envVar string, defaultValue bool) bool {
+	v := os.Getenv(envVar)
+	if v == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
+}

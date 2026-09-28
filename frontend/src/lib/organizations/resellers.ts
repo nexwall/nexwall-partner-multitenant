@@ -1,0 +1,380 @@
+//  Copyright (C) 2025 Nethesis S.r.l.
+//  SPDX-License-Identifier: GPL-3.0-or-later
+
+import axios from 'axios'
+import { API_URL } from '../config'
+import { useLoginStore } from '@/stores/login'
+import * as v from 'valibot'
+import { type Pagination } from '../common'
+import type { ImportValidationResult, ImportConfirmResult } from './organizations'
+
+export const RESELLERS_KEY = 'resellers'
+export const RESELLERS_TOTAL_KEY = 'resellersTotal'
+export const RESELLERS_TABLE_ID = 'resellersTable'
+
+export type ResellerStatus = 'enabled' | 'suspended' | 'deleted'
+
+export const CreateResellerSchema = v.object({
+  name: v.pipe(v.string(), v.nonEmpty('organizations.name_cannot_be_empty')),
+  custom_data: v.object({
+    vat: v.pipe(v.string(), v.nonEmpty('organizations.custom_data_vat_cannot_be_empty')),
+    address: v.optional(v.string()),
+    city: v.optional(v.string()),
+    main_contact: v.optional(v.string()),
+    email: v.optional(
+      v.union([
+        v.literal(''),
+        v.pipe(v.string(), v.email('organizations.custom_data_email_invalid')),
+      ]),
+    ),
+    phone: v.optional(
+      v.union([
+        v.literal(''),
+        v.pipe(
+          v.string(),
+          v.regex(/^\+?[\d\s\-\(\)]{7,20}$/, 'organizations.custom_data_phone_invalid_format'),
+        ),
+      ]),
+    ),
+    language: v.optional(v.string()),
+    notes: v.optional(v.string()),
+  }),
+  // Optional: attribute the new reseller to an ancestor org (instead of the
+  // caller's own org) to preserve hierarchical ownership when an upper tier
+  // creates it on behalf of a lower one. Empty = owned by the caller's org.
+  created_by_organization_id: v.optional(v.string()),
+})
+
+export const EditResellerSchema = v.object({
+  ...CreateResellerSchema.entries,
+  logto_id: v.string(),
+})
+
+export const ResellerSchema = v.object({
+  ...CreateResellerSchema.entries,
+  ...EditResellerSchema.entries,
+  created_at: v.optional(v.string()),
+  suspended_at: v.optional(v.string()),
+  deleted_at: v.optional(v.string()),
+  systems_count: v.number(),
+  customers_count: v.number(),
+  // Resolved rebranding flag: true when this organization inherits or holds a
+  // rebranding grant. Populated by the detail and list handlers alike.
+  rebranding_enabled: v.optional(v.boolean()),
+  created_by: v.optional(
+    v.object({
+      user_id: v.string(),
+      username: v.string(),
+      name: v.string(),
+      email: v.string(),
+      organization_id: v.string(),
+      organization_name: v.string(),
+      // Level of organization_id, resolved live by the backend (it is not part
+      // of the stored snapshot: an organization can be promoted after the fact).
+      // Absent for the Owner organization and for deleted ones, which have no
+      // detail page to link to.
+      organization_type: v.optional(v.string()),
+      // True when the creator acted on behalf of organization_name (attributed
+      // via created_by_organization_id) rather than belonging to it. Omitted
+      // (falsy) on the default own-org path.
+      on_behalf_of: v.optional(v.boolean()),
+    }),
+  ),
+})
+
+export type CreateReseller = v.InferOutput<typeof CreateResellerSchema>
+export type EditReseller = v.InferOutput<typeof EditResellerSchema>
+export type Reseller = v.InferOutput<typeof ResellerSchema>
+
+interface ResellersResponse {
+  code: number
+  message: string
+  data: {
+    resellers: Reseller[]
+    pagination: Pagination
+  }
+}
+
+export const getQueryStringParams = (
+  pageNum: number,
+  pageSize: number,
+  textFilter: string | null,
+  statusFilter: ResellerStatus[],
+  createdByFilter: string[],
+  organizationFilter: string[],
+  sortBy: string | null,
+  sortDescending: boolean,
+) => {
+  const searchParams = new URLSearchParams({
+    page: pageNum.toString(),
+    page_size: pageSize.toString(),
+    sort_by: sortBy || '',
+    sort_direction: sortDescending ? 'desc' : 'asc',
+    // The table renders the per-row counters, so it asks for them. They are
+    // opt-in because they cost a query each: everything that only needs the
+    // rows (the exports, the legacy-counts sync) leaves this out. 'all' would
+    // add applications_count, which no column shows and which is slow on the
+    // reseller list.
+    include_counts: 'true',
+  })
+
+  if (textFilter?.trim()) {
+    searchParams.append('search', textFilter)
+  }
+
+  statusFilter.forEach((status) => {
+    searchParams.append('status', status)
+  })
+
+  createdByFilter.forEach((userId) => {
+    searchParams.append('created_by', userId)
+  })
+
+  // Parent company filter: matched exactly against the reseller's owning
+  // organization. include_hierarchy is deliberately not sent, so selecting a
+  // distributor never pulls in the resellers of its descendants.
+  organizationFilter.forEach((organizationId) => {
+    searchParams.append('organization_id', organizationId)
+  })
+
+  return searchParams.toString()
+}
+
+export const getResellers = (
+  pageNum: number,
+  pageSize: number,
+  textFilter: string,
+  statusFilter: ResellerStatus[],
+  createdByFilter: string[],
+  organizationFilter: string[],
+  sortBy: string,
+  sortDescending: boolean,
+) => {
+  const loginStore = useLoginStore()
+  const params = getQueryStringParams(
+    pageNum,
+    pageSize,
+    textFilter,
+    statusFilter,
+    createdByFilter,
+    organizationFilter,
+    sortBy,
+    sortDescending,
+  )
+
+  return axios
+    .get<ResellersResponse>(`${API_URL}/resellers?${params}`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data.data)
+}
+
+export const postReseller = (reseller: CreateReseller) => {
+  const loginStore = useLoginStore()
+
+  return axios.post(`${API_URL}/resellers`, reseller, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const putReseller = (reseller: EditReseller) => {
+  const loginStore = useLoginStore()
+
+  return axios.put(`${API_URL}/resellers/${reseller.logto_id}`, reseller, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const deleteReseller = (reseller: Reseller) => {
+  const loginStore = useLoginStore()
+
+  return axios.delete(`${API_URL}/resellers/${reseller.logto_id}`, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const destroyReseller = (reseller: Reseller) => {
+  const loginStore = useLoginStore()
+
+  return axios.delete(`${API_URL}/resellers/${reseller.logto_id}/destroy`, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const getResellersTotal = () => {
+  const loginStore = useLoginStore()
+
+  return axios
+    .get(`${API_URL}/resellers/totals`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data.data.total as number)
+}
+
+export const suspendReseller = (reseller: Reseller) => {
+  const loginStore = useLoginStore()
+
+  return axios.patch(
+    `${API_URL}/resellers/${reseller.logto_id}/suspend`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const reactivateReseller = (reseller: Reseller) => {
+  const loginStore = useLoginStore()
+
+  return axios.patch(
+    `${API_URL}/resellers/${reseller.logto_id}/reactivate`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const promoteReseller = (reseller: Reseller) => {
+  const loginStore = useLoginStore()
+
+  return axios.patch(
+    `${API_URL}/resellers/${reseller.logto_id}/promote`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const restoreReseller = (reseller: Reseller) => {
+  const loginStore = useLoginStore()
+
+  return axios.patch(
+    `${API_URL}/resellers/${reseller.logto_id}/restore`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const getQueryStringParamsForExport = (
+  format: string,
+  textFilter: string | undefined,
+  statusFilter: ResellerStatus[] | undefined,
+  createdByFilter: string[] | undefined,
+  organizationFilter: string[] | undefined,
+  sortBy: string | undefined,
+  sortDescending: boolean | undefined,
+) => {
+  const searchParams = new URLSearchParams({
+    format: format,
+  })
+
+  if (textFilter?.trim()) {
+    searchParams.append('search', textFilter)
+  }
+
+  if (statusFilter) {
+    statusFilter.forEach((status) => {
+      searchParams.append('status', status)
+    })
+  }
+
+  if (createdByFilter) {
+    createdByFilter.forEach((userId) => {
+      searchParams.append('created_by', userId)
+    })
+  }
+
+  // Parent company filter: same exact match as the list query, so the export of
+  // a distributor's resellers never pulls in the resellers of its descendants.
+  if (organizationFilter) {
+    organizationFilter.forEach((organizationId) => {
+      searchParams.append('organization_id', organizationId)
+    })
+  }
+
+  if (sortBy) {
+    searchParams.append('sort_by', sortBy)
+  }
+
+  if (sortDescending !== undefined) {
+    searchParams.append('sort_direction', sortDescending ? 'desc' : 'asc')
+  }
+
+  return searchParams.toString()
+}
+
+export const getExport = (
+  format: 'csv' | 'pdf',
+  textFilter: string | undefined = undefined,
+  statusFilter: ResellerStatus[] | undefined = undefined,
+  createdByFilter: string[] | undefined = undefined,
+  organizationFilter: string[] | undefined = undefined,
+  sortBy: string | undefined = undefined,
+  sortDescending: boolean | undefined = undefined,
+) => {
+  const loginStore = useLoginStore()
+  const params = getQueryStringParamsForExport(
+    format,
+    textFilter,
+    statusFilter,
+    createdByFilter,
+    organizationFilter,
+    sortBy,
+    sortDescending,
+  )
+
+  return axios
+    .get(`${API_URL}/resellers/export?${params}`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data)
+}
+
+// ============================================================
+// Import API functions
+// ============================================================
+
+export const getImportTemplate = () => {
+  const loginStore = useLoginStore()
+  return axios
+    .get<Blob>(`${API_URL}/resellers/import/template`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+      responseType: 'blob',
+    })
+    .then((res) => res.data)
+}
+
+export const validateResellersImport = (file: File) => {
+  const loginStore = useLoginStore()
+  const formData = new FormData()
+  formData.append('file', file)
+  return axios
+    .post<{ code: number; message: string; data: ImportValidationResult }>(
+      `${API_URL}/resellers/import/validate`,
+      formData,
+      {
+        headers: {
+          Authorization: `Bearer ${loginStore.jwtToken}`,
+          'Content-Type': null,
+        },
+      },
+    )
+    .then((res) => res.data.data)
+}
+
+export const confirmResellersImport = (importId: string, override: boolean) => {
+  const loginStore = useLoginStore()
+  return axios
+    .post<{ code: number; message: string; data: ImportConfirmResult }>(
+      `${API_URL}/resellers/import/confirm`,
+      { import_id: importId, override },
+      {
+        headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+      },
+    )
+    .then((res) => res.data.data)
+}

@@ -1,0 +1,87 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { useI18n } from 'vue-i18n'
+import { useMutation, useQueryCache } from '@pinia/colada'
+import { deleteSystem, SYSTEMS_KEY, SYSTEMS_TOTAL_KEY, type System } from '@/lib/systems/systems'
+import { useNotificationsStore } from '@/stores/notifications'
+import { SYSTEM_FILTERS_KEY } from '@/lib/systems/systemFilters'
+import DeleteObjectModal from '../common/DeleteObjectModal.vue'
+
+const { visible = false, system = undefined } = defineProps<{
+  visible: boolean
+  system: System | undefined
+}>()
+
+const emit = defineEmits(['close', 'success'])
+
+const { t } = useI18n()
+const notificationsStore = useNotificationsStore()
+const queryCache = useQueryCache()
+
+const {
+  mutate: deleteSystemMutate,
+  isLoading: deleteSystemLoading,
+  reset: deleteSystemReset,
+  error: deleteSystemError,
+} = useMutation({
+  mutation: (system: System) => {
+    return deleteSystem(system)
+  },
+  onSuccess(data, vars) {
+    // show success notification after modal closes
+    setTimeout(() => {
+      notificationsStore.createNotification({
+        kind: 'success',
+        title: t('systems.system_archived'),
+        description: t('common.object_archived_successfully', {
+          name: vars.name,
+        }),
+      })
+    }, 500)
+
+    emit('close')
+    emit('success')
+  },
+  onError: (error) => {
+    console.error('Error deleting system:', error)
+  },
+  onSettled: (data, error, vars) => {
+    // Refresh the systems lists/aggregates, but skip this system's detail
+    // query. [SYSTEMS_KEY] prefix-matches both the list and the detail entry
+    // (['systems', <id>]); since we're navigating away and the system is now
+    // archived, refetching GET /systems/<id> would fail and show a spurious
+    // "request failed" notification.
+    queryCache.invalidateQueries({
+      key: [SYSTEMS_KEY],
+      predicate: (entry) => entry.key[1] !== vars.id,
+    })
+    queryCache.invalidateQueries({ key: [SYSTEMS_TOTAL_KEY] })
+    queryCache.invalidateQueries({ key: [SYSTEM_FILTERS_KEY] })
+  },
+})
+
+function onShow() {
+  // clear error
+  deleteSystemReset()
+}
+</script>
+
+<template>
+  <DeleteObjectModal
+    :visible="visible"
+    :title="$t('systems.archive_system')"
+    :primary-label="$t('common.archive')"
+    :deleting="deleteSystemLoading"
+    :confirmation-message="t('systems.archive_system_confirmation', { name: system?.name })"
+    :confirmation-input="system?.name"
+    :error-title="t('systems.cannot_archive_system')"
+    :error-description="deleteSystemError?.message"
+    @show="onShow"
+    @close="emit('close')"
+    @primary-click="deleteSystemMutate(system!)"
+  />
+</template>

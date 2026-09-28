@@ -1,0 +1,597 @@
+//  Copyright (C) 2025 Nethesis S.r.l.
+//  SPDX-License-Identifier: GPL-3.0-or-later
+
+import { computed, ref, watch } from 'vue'
+import { defineStore } from 'pinia'
+import { useLogto } from '@logto/vue'
+import {
+  API_URL,
+  LOGIN_REDIRECT_URI,
+  LOGTO_API_RESOURCE,
+  SIGN_OUT_REDIRECT_URI,
+} from '@/lib/config'
+import axios from 'axios'
+import { useThemeStore } from './theme'
+import { useStorage } from '@vueuse/core'
+import { getPreference } from '@nethesis/vue-components'
+import { getBrowserLocale, setLocale } from '@/i18n'
+import router from '@/router'
+import { deleteImpersonate, getImpersonationStatus, postImpersonate } from '@/lib/impersonation'
+import { canImpersonateUsers } from '@/lib/permissions'
+import { organizationDetailRoute } from '@/lib/organizations/organizationDetailRoute'
+
+export const TOKEN_REFRESH_INTERVAL = 20 * 60 * 1000 // 20 minutes
+
+// refresh ahead of the real expiry so an in-flight request never carries an
+// expired token (which would trigger the 401 logout in the interceptor)
+const TOKEN_EXPIRY_MARGIN = 60 * 1000 // 1 minute
+
+export type UserInfo = {
+  email: string
+  id: string
+  logto_id: string
+  name: string
+  org_permissions: string[]
+  org_role: string
+  org_role_id: string
+  organization_id: string
+  organization_name: string
+  phone: string
+  user_permissions: string[]
+  user_role_ids: string[]
+  user_roles: string[]
+  has_avatar: boolean
+}
+
+export const useLoginStore = defineStore('login', () => {
+  const { signIn, signOut, isAuthenticated, getAccessToken, getIdToken } = useLogto()
+  const themeStore = useThemeStore()
+
+  // The Logto access token (a JWT for the my API resource) is only used at
+  // exchange time; keep it in memory.
+  const accessToken = ref<string>('')
+  // Raw Logto ID token (JWT with email): sent to third-party apps' info_url,
+  // which validate it against the shared Logto tenant. In memory only: the
+  // Logto SDK owns its lifecycle and re-issues it on the next token exchange.
+  const idToken = ref<string>('')
+  // The custom JWT pair (and its expiry bookkeeping) is persisted in
+  // sessionStorage so a page reload no longer drops the session and falls back
+  // to a full Logto re-login. sessionStorage keeps the per-tab isolation the
+  // rotating refresh chain relies on: it survives reload, is not shared between
+  // tabs, and is cleared when the tab closes.
+  const jwtToken = useStorage<string>('my_jwt', '', sessionStorage)
+  const refreshToken = useStorage<string>('my_refresh_token', '', sessionStorage)
+  const tokenRefreshedAt = useStorage<number>('my_token_refreshed_at', 0, sessionStorage)
+  const tokenExpiresAt = useStorage<number>('my_token_expires_at', 0, sessionStorage)
+
+  // A reload rehydrates the pair from sessionStorage. If the access token is
+  // already (near) expired, drop it so queries gated on jwtToken don't fire
+  // with a dead token before the silent re-exchange runs; the refresh token is
+  // kept so the interceptor / re-exchange can still mint a fresh pair.
+  if (
+    jwtToken.value &&
+    (!tokenExpiresAt.value || Date.now() > tokenExpiresAt.value - TOKEN_EXPIRY_MARGIN)
+  ) {
+    jwtToken.value = ''
+  }
+
+  const userInfo = ref<UserInfo | undefined>()
+  const loadingUserInfo = ref<boolean>(true)
+  const avatarVersion = ref<number>(0)
+  const isImpersonating = ref<boolean>(false)
+  const impersonatedUser = ref<UserInfo | undefined>()
+  const originalUser = ref<UserInfo | undefined>()
+  const impersonateExpiration = ref<Date | undefined>()
+
+  const userDisplayName = computed(() => userInfo.value?.name || '')
+
+  const isOwner = computed(() => {
+    return userInfo.value?.org_role === 'Owner'
+  })
+
+  // The bootstrap 'owner' account is the only user without a local database id
+  // (it lives only in Logto): profile editing, API keys and impersonation
+  // consent need that row, so they are disabled for it — and only for it.
+  // Staff/Owner-org users are regular accounts.
+  const isOwnerAccount = computed(() => {
+    return !!userInfo.value && userInfo.value.id === ''
+  })
+
+  // Detail page of the user's own company. The side menu lists only the levels
+  // below the user's, so this is the way there. Null for the Owner organization,
+  // which has no detail page.
+  const ownOrganizationRoute = computed(() =>
+    organizationDetailRoute(userInfo.value?.organization_id, userInfo.value?.org_role),
+  )
+
+  const permissions = computed(() => {
+    return (userInfo.value?.org_permissions || []).concat(userInfo.value?.user_permissions || [])
+  })
+
+  // Proactively refresh the short-lived access token while the tab is open, so
+  // an idle period never leaves an expired token that the interceptor would
+  // turn into a 401 logout. The tick is cheap; shouldRefreshToken() decides
+  // whether a network refresh actually happens, and doRefreshToken dedups.
+  const AUTO_REFRESH_CHECK_INTERVAL = 60 * 1000 // 1 minute
+  let autoRefreshTimer: ReturnType<typeof setInterval> | null = null
+
+  // Waking from sleep or switching network makes the Logto SDK's token calls
+  // fail with a plain connectivity error (ERR_INTERNET_DISCONNECTED on the
+  // discovery endpoint): the SDK reports it as "no token", which says nothing
+  // about whether the session is still valid. Treating it as a dead session
+  // would wipe the tokens and redirect to Logto — a redirect that cannot reach
+  // Logto either, leaving the app stuck on its skeletons until a manual
+  // reload. So connectivity failures are retried, never re-authenticated.
+  const MAX_TOKEN_ATTEMPTS = 3
+  const TOKEN_RETRY_DELAY = 5 * 1000
+  let tokenAttempts = 0
+  let tokenRetryPending = false
+  let tokenRetryTimer: ReturnType<typeof setTimeout> | null = null
+  let fetchingTokenAndUserInfo = false
+
+  const isOffline = () => typeof navigator !== 'undefined' && navigator.onLine === false
+
+  const cancelTokenRetry = () => {
+    if (tokenRetryTimer) {
+      clearTimeout(tokenRetryTimer)
+      tokenRetryTimer = null
+    }
+    tokenRetryPending = false
+  }
+
+  const scheduleTokenRetry = () => {
+    tokenRetryPending = true
+
+    if (isOffline() || tokenRetryTimer) {
+      // offline: the 'online' event drives the retry, a timer would only burn
+      // attempts against a network that is known to be down
+      return
+    }
+    tokenRetryTimer = setTimeout(() => {
+      tokenRetryTimer = null
+
+      if (tokenRetryPending) {
+        fetchTokenAndUserInfo()
+      }
+    }, TOKEN_RETRY_DELAY)
+  }
+
+  const startAutoRefresh = () => {
+    if (autoRefreshTimer) {
+      return
+    }
+    autoRefreshTimer = setInterval(() => {
+      if (document.visibilityState === 'visible' && shouldRefreshToken()) {
+        doRefreshToken()
+      }
+    }, AUTO_REFRESH_CHECK_INTERVAL)
+  }
+
+  const stopAutoRefresh = () => {
+    if (autoRefreshTimer) {
+      clearInterval(autoRefreshTimer)
+      autoRefreshTimer = null
+    }
+  }
+
+  // A tab returning to the foreground after being idle is the classic moment
+  // for an expired token: refresh right away instead of waiting for the tick.
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') {
+        return
+      }
+
+      if (tokenRetryPending) {
+        fetchTokenAndUserInfo()
+      } else if (shouldRefreshToken()) {
+        doRefreshToken()
+      }
+    })
+  }
+
+  // Connectivity is back (resume from sleep, new Wi-Fi): recover the session
+  // that could not be renewed while the machine was offline.
+  if (typeof window !== 'undefined') {
+    window.addEventListener('online', () => {
+      if (tokenRetryPending) {
+        fetchTokenAndUserInfo()
+      } else if (shouldRefreshToken()) {
+        doRefreshToken()
+      }
+    })
+  }
+
+  // watch for authentication changes
+  watch(
+    isAuthenticated,
+    (isAuth, wasAuth) => {
+      if (isAuth) {
+        fetchTokenAndUserInfo()
+        // pathRequested (deep link saved by the router guard) is restored by
+        // LoginRedirectView's sign-in callback: doing it here too would race
+        // with that push and could bounce the user to the dashboard.
+      } else if (wasAuth) {
+        // Genuine logout (was authenticated, now not) — tear the session down.
+        // On the initial boot tick isAuthenticated is transiently false while
+        // the Logto SDK restores the session, so wasAuth is undefined there and
+        // we must NOT wipe the persisted tokens we just rehydrated.
+        stopAutoRefresh()
+        jwtToken.value = ''
+        accessToken.value = ''
+        idToken.value = ''
+        refreshToken.value = ''
+        tokenRefreshedAt.value = 0
+        tokenExpiresAt.value = 0
+        userInfo.value = undefined
+      }
+    },
+    { immediate: true },
+  )
+
+  const login = () => {
+    signIn(LOGIN_REDIRECT_URI)
+  }
+
+  const logout = () => {
+    // Clear the persisted session before redirecting to Logto: signOut is a
+    // same-tab navigation, so sessionStorage would otherwise survive and leave
+    // orphaned tokens that queries (gated on jwtToken) could still pick up.
+    stopAutoRefresh()
+    jwtToken.value = ''
+    refreshToken.value = ''
+    tokenRefreshedAt.value = 0
+    tokenExpiresAt.value = 0
+    signOut(SIGN_OUT_REDIRECT_URI)
+  }
+
+  // Failure-path re-auth: tears down the local session but keeps the Logto SSO
+  // session alive, then re-enters the sign-in flow — silent (no credentials)
+  // while that session is valid. The full signOut is reserved for the user's
+  // explicit logout: it revokes the Logto grant and session, forcing
+  // credentials + MFA on the next visit, which is never the right response to
+  // an internal error.
+  let reauthStarted = false
+  const forceReauth = () => {
+    // one redirect is enough, even if several requests fail at once
+    if (reauthStarted) {
+      return
+    }
+    if (isOffline()) {
+      // the sign-in redirect cannot reach Logto either: keep the session as it
+      // is and let the 'online' handler recover it
+      scheduleTokenRetry()
+      return
+    }
+    reauthStarted = true
+    // Keep the page the user is on: this re-auth is a full-page redirect and
+    // LoginRedirectView resumes whatever the router guard saved, so without
+    // this a session that dies mid-visit comes back on the dashboard. Same
+    // key, same exclusions as the guard (router/index.ts).
+    const here = window.location.pathname + window.location.search
+    if (!['/', '/login', '/dashboard', '/login-redirect'].includes(window.location.pathname)) {
+      localStorage.setItem('pathRequested', JSON.stringify(here))
+    }
+    stopAutoRefresh()
+    jwtToken.value = ''
+    accessToken.value = ''
+    idToken.value = ''
+    refreshToken.value = ''
+    tokenRefreshedAt.value = 0
+    tokenExpiresAt.value = 0
+    userInfo.value = undefined
+    Promise.resolve(signIn(LOGIN_REDIRECT_URI)).catch((error) => {
+      // the redirect never left (the network dropped while it was starting):
+      // release the guard, or no later attempt could ever re-authenticate
+      console.error('Cannot start the sign-in flow, retrying later:', error)
+      reauthStarted = false
+      scheduleTokenRetry()
+    })
+  }
+
+  // Called after the picture is uploaded or removed: busts the avatar URL cache
+  // and keeps has_avatar in sync, so the shell doesn't wait for the next token
+  // refresh to start (or stop) rendering the image.
+  const refreshAvatar = (hasAvatar: boolean) => {
+    avatarVersion.value = Date.now()
+
+    if (userInfo.value) {
+      userInfo.value.has_avatar = hasAvatar
+    }
+  }
+
+  // A token fetch failed. The SDK does not tell a dead session apart from an
+  // unreachable Logto, so retry first and only re-authenticate once several
+  // attempts failed with the browser online.
+  const handleTokenFailure = () => {
+    loadingUserInfo.value = false
+
+    if (isOffline()) {
+      console.warn('Cannot fetch access token while offline, waiting for the network')
+      scheduleTokenRetry()
+      return
+    }
+    tokenAttempts += 1
+
+    if (tokenAttempts < MAX_TOKEN_ATTEMPTS) {
+      console.warn(`Cannot fetch access token, retry ${tokenAttempts}/${MAX_TOKEN_ATTEMPTS}`)
+      scheduleTokenRetry()
+      return
+    }
+    console.error('Cannot fetch access token, re-authenticating')
+    tokenAttempts = 0
+    cancelTokenRetry()
+    forceReauth()
+  }
+
+  const fetchTokenAndUserInfo = async () => {
+    if (fetchingTokenAndUserInfo) {
+      // a retry timer and the 'online' / visibility handlers can fire together
+      return
+    }
+    fetchingTokenAndUserInfo = true
+    cancelTokenRetry()
+    loadingUserInfo.value = true
+
+    try {
+      const token = await getAccessToken(LOGTO_API_RESOURCE)
+
+      if (!token) {
+        fetchingTokenAndUserInfo = false
+        handleTokenFailure()
+        return
+      }
+
+      accessToken.value = token || ''
+
+      // Raw ID token for third-party info_url calls (best-effort).
+      try {
+        idToken.value = (await getIdToken()) || ''
+      } catch {
+        idToken.value = ''
+      }
+    } catch (error) {
+      // the SDK throws both when its refresh token is dead and when it cannot
+      // reach Logto at all: handleTokenFailure tells the two apart
+      console.warn('Cannot fetch access token:', error)
+      fetchingTokenAndUserInfo = false
+      handleTokenFailure()
+      return
+    }
+
+    tokenAttempts = 0
+
+    try {
+      const res = await axios.post(`${API_URL}/auth/exchange`, {
+        access_token: accessToken.value,
+      })
+      jwtToken.value = res.data.data.token
+      refreshToken.value = res.data.data.refresh_token
+      tokenRefreshedAt.value = Date.now()
+      tokenExpiresAt.value = Date.now() + res.data.data.expires_in * 1000
+      const user = res.data.data.user as UserInfo
+      userInfo.value = user
+
+      // keep the short-lived access token fresh while the tab is open, so an
+      // idle period never leaves an expired token that would 401 on the next call
+      startAutoRefresh()
+
+      // Load user theme
+      themeStore.loadTheme()
+
+      // Load locale from user preference
+      const locale = getPreference('locale', user.email) || getBrowserLocale()
+      setLocale(locale)
+
+      // save last user to local storage: this is used to load the theme and locale before user info is fetched
+      const lastUser = useStorage('lastUser', '')
+      lastUser.value = user.email
+
+      if (canImpersonateUsers()) {
+        // check if we are in impersonation mode
+        checkImpersonationStatus()
+      }
+    } catch (error) {
+      console.error('Cannot exchange token:', error)
+
+      // no HTTP response at all: the API was unreachable (offline, network
+      // switch), not a rejected token — retry instead of leaving the app
+      // without a JWT, which keeps every query on its skeleton forever
+      if (!axios.isAxiosError(error) || !error.response) {
+        scheduleTokenRetry()
+      }
+    } finally {
+      loadingUserInfo.value = false
+      fetchingTokenAndUserInfo = false
+    }
+  }
+
+  const checkImpersonationStatus = async () => {
+    const impersonationStatus = await getImpersonationStatus()
+
+    if (impersonationStatus.is_impersonating && !isImpersonating.value) {
+      // Store original user info before switching
+      if (!isImpersonating.value) {
+        originalUser.value = { ...userInfo.value! }
+      }
+
+      // Update tokens and user info with impersonated user
+      jwtToken.value = impersonationStatus.token
+      impersonatedUser.value = impersonationStatus.impersonated_user
+      userInfo.value = impersonatedUser.value
+      isImpersonating.value = true
+      impersonateExpiration.value = new Date(impersonationStatus.expires_at)
+    }
+  }
+
+  const shouldRefreshToken = () => {
+    // impersonation tokens have their own lifecycle and cannot be refreshed
+    if (isImpersonating.value) {
+      return false
+    }
+    // no access token but a surviving refresh token (a reload drops a
+    // near-expired token, see the rehydration above): a refresh can mint a
+    // fresh pair before the first request goes out
+    if (!jwtToken.value) {
+      return Boolean(refreshToken.value)
+    }
+    const now = Date.now()
+
+    if (tokenExpiresAt.value && now > tokenExpiresAt.value - TOKEN_EXPIRY_MARGIN) {
+      return true
+    }
+    return now - tokenRefreshedAt.value > TOKEN_REFRESH_INTERVAL
+  }
+
+  // Fallback used when the custom refresh chain can no longer be rotated (e.g.
+  // reuse-detection burned it, or two tabs briefly shared the same token):
+  // re-derive a brand-new token pair from the still-valid Logto session. Works
+  // silently only because we request the offline_access scope.
+  const reexchangeFromLogto = async (): Promise<boolean> => {
+    try {
+      const token = await getAccessToken(LOGTO_API_RESOURCE)
+      if (!token) {
+        return false
+      }
+      accessToken.value = token
+      const res = await axios.post(`${API_URL}/auth/exchange`, {
+        access_token: token,
+      })
+      jwtToken.value = res.data.data.token
+      refreshToken.value = res.data.data.refresh_token
+      tokenRefreshedAt.value = Date.now()
+      tokenExpiresAt.value = Date.now() + res.data.data.expires_in * 1000
+      userInfo.value = res.data.data.user as UserInfo
+      return true
+    } catch (error) {
+      console.error('Cannot re-exchange token via Logto:', error)
+      return false
+    }
+  }
+
+  // deduplicate concurrent refreshes: the backend rotates the refresh token on
+  // every use, so two parallel calls with the same token would look like theft
+  let refreshPromise: Promise<boolean> | null = null
+
+  // lets a request that already carries a token wait out a rotation another
+  // caller started, instead of racing it with a stale Authorization header
+  const pendingRefresh = (): Promise<boolean> => refreshPromise ?? Promise.resolve(true)
+
+  // resolves to true when a usable token pair is in place afterwards
+  const doRefreshToken = (): Promise<boolean> => {
+    // don't refresh if we are impersonating
+    if (isImpersonating.value) {
+      return Promise.resolve(false)
+    }
+
+    if (refreshPromise) {
+      return refreshPromise
+    }
+
+    refreshPromise = (async () => {
+      try {
+        if (!refreshToken.value) {
+          // no chain to rotate: mint a brand-new pair from the Logto session
+          return await reexchangeFromLogto()
+        }
+        const res = await axios.post(`${API_URL}/auth/refresh`, {
+          refresh_token: refreshToken.value,
+        })
+        jwtToken.value = res.data.data.token
+        refreshToken.value = res.data.data.refresh_token
+        tokenRefreshedAt.value = Date.now()
+        tokenExpiresAt.value = Date.now() + res.data.data.expires_in * 1000
+        return true
+      } catch (error) {
+        // the custom refresh chain is dead; try a silent Logto re-exchange
+        // before surrendering, so a burned chain self-heals instead of the
+        // next request 401-ing the user out
+        console.warn('Refresh failed, falling back to Logto re-exchange:', error)
+        return await reexchangeFromLogto()
+      } finally {
+        refreshPromise = null
+      }
+    })()
+    return refreshPromise
+  }
+
+  const impersonateUser = async (userId: string) => {
+    try {
+      const res = await postImpersonate(userId)
+
+      // Store original user info before switching
+      if (!isImpersonating.value) {
+        originalUser.value = { ...userInfo.value! }
+      }
+
+      // Update tokens and user info with impersonated user
+      jwtToken.value = res.token
+      impersonatedUser.value = res.impersonated_user as UserInfo
+      userInfo.value = impersonatedUser.value
+      isImpersonating.value = true
+      impersonateExpiration.value = new Date(res.expires_at)
+
+      // Navigate to dashboard or stay on current page
+      if (router.currentRoute.value.path === '/users') {
+        router.push('/dashboard')
+      }
+      return res
+    } catch (error) {
+      console.error('Cannot impersonate user:', error)
+      throw error
+    }
+  }
+
+  const exitImpersonation = async () => {
+    try {
+      const res = await deleteImpersonate()
+
+      // Restore original user info
+      jwtToken.value = res.token
+      refreshToken.value = res.refresh_token
+      tokenRefreshedAt.value = Date.now()
+      tokenExpiresAt.value = Date.now() + res.expires_in * 1000
+      userInfo.value = res.user as UserInfo
+      isImpersonating.value = false
+      impersonatedUser.value = undefined
+      originalUser.value = undefined
+
+      // Navigate to dashboard
+      if (router.currentRoute.value.path !== '/dashboard') {
+        router.push('/dashboard')
+      }
+      return res
+    } catch (error) {
+      console.error('Cannot exit impersonation:', error)
+      throw error
+    }
+  }
+
+  return {
+    isAuthenticated,
+    jwtToken,
+    idToken,
+    userDisplayName,
+    userInfo,
+    loadingUserInfo,
+    isOwner,
+    isOwnerAccount,
+    ownOrganizationRoute,
+    permissions,
+    avatarVersion,
+    isImpersonating,
+    impersonatedUser,
+    originalUser,
+    impersonateExpiration,
+    refreshAvatar,
+    fetchTokenAndUserInfo,
+    shouldRefreshToken,
+    doRefreshToken,
+    pendingRefresh,
+    impersonateUser,
+    exitImpersonation,
+    login,
+    logout,
+    forceReauth,
+  }
+})

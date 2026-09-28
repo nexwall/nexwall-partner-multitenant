@@ -1,0 +1,131 @@
+<!--
+  Copyright (C) 2026 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { NeCombobox } from '@nethesis/vue-components'
+import { useI18n } from 'vue-i18n'
+import { computed, ref } from 'vue'
+import { useOrganizationFilter } from '@/composables/useOrganizationFilter'
+
+const props = withDefaults(
+  defineProps<{
+    modelValue: string
+    // Gates the org search so it doesn't fire while the host drawer is closed.
+    isShown?: boolean
+    label: string
+    disabled?: boolean
+    invalidMessage?: string
+    helperText?: string
+    placeholder?: string
+    optional?: boolean
+    // Scopes the server-side search to these organization types (e.g.
+    // ['distributor']). Filtering by type here rather than on the fetched page
+    // is what keeps the options meaningful: the page is truncated, so a
+    // client-side filter would drop to a handful of entries — or none — as soon
+    // as companies of other types sort ahead of them.
+    allowedTypes?: string[]
+    // Exclude these organization ids from the options (e.g. the caller's own org).
+    excludeOrganizationIds?: string[]
+    // The organization already assigned to the entity being edited. The options
+    // are a single page of a server-side search, so a company that falls outside
+    // it has no option to resolve its label from — pass it here and the field can
+    // still show its name.
+    selectedOrganization?: { logto_id?: string; name: string; type: string }
+  }>(),
+  {
+    isShown: true,
+    optional: false,
+  },
+)
+
+const emit = defineEmits<{
+  'update:modelValue': [value: string]
+}>()
+
+const { t } = useI18n()
+
+const { organizations, loading, onSearch, currentSearch } = useOrganizationFilter(
+  () => props.isShown,
+  () => props.allowedTypes,
+)
+
+const organizationOptions = computed(() => {
+  let orgs = organizations.value
+  // The excluded ids stay a client-side filter: the API has no equivalent
+  // parameter, and unlike a type filter this one only ever removes ids the
+  // caller already knows about, so it cannot silently empty the list.
+  if (props.excludeOrganizationIds && props.excludeOrganizationIds.length > 0) {
+    orgs = orgs.filter((org) => !props.excludeOrganizationIds!.includes(org.logto_id))
+  }
+  return orgs.map((org) => ({
+    id: org.logto_id,
+    label: org.name,
+    description: t(`organizations.${org.type}`),
+  }))
+})
+
+// Skipped when the name is empty (owner-org entities, whose name the API leaves
+// blank) so the field stays blank instead of showing an unlabelled selection.
+const selectedOption = computed(() => {
+  const org = props.selectedOrganization
+  if (!props.modelValue || org?.logto_id !== props.modelValue || !org.name) {
+    return undefined
+  }
+  return {
+    id: props.modelValue,
+    label: org.name,
+    description: t(`organizations.${org.type}`),
+  }
+})
+
+const isLoading = loading
+
+const isInitiallyLoading = computed(
+  () => loading.value && organizations.value.length === 0 && !currentSearch.value,
+)
+
+const computedPlaceholder = computed(() =>
+  isLoading.value
+    ? t('common.loading')
+    : (props.placeholder ?? t('organizations.choose_organization')),
+)
+
+const comboboxRef = ref()
+
+defineExpose({
+  focus: () => comboboxRef.value?.focus?.(),
+})
+</script>
+
+<template>
+  <NeCombobox
+    ref="comboboxRef"
+    :model-value="props.modelValue"
+    :options="organizationOptions"
+    :selected-option="selectedOption"
+    :label="props.label"
+    :placeholder="computedPlaceholder"
+    :invalid-message="props.invalidMessage"
+    :disabled="isInitiallyLoading || props.disabled"
+    :optional="props.optional"
+    :no-results-label="t('ne_combobox.no_results')"
+    :limited-options-label="t('ne_combobox.limited_options_label')"
+    :no-options-label="t('organizations.no_organizations')"
+    :selected-label="t('ne_combobox.selected')"
+    :user-input-label="t('ne_combobox.user_input_label')"
+    :optional-label="t('common.optional')"
+    :loading-options="isLoading"
+    :helper-text="props.helperText"
+    external-filter
+    @update:model-value="emit('update:modelValue', $event)"
+    @filter="onSearch"
+  >
+    <!-- forward the tooltip slot only when the caller provides one, so other
+      consumers don't get an empty tooltip icon -->
+    <template v-if="$slots.tooltip" #tooltip>
+      <slot name="tooltip" />
+    </template>
+  </NeCombobox>
+</template>

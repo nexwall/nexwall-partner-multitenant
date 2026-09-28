@@ -1,0 +1,479 @@
+//  Copyright (C) 2025 Nethesis S.r.l.
+//  SPDX-License-Identifier: GPL-3.0-or-later
+
+import axios from 'axios'
+import { API_URL } from '../config'
+import { useLoginStore } from '@/stores/login'
+import * as v from 'valibot'
+import { downloadFile, type Pagination } from '../common'
+import Ns8Logo from '@/assets/system_logos/nethserver.svg'
+import NsecLogo from '@/assets/system_logos/nethsecurity.svg'
+
+export const SYSTEMS_KEY = 'systems'
+export const SYSTEMS_TOTAL_KEY = 'systemsTotal'
+export const SYSTEMS_TABLE_ID = 'systemsTable'
+export const SYSTEM_REACHABILITY_KEY = 'systemReachability'
+
+// Home of the systems still running NethServer 7 and older: the legacy counters
+// point there, since my has no page of its own for them.
+export const LEGACY_SYSTEMS_URL = 'https://legacy.my.nethesis.it'
+
+const SystemStatusSchema = v.picklist(['active', 'inactive', 'unknown', 'deleted', 'suspended'])
+
+export const CreateSystemSchema = v.object({
+  name: v.pipe(v.string(), v.nonEmpty('systems.name_cannot_be_empty')),
+  organization_id: v.pipe(v.string(), v.nonEmpty('systems.organization_required')),
+  notes: v.pipe(v.string()),
+  custom_data: v.optional(v.record(v.string(), v.string())),
+  // Optional: attribute the new system's created_by display org to an ancestor
+  // org (a reseller or distributor) instead of the caller's own org — used when
+  // an upper tier creates it on behalf of a lower one. Empty = caller's own org.
+  created_by_organization_id: v.optional(v.string()),
+})
+
+export const EditSystemSchema = v.object({
+  ...CreateSystemSchema.entries,
+  id: v.string(),
+})
+
+export const SystemSchema = v.object({
+  ...CreateSystemSchema.entries,
+  ...EditSystemSchema.entries,
+  type: v.optional(v.picklist(['ns8', 'nsec'])),
+  status: v.optional(SystemStatusSchema),
+  fqdn: v.string(),
+  ipv4_address: v.string(),
+  ipv6_address: v.string(),
+  version: v.string(),
+  created_at: v.string(),
+  updated_at: v.string(),
+  registered_at: v.optional(v.string()),
+  system_key: v.optional(v.string()),
+  system_secret: v.string(),
+  suspended_at: v.optional(v.string()),
+  last_heartbeat: v.optional(v.string()),
+  last_inventory: v.optional(v.string()),
+  first_heartbeat: v.optional(v.string()),
+  first_inventory: v.optional(v.string()),
+  rebranding_enabled: v.optional(v.boolean()),
+  // Add-on catalog ids granted and valid right now. The list endpoint sends
+  // them only when asked with include_addons, and omits the key for a system
+  // holding none.
+  addons: v.optional(v.array(v.string())),
+  organization: v.object({
+    id: v.string(),
+    logto_id: v.string(),
+    name: v.string(),
+    type: v.string(),
+  }),
+  created_by: v.object({
+    user_id: v.string(),
+    username: v.string(),
+    name: v.string(),
+    email: v.string(),
+    organization_id: v.string(),
+    organization_name: v.string(),
+    // Level of organization_id, resolved live by the backend (it is not part
+    // of the stored snapshot: an organization can be promoted after the fact).
+    // Absent for the Owner organization and for deleted ones, which have no
+    // detail page to link to.
+    organization_type: v.optional(v.string()),
+    // True when the creator acted on behalf of organization_name (attributed
+    // via created_by_organization_id) rather than belonging to it. Omitted
+    // (falsy) on the default own-org path.
+    on_behalf_of: v.optional(v.boolean()),
+  }),
+})
+
+export type CreateSystem = v.InferOutput<typeof CreateSystemSchema>
+export type EditSystem = v.InferOutput<typeof EditSystemSchema>
+export type System = v.InferOutput<typeof SystemSchema>
+export type SystemStatus = v.InferOutput<typeof SystemStatusSchema>
+
+interface SystemsResponse {
+  code: number
+  message: string
+  data: {
+    systems: System[]
+    pagination: Pagination
+  }
+}
+
+interface PostSystemResponse {
+  code: number
+  message: string
+  data: System
+}
+
+interface SystemsTotalResponse {
+  code: number
+  message: string
+  data: {
+    total: number
+    active: number
+    inactive: number
+    unknown: number
+    legacy: number
+    timeout_minutes: number
+  }
+}
+
+interface SystemReachabilityResponse {
+  code: number
+  message: string
+  data: {
+    reachable: boolean
+    url: string
+  }
+}
+
+export const getQueryStringParams = (
+  pageNum: number,
+  pageSize: number,
+  textFilter: string | null,
+  productFilter: string[],
+  createdByFilter: string[],
+  versionFilter: string[],
+  statusFilter: SystemStatus[],
+  organizationFilter: string[],
+  addonFilter: string[],
+  includeHierarchy: boolean,
+  sortBy: string | null,
+  sortDescending: boolean,
+) => {
+  const searchParams = new URLSearchParams({
+    page: pageNum.toString(),
+    page_size: pageSize.toString(),
+    sort_by: sortBy || '',
+    sort_direction: sortDescending ? 'desc' : 'asc',
+  })
+
+  if (textFilter?.trim()) {
+    searchParams.append('search', textFilter)
+  }
+
+  productFilter.forEach((product) => {
+    searchParams.append('type', product)
+  })
+
+  createdByFilter.forEach((userId) => {
+    searchParams.append('created_by', userId)
+  })
+
+  versionFilter.forEach((version) => {
+    searchParams.append('version', version)
+  })
+
+  statusFilter.forEach((status) => {
+    searchParams.append('status', status)
+  })
+
+  organizationFilter.forEach((orgId) => {
+    searchParams.append('organization_id', orgId)
+  })
+
+  addonFilter.forEach((addon) => {
+    searchParams.append('addon', addon)
+  })
+
+  if (includeHierarchy) {
+    searchParams.append('include_hierarchy', 'true')
+  }
+  return searchParams.toString()
+}
+
+export const getQueryStringParamsForExport = (
+  format: string,
+  systemKey: string | undefined,
+  textFilter: string | undefined,
+  productFilter: string[] | undefined,
+  createdByFilter: string[] | undefined,
+  versionFilter: string[] | undefined,
+  statusFilter: SystemStatus[] | undefined,
+  organizationFilter: string[] | undefined,
+  addonFilter: string[] | undefined,
+  includeHierarchy: boolean | undefined,
+  sortBy: string | undefined,
+  sortDescending: boolean | undefined,
+) => {
+  const searchParams = new URLSearchParams({
+    format: format,
+  })
+
+  if (systemKey) {
+    searchParams.append('system_key', systemKey)
+  }
+
+  if (textFilter?.trim()) {
+    searchParams.append('search', textFilter)
+  }
+
+  if (productFilter) {
+    productFilter.forEach((product) => {
+      searchParams.append('type', product)
+    })
+  }
+
+  if (createdByFilter) {
+    createdByFilter.forEach((userId) => {
+      searchParams.append('created_by', userId)
+    })
+  }
+
+  if (versionFilter) {
+    versionFilter.forEach((version) => {
+      searchParams.append('version', version)
+    })
+  }
+
+  if (organizationFilter) {
+    organizationFilter.forEach((orgId) => {
+      searchParams.append('organization_id', orgId)
+    })
+  }
+
+  if (addonFilter) {
+    addonFilter.forEach((addon) => {
+      searchParams.append('addon', addon)
+    })
+  }
+
+  if (includeHierarchy) {
+    searchParams.append('include_hierarchy', 'true')
+  }
+
+  if (statusFilter) {
+    statusFilter.forEach((status) => {
+      searchParams.append('status', status)
+    })
+  }
+
+  if (sortBy) {
+    searchParams.append('sort_by', sortBy)
+  }
+
+  if (sortDescending !== undefined) {
+    searchParams.append('sort_direction', sortDescending ? 'desc' : 'asc')
+  }
+  return searchParams.toString()
+}
+
+export const getSystems = (
+  pageNum: number,
+  pageSize: number,
+  textFilter: string,
+  productFilter: string[],
+  createdByFilter: string[],
+  versionFilter: string[],
+  statusFilter: SystemStatus[],
+  organizationFilter: string[],
+  addonFilter: string[],
+  includeHierarchy: boolean,
+  sortBy: string,
+  sortDescending: boolean,
+) => {
+  const loginStore = useLoginStore()
+  const params = getQueryStringParams(
+    pageNum,
+    pageSize,
+    textFilter,
+    productFilter,
+    createdByFilter,
+    versionFilter,
+    statusFilter,
+    organizationFilter,
+    addonFilter,
+    includeHierarchy,
+    sortBy,
+    sortDescending,
+  )
+
+  return axios
+    .get<SystemsResponse>(`${API_URL}/systems?${params}`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data.data)
+}
+
+export const postSystem = (system: CreateSystem) => {
+  const loginStore = useLoginStore()
+
+  return axios
+    .post<PostSystemResponse>(`${API_URL}/systems`, system, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data)
+}
+
+export const putSystem = (system: EditSystem) => {
+  const loginStore = useLoginStore()
+
+  return axios.put<PostSystemResponse>(`${API_URL}/systems/${system.id}`, system, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const deleteSystem = (system: System) => {
+  const loginStore = useLoginStore()
+
+  return axios.delete(`${API_URL}/systems/${system.id}`, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const destroySystem = (system: System) => {
+  const loginStore = useLoginStore()
+
+  return axios.delete(`${API_URL}/systems/${system.id}/destroy`, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const restoreSystem = (system: System) => {
+  const loginStore = useLoginStore()
+
+  return axios.patch(
+    `${API_URL}/systems/${system.id}/restore`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const regenerateSystemSecret = (systemId: string) => {
+  const loginStore = useLoginStore()
+
+  return axios.post<System>(
+    `${API_URL}/systems/${systemId}/regenerate-secret`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const getSystemsTotal = () => {
+  const loginStore = useLoginStore()
+
+  return axios
+    .get<SystemsTotalResponse>(`${API_URL}/systems/totals`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data.data)
+}
+
+export const checkSystemReachability = (systemId: string) => {
+  const loginStore = useLoginStore()
+
+  return axios
+    .get<SystemReachabilityResponse>(`${API_URL}/systems/${systemId}/reachability`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data.data)
+}
+
+export function getProductName(systemType: string) {
+  if (systemType === 'ns8') {
+    return 'NethServer'
+  } else if (systemType === 'nsec') {
+    return 'NethSecurity'
+  } else {
+    return systemType
+  }
+}
+
+export const getProductLogo = (systemType: string) => {
+  switch (systemType) {
+    case 'ns8':
+      return Ns8Logo
+    case 'nsec':
+      return NsecLogo
+    default:
+      return undefined
+  }
+}
+
+export async function exportSystem(system: System, format: 'pdf' | 'csv') {
+  try {
+    const exportData = await getExport(format, system.system_key)
+    const fileName = `${system.name}.${format}`
+    downloadFile(exportData, fileName, format)
+  } catch (error) {
+    console.error(`Cannot export system to ${format}:`, error)
+    throw error
+  }
+}
+
+export const getExport = (
+  format: 'csv' | 'pdf',
+  systemKey: string | undefined = undefined,
+  textFilter: string | undefined = undefined,
+  productFilter: string[] | undefined = undefined,
+  createdByFilter: string[] | undefined = undefined,
+  versionFilter: string[] | undefined = undefined,
+  statusFilter: SystemStatus[] | undefined = undefined,
+  organizationFilter: string[] | undefined = undefined,
+  addonFilter: string[] | undefined = undefined,
+  includeHierarchy: boolean | undefined = undefined,
+  sortBy: string | undefined = undefined,
+  sortDescending: boolean | undefined = undefined,
+) => {
+  const loginStore = useLoginStore()
+  const params = getQueryStringParamsForExport(
+    format,
+    systemKey,
+    textFilter,
+    productFilter,
+    createdByFilter,
+    versionFilter,
+    statusFilter,
+    organizationFilter,
+    addonFilter,
+    includeHierarchy,
+    sortBy,
+    sortDescending,
+  )
+
+  return axios
+    .get(`${API_URL}/systems/export?${params}`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data)
+}
+
+export const postRegenerateSecret = (systemId: string) => {
+  const loginStore = useLoginStore()
+
+  return axios.post<PostSystemResponse>(
+    `${API_URL}/systems/${systemId}/regenerate-secret`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const suspendSystem = (system: System) => {
+  const loginStore = useLoginStore()
+
+  return axios.patch(
+    `${API_URL}/systems/${system.id}/suspend`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}
+
+export const reactivateSystem = (system: System) => {
+  const loginStore = useLoginStore()
+
+  return axios.patch(
+    `${API_URL}/systems/${system.id}/reactivate`,
+    {},
+    {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    },
+  )
+}

@@ -1,0 +1,865 @@
+/*
+ * Copyright (C) 2025 Nethesis S.r.l.
+ * http://www.nethesis.it - info@nethesis.it
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * author: Edoardo Spadoni <edoardo.spadoni@nethesis.it>
+ */
+
+package methods
+
+import (
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/nethesis/my/backend/cache"
+	"github.com/nethesis/my/backend/configuration"
+	"github.com/nethesis/my/backend/entities"
+	"github.com/nethesis/my/backend/helpers"
+	"github.com/nethesis/my/backend/jwt"
+	"github.com/nethesis/my/backend/logger"
+	"github.com/nethesis/my/backend/models"
+	"github.com/nethesis/my/backend/response"
+	"github.com/nethesis/my/backend/services/local"
+	"github.com/nethesis/my/backend/services/logto"
+)
+
+// TokenExchangeRequest represents the request body for token exchange
+type TokenExchangeRequest struct {
+	AccessToken string `json:"access_token" binding:"required"`
+}
+
+// RefreshTokenRequest represents the request body for token refresh
+type RefreshTokenRequest struct {
+	RefreshToken string `json:"refresh_token" binding:"required"`
+}
+
+// ImpersonateRequest represents the request body for user impersonation
+type ImpersonateRequest struct {
+	UserID string `json:"user_id" binding:"required"`
+}
+
+// TokenExchangeResponse represents the response for token exchange
+type TokenExchangeResponse struct {
+	Token        string      `json:"token"`
+	RefreshToken string      `json:"refresh_token"`
+	ExpiresIn    int64       `json:"expires_in"`
+	User         models.User `json:"user"`
+}
+
+// buildUserFromLogtoID constructs a complete User object (profile, roles,
+// permissions, organization) from a Logto ID, reusing the 10-minute Redis
+// profile cache. The resolution lives in the local service so API-key
+// authentication shares the exact same effective-permission logic.
+func buildUserFromLogtoID(c *gin.Context, logtoID string) (*models.User, error) {
+	user, err := local.ResolveUserByLogtoID(logtoID)
+	if err != nil {
+		logger.RequestLogger(c, "auth").Error().
+			Err(err).
+			Str("operation", "enrich_user").
+			Msg("Failed to build user from Logto ID")
+		return nil, err
+	}
+	return user, nil
+}
+
+// ExchangeToken converts Logto access token to custom JWT
+// POST /auth/exchange
+func ExchangeToken(c *gin.Context) {
+	var req TokenExchangeRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.NewHTTPErrorLogger(c, "auth").LogError(err, "parse_request", http.StatusBadRequest, "Invalid request body")
+		c.JSON(http.StatusBadRequest, response.BadRequest(
+			"invalid request body: "+err.Error(),
+			nil,
+		))
+		return
+	}
+
+	// The token must be a Logto JWT access token issued TO the my SPA FOR the
+	// my API resource: signature against the tenant JWKS, issuer, audience,
+	// client_id and expiry. Nothing else — in particular not the opaque token
+	// a third-party application of the tenant receives at login — is
+	// exchangeable, whoever the user behind it is.
+	subject, err := logto.SPAAccessTokenValidator().Validate(req.AccessToken)
+	if err != nil {
+		if errors.Is(err, logto.ErrExchangeNotConfigured) {
+			logger.NewHTTPErrorLogger(c, "auth").LogError(err, "exchange_not_configured", http.StatusServiceUnavailable, "Token exchange is not configured")
+			c.JSON(http.StatusServiceUnavailable, response.ServiceUnavailable("token exchange is not configured", nil))
+			return
+		}
+		logger.NewHTTPErrorLogger(c, "auth").LogError(err, "validate_access_token", http.StatusUnauthorized, "Logto access token rejected")
+		c.JSON(http.StatusUnauthorized, response.Unauthorized("invalid access token", nil))
+		return
+	}
+
+	// Build complete user object using helper
+	user, err := buildUserFromLogtoID(c, subject)
+	if err != nil {
+		if errors.Is(err, local.ErrUserInactive) {
+			logger.RequestLogger(c, "auth").Warn().
+				Str("operation", "exchange_inactive_user").
+				Str("logto_id", subject).
+				Msg("Token exchange refused: account suspended or deleted")
+			c.JSON(http.StatusForbidden, response.Forbidden("account suspended or deleted", nil))
+			return
+		}
+		logger.RequestLogger(c, "auth").Error().
+			Err(err).
+			Str("operation", "build_user").
+			Msg("Failed to build user from Logto ID")
+		c.JSON(http.StatusInternalServerError, response.InternalServerError(
+			"failed to retrieve user information",
+			nil,
+		))
+		return
+	}
+
+	// Update latest login timestamp (always, regardless of cache)
+	if user.ID != "" {
+		userService := local.NewUserService()
+		if updateErr := userService.UpdateLatestLogin(user.ID); updateErr != nil {
+			logger.RequestLogger(c, "auth").Warn().
+				Err(updateErr).
+				Str("operation", "update_latest_login").
+				Str("user_id", user.ID).
+				Msg("Failed to update latest login timestamp")
+		}
+	}
+
+	// Generate custom JWT token
+	customToken, err := jwt.GenerateCustomToken(*user)
+	if err != nil {
+		logger.NewHTTPErrorLogger(c, "auth").LogError(err, "generate_token", http.StatusInternalServerError, "Failed to generate custom token")
+		c.JSON(http.StatusInternalServerError, response.InternalServerError(
+			"failed to generate token: "+err.Error(),
+			nil,
+		))
+		return
+	}
+
+	// Generate refresh token using Logto ID (for auth compatibility)
+	refreshToken, err := jwt.GenerateRefreshToken(*user.LogtoID)
+	if err != nil {
+		logger.NewHTTPErrorLogger(c, "auth").LogError(err, "generate_refresh_token", http.StatusInternalServerError, "Failed to generate refresh token")
+		c.JSON(http.StatusInternalServerError, response.InternalServerError(
+			"failed to generate refresh token: "+err.Error(),
+			nil,
+		))
+		return
+	}
+
+	// Calculate expiration in seconds
+	expDuration, err := time.ParseDuration(configuration.Config.JWTExpiration)
+	if err != nil {
+		expDuration = 30 * time.Minute // Default fallback, mirrors configuration default
+	}
+	expiresIn := int64(expDuration.Seconds())
+
+	logger.LogTokenExchange(c, "auth", "access_token", true, nil)
+
+	c.JSON(http.StatusOK, response.OK(
+		"token exchange successful",
+		gin.H{
+			"token":         customToken,
+			"refresh_token": refreshToken,
+			"expires_in":    expiresIn,
+			"user":          user,
+		},
+	))
+}
+
+// refreshReuseGraceWindow tolerates a rotated refresh token re-presented
+// shortly after its rotation (e.g. the client never received the rotation
+// response and retries); beyond it, reuse is treated as token theft and the
+// whole chain is burned.
+const refreshReuseGraceWindow = 30 * time.Second
+
+// RefreshToken refreshes access token using refresh token, rotating the
+// refresh token: each token is one-shot, and reuse burns every token of the
+// user (reuse detection per OAuth refresh token rotation).
+// POST /auth/refresh
+func RefreshToken(c *gin.Context) {
+	var req RefreshTokenRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.NewHTTPErrorLogger(c, "auth").LogError(err, "parse_refresh_request", http.StatusBadRequest, "Invalid refresh request body")
+		c.JSON(http.StatusBadRequest, response.BadRequest(
+			"invalid request body: "+err.Error(),
+			nil,
+		))
+		return
+	}
+
+	// Validate refresh token
+	refreshClaims, err := jwt.ValidateRefreshToken(req.RefreshToken)
+	if err != nil {
+		logger.NewHTTPErrorLogger(c, "auth").LogError(err, "validate_refresh_token", http.StatusUnauthorized, "Invalid refresh token")
+		c.JSON(http.StatusUnauthorized, response.Unauthorized(
+			"invalid refresh token",
+			nil,
+		))
+		return
+	}
+
+	blacklist := cache.GetTokenBlacklist()
+
+	// Reuse detection: a refresh token consumed by a previous rotation must
+	// never come back. Outside the grace window we cannot tell the thief from
+	// the victim, so all the user's outstanding tokens are burned and a new
+	// login is required.
+	rotatedEntry, entryErr := blacklist.GetBlacklistEntry(req.RefreshToken)
+	if entryErr != nil {
+		logger.RequestLogger(c, "auth").Error().
+			Err(entryErr).
+			Str("operation", "refresh_blacklist_unavailable").
+			Msg("Failed to check refresh token rotation state - denying request")
+		c.JSON(http.StatusServiceUnavailable, response.ServiceUnavailable("security service temporarily unavailable", nil))
+		return
+	}
+	if rotatedEntry != nil {
+		withinGrace := rotatedEntry.Reason == cache.ReasonRefreshTokenRotated &&
+			time.Since(time.Unix(rotatedEntry.BlacklistedAt, 0)) <= refreshReuseGraceWindow
+		if !withinGrace {
+			if blErr := blacklist.BlacklistAllUserTokens(refreshClaims.UserID, "refresh token reuse detected"); blErr != nil {
+				logger.RequestLogger(c, "auth").Error().
+					Err(blErr).
+					Str("operation", "burn_tokens_on_reuse").
+					Str("logto_id", refreshClaims.UserID).
+					Msg("Failed to blacklist user tokens after refresh token reuse")
+			}
+			logger.RequestLogger(c, "auth").Warn().
+				Str("operation", "refresh_token_reuse_detected").
+				Str("logto_id", refreshClaims.UserID).
+				Str("client_ip", c.ClientIP()).
+				Msg("Rotated refresh token presented again - all user tokens invalidated")
+			c.JSON(http.StatusUnauthorized, response.Unauthorized(
+				"invalid refresh token",
+				nil,
+			))
+			return
+		}
+	}
+
+	// Refresh tokens issued before a user-level blacklist event (logout,
+	// reuse-detection burn) are dead; tokens from a later login pass.
+	issuedAt := time.Time{} // zero value predates any blacklist event
+	if refreshClaims.IssuedAt != nil {
+		issuedAt = refreshClaims.IssuedAt.Time
+	}
+	revoked, reason, revokeErr := blacklist.IsUserTokenInvalidatedSince(refreshClaims.UserID, issuedAt)
+	if revokeErr != nil {
+		logger.RequestLogger(c, "auth").Error().
+			Err(revokeErr).
+			Str("operation", "refresh_revocation_unavailable").
+			Msg("Failed to check user revocation - denying request")
+		c.JSON(http.StatusServiceUnavailable, response.ServiceUnavailable("security service temporarily unavailable", nil))
+		return
+	}
+	if revoked {
+		logger.RequestLogger(c, "auth").Warn().
+			Str("operation", "refresh_token_revoked").
+			Str("logto_id", refreshClaims.UserID).
+			Str("reason", reason).
+			Msg("Refresh token predates user-level blacklist event")
+		c.JSON(http.StatusUnauthorized, response.Unauthorized(
+			"refresh token has been revoked",
+			nil,
+		))
+		return
+	}
+
+	// Build complete user object using helper
+	user, err := buildUserFromLogtoID(c, refreshClaims.UserID)
+	if err != nil {
+		if errors.Is(err, local.ErrUserInactive) {
+			logger.RequestLogger(c, "auth").Warn().
+				Str("operation", "refresh_inactive_user").
+				Str("logto_id", refreshClaims.UserID).
+				Msg("Token refresh refused: account suspended or deleted")
+			c.JSON(http.StatusUnauthorized, response.Unauthorized("account suspended or deleted", nil))
+			return
+		}
+		logger.RequestLogger(c, "auth").Error().
+			Err(err).
+			Str("operation", "build_user_refresh").
+			Msg("Failed to build user during refresh")
+		c.JSON(http.StatusInternalServerError, response.InternalServerError(
+			"failed to retrieve user information",
+			nil,
+		))
+		return
+	}
+
+	// Generate new tokens
+	newAccessToken, err := jwt.GenerateCustomToken(*user)
+	if err != nil {
+		logger.NewHTTPErrorLogger(c, "auth").LogError(err, "generate_new_token", http.StatusInternalServerError, "Failed to generate new access token")
+		c.JSON(http.StatusInternalServerError, response.InternalServerError(
+			"failed to generate new access token: "+err.Error(),
+			nil,
+		))
+		return
+	}
+
+	newRefreshToken, err := jwt.GenerateRefreshToken(*user.LogtoID)
+	if err != nil {
+		logger.NewHTTPErrorLogger(c, "auth").LogError(err, "generate_new_refresh_token", http.StatusInternalServerError, "Failed to generate new refresh token")
+		c.JSON(http.StatusInternalServerError, response.InternalServerError(
+			"failed to generate new refresh token: "+err.Error(),
+			nil,
+		))
+		return
+	}
+
+	// Rotate: the presented refresh token is now consumed. Skip when it was
+	// already rotated (grace-window replay) so the grace window doesn't slide.
+	// A blacklist failure only leaves this one token spendable until its
+	// expiry, so log it instead of failing the refresh.
+	if rotatedEntry == nil {
+		if blErr := blacklist.BlacklistToken(req.RefreshToken, cache.ReasonRefreshTokenRotated); blErr != nil {
+			logger.RequestLogger(c, "auth").Warn().
+				Err(blErr).
+				Str("operation", "rotate_refresh_token").
+				Str("logto_id", refreshClaims.UserID).
+				Msg("Failed to blacklist rotated refresh token")
+		}
+	}
+
+	// Calculate expiration in seconds
+	expDuration, err := time.ParseDuration(configuration.Config.JWTExpiration)
+	if err != nil {
+		expDuration = 30 * time.Minute // Default fallback, mirrors configuration default
+	}
+	expiresIn := int64(expDuration.Seconds())
+
+	logger.LogTokenExchange(c, "auth", "refresh_token", true, nil)
+
+	c.JSON(http.StatusOK, response.OK(
+		"token refresh successful",
+		gin.H{
+			"token":         newAccessToken,
+			"refresh_token": newRefreshToken,
+			"expires_in":    expiresIn,
+			"user":          user,
+		},
+	))
+}
+
+// GetCurrentUser returns current user information from JWT token
+// GET /me
+func GetCurrentUser(c *gin.Context) {
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	userData := gin.H{
+		"id":                user.ID,
+		"logto_id":          user.LogtoID,
+		"username":          user.Username,
+		"email":             user.Email,
+		"name":              user.Name,
+		"phone":             user.Phone,
+		"user_roles":        user.UserRoles,
+		"user_role_ids":     user.UserRoleIDs,
+		"user_permissions":  user.UserPermissions,
+		"org_role":          user.OrgRole,
+		"org_role_id":       user.OrgRoleID,
+		"org_permissions":   user.OrgPermissions,
+		"organization_id":   user.OrganizationID,
+		"organization_name": user.OrganizationName,
+		"has_avatar":        user.HasAvatar,
+	}
+
+	logger.RequestLogger(c, "auth").Info().
+		Str("operation", "get_current_user").
+		Str("user_id", user.ID).
+		Str("organization_id", user.OrganizationID).
+		Msg("User info requested")
+
+	c.JSON(http.StatusOK, response.OK(
+		"user information retrieved successfully",
+		userData,
+	))
+}
+
+// ChangePassword allows the current user to change their own password
+// POST /me/change-password
+func ChangePassword(c *gin.Context) {
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Check if user has a Logto ID (required for password operations)
+	if user.LogtoID == nil || *user.LogtoID == "" {
+		logger.RequestLogger(c, "auth").Warn().
+			Str("operation", "change_password").
+			Str("user_id", user.ID).
+			Msg("User attempted password change without Logto ID")
+
+		c.JSON(http.StatusBadRequest, response.BadRequest(
+			"password change not available for this user",
+			nil,
+		))
+		return
+	}
+
+	// Parse request body
+	var req models.ChangePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.RequestLogger(c, "auth").Warn().
+			Err(err).
+			Str("operation", "change_password").
+			Str("user_id", user.ID).
+			Msg("Invalid change password request JSON")
+
+		c.JSON(http.StatusBadRequest, response.BadRequest(
+			"invalid request body: "+err.Error(),
+			nil,
+		))
+		return
+	}
+
+	// Manual validation with proper field names
+	var validationErrors []gin.H
+	if req.CurrentPassword == "" {
+		validationErrors = append(validationErrors, gin.H{
+			"key":     "current_password",
+			"message": "required",
+			"value":   "",
+		})
+	}
+	if req.NewPassword == "" {
+		validationErrors = append(validationErrors, gin.H{
+			"key":     "new_password",
+			"message": "required",
+			"value":   "",
+		})
+	}
+
+	if len(validationErrors) > 0 {
+		logger.RequestLogger(c, "auth").Warn().
+			Str("operation", "change_password").
+			Str("user_id", user.ID).
+			Msg("Missing required fields for password change")
+
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "validation failed",
+			"data": gin.H{
+				"type":   "validation_error",
+				"errors": validationErrors,
+			},
+		})
+		return
+	}
+
+	// Validate new password strength
+	isValid, passwordErrors := helpers.ValidatePasswordStrength(req.NewPassword)
+	if !isValid {
+		logger.RequestLogger(c, "auth").Warn().
+			Strs("validation_errors", passwordErrors).
+			Str("operation", "change_password").
+			Str("user_id", user.ID).
+			Msg("New password failed validation")
+
+		// Convert validation errors to standard format
+		var errors []gin.H
+		for _, validationError := range passwordErrors {
+			errors = append(errors, gin.H{
+				"key":     "new_password",
+				"message": validationError,
+				"value":   "", // Don't expose the actual password value
+			})
+		}
+
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "validation failed",
+			"data": gin.H{
+				"type":   "validation_error",
+				"errors": errors,
+			},
+		})
+		return
+	}
+
+	// Create Logto client
+	logtoClient := logto.NewManagementClient()
+
+	// Verify current password
+	err := logtoClient.VerifyUserPassword(*user.LogtoID, req.CurrentPassword)
+	if err != nil {
+		logger.RequestLogger(c, "auth").Warn().
+			Err(err).
+			Str("operation", "change_password").
+			Str("user_id", user.ID).
+			Str("logto_id", *user.LogtoID).
+			Msg("Current password verification failed")
+
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "validation failed",
+			"data": gin.H{
+				"type": "validation_error",
+				"errors": []gin.H{
+					{
+						"key":     "current_password",
+						"message": "incorrect_password",
+						"value":   "", // Don't expose the actual password value
+					},
+				},
+			},
+		})
+		return
+	}
+
+	// Update password in Logto
+	err = logtoClient.UpdateUserPassword(*user.LogtoID, req.NewPassword)
+	if err != nil {
+		logger.RequestLogger(c, "auth").Error().
+			Err(err).
+			Str("operation", "change_password").
+			Str("user_id", user.ID).
+			Str("logto_id", *user.LogtoID).
+			Msg("Failed to update password in Logto")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError(
+			"failed to update password",
+			map[string]interface{}{
+				"error": err.Error(),
+			},
+		))
+		return
+	}
+
+	// Log successful password change
+	logger.LogAccountOperation(c, "change_password", user.ID, user.OrganizationID, user.ID, user.OrganizationID, true, nil)
+
+	logger.RequestLogger(c, "auth").Info().
+		Str("operation", "change_password").
+		Str("user_id", user.ID).
+		Str("logto_id", *user.LogtoID).
+		Msg("Password changed successfully")
+
+	c.JSON(http.StatusOK, response.OK(
+		"password changed successfully",
+		nil,
+	))
+}
+
+// ChangeInfo allows the current user to change their own personal information
+// POST /me/change-info
+func ChangeInfo(c *gin.Context) {
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Check if user has a Logto ID (required for profile operations)
+	if user.LogtoID == nil || *user.LogtoID == "" {
+		logger.RequestLogger(c, "auth").Warn().
+			Str("operation", "change_info").
+			Str("user_id", user.ID).
+			Msg("User attempted info change without Logto ID")
+
+		c.JSON(http.StatusBadRequest, response.BadRequest(
+			"profile update not available for this user",
+			nil,
+		))
+		return
+	}
+
+	// Parse request body
+	var req models.ChangeInfoRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.RequestLogger(c, "auth").Warn().
+			Err(err).
+			Str("operation", "change_info").
+			Str("user_id", user.ID).
+			Msg("Invalid change info request JSON")
+
+		c.JSON(http.StatusBadRequest, response.BadRequest(
+			"invalid request body: "+err.Error(),
+			nil,
+		))
+		return
+	}
+
+	// Validate that at least one field is provided
+	if req.Name == nil && req.Email == nil && req.Phone == nil {
+		logger.RequestLogger(c, "auth").Warn().
+			Str("operation", "change_info").
+			Str("user_id", user.ID).
+			Msg("No fields provided for info change")
+
+		c.JSON(http.StatusBadRequest, response.BadRequest(
+			"at least one field (name, email, or phone) must be provided",
+			nil,
+		))
+		return
+	}
+
+	// Manual validation with proper field names
+	var validationErrors []gin.H
+
+	if req.Name != nil && *req.Name == "" {
+		validationErrors = append(validationErrors, gin.H{
+			"key":     "name",
+			"message": "name cannot be empty",
+			"value":   "",
+		})
+	}
+
+	if req.Email != nil && *req.Email == "" {
+		validationErrors = append(validationErrors, gin.H{
+			"key":     "email",
+			"message": "email cannot be empty",
+			"value":   "",
+		})
+	}
+
+	if len(validationErrors) > 0 {
+		logger.RequestLogger(c, "auth").Warn().
+			Str("operation", "change_info").
+			Str("user_id", user.ID).
+			Msg("Validation failed for info change")
+
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "validation failed",
+			"data": gin.H{
+				"type":   "validation_error",
+				"errors": validationErrors,
+			},
+		})
+		return
+	}
+
+	// Prepare update data
+	updateData := models.UpdateUserRequest{}
+	changedFields := []string{}
+
+	if req.Name != nil {
+		updateData.Name = req.Name
+		changedFields = append(changedFields, "name")
+	}
+
+	// A different email is never written here: it is parked and a one-time
+	// code is mailed to it, see startEmailChange. An address equal to the
+	// current one (case and whitespace aside) is simply not a change.
+	pendingEmail := ""
+	if req.Email != nil {
+		newEmail := normalizeEmail(*req.Email)
+		if newEmail != normalizeEmail(user.Email) {
+			if !emailShape.MatchString(newEmail) {
+				changeInfoValidationError(c, "email", "invalid email format", *req.Email)
+				return
+			}
+			pendingEmail = newEmail
+		}
+	}
+
+	if req.Phone != nil {
+		if *req.Phone == "" {
+			// Remove phone number
+			emptyPhone := ""
+			updateData.PrimaryPhone = &emptyPhone
+			changedFields = append(changedFields, "phone (removed)")
+		} else {
+			normalizedPhone := local.NormalizePhoneForLogto(*req.Phone)
+			updateData.PrimaryPhone = &normalizedPhone
+			changedFields = append(changedFields, "phone")
+		}
+	}
+
+	// Update user profile in Logto (name and phone only; the email has its
+	// own verified path)
+	if len(changedFields) > 0 {
+		if err := applyProfileUpdate(c, user, updateData, changedFields); err != nil {
+			return
+		}
+	}
+
+	if pendingEmail != "" {
+		if !startEmailChange(c, user, pendingEmail) {
+			return
+		}
+		logger.LogAccountOperation(c, "change_info", user.ID, user.OrganizationID, user.ID, user.OrganizationID, true, nil)
+		c.JSON(http.StatusAccepted, response.Success(http.StatusAccepted,
+			"verification code sent to the new email address",
+			gin.H{
+				"updated_fields":              changedFields,
+				"email_verification_required": true,
+				"pending_email":               pendingEmail,
+			},
+		))
+		return
+	}
+
+	// Log successful profile change
+	logger.LogAccountOperation(c, "change_info", user.ID, user.OrganizationID, user.ID, user.OrganizationID, true, nil)
+
+	c.JSON(http.StatusOK, response.OK(
+		"profile updated successfully",
+		gin.H{
+			"updated_fields": changedFields,
+		},
+	))
+}
+
+// applyProfileUpdate writes name/phone to Logto and mirrors them locally. On
+// failure it has already answered the request and returns the error.
+func applyProfileUpdate(c *gin.Context, user *models.User, updateData models.UpdateUserRequest, changedFields []string) error {
+	logtoClient := logto.NewManagementClient()
+
+	_, err := logtoClient.UpdateUser(*user.LogtoID, updateData)
+	if err != nil {
+		logger.RequestLogger(c, "auth").Error().
+			Err(err).
+			Str("operation", "change_info").
+			Str("user_id", user.ID).
+			Str("logto_id", *user.LogtoID).
+			Strs("fields", changedFields).
+			Msg("Failed to update user profile in Logto")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError(
+			"failed to update profile",
+			nil,
+		))
+		return err
+	}
+
+	// Mirror the change into the local users table so list endpoints (GET /users),
+	// which read name/email/phone from the local DB rather than Logto, stay in sync.
+	// We pass the exact values sent to Logto (normalized phone, empty string on
+	// removal) so both stores agree. A failure here is logged but not fatal: Logto
+	// is the identity source of truth and was already updated, so /me and the
+	// profile menu are correct; only the cached list copy would lag, and surfacing
+	// an error after the change has applied upstream would be worse for the user.
+	if err := entities.NewLocalUserRepository().UpdateProfileInfo(*user.LogtoID, updateData.Name, updateData.PrimaryEmail, updateData.PrimaryPhone); err != nil {
+		logger.RequestLogger(c, "auth").Warn().
+			Err(err).
+			Str("operation", "change_info").
+			Str("user_id", user.ID).
+			Str("logto_id", *user.LogtoID).
+			Strs("changed_fields", changedFields).
+			Msg("Profile updated in Logto but failed to sync to local database")
+	}
+
+	// Invalidate cached user profile so next refresh picks up the changes
+	if rc := cache.GetRedisClient(); rc != nil {
+		_ = rc.Delete("user_profile:" + *user.LogtoID)
+	}
+
+	logger.RequestLogger(c, "auth").Info().
+		Str("operation", "change_info").
+		Str("user_id", user.ID).
+		Str("logto_id", *user.LogtoID).
+		Strs("changed_fields", changedFields).
+		Msg("Profile updated successfully")
+
+	return nil
+}
+
+// Logout invalidates the current JWT token by adding it to the blacklist
+// POST /api/auth/logout
+func Logout(c *gin.Context) {
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Extract token from Authorization header
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		logger.RequestLogger(c, "auth").Warn().
+			Str("operation", "logout").
+			Str("user_id", user.ID).
+			Msg("Logout called without authorization header")
+		c.JSON(http.StatusBadRequest, response.BadRequest("authorization header required", nil))
+		return
+	}
+
+	// Check Bearer prefix and extract token
+	const bearerPrefix = "Bearer "
+	if !strings.HasPrefix(authHeader, bearerPrefix) {
+		logger.RequestLogger(c, "auth").Warn().
+			Str("operation", "logout").
+			Str("user_id", user.ID).
+			Msg("Invalid authorization header format for logout")
+		c.JSON(http.StatusBadRequest, response.BadRequest("invalid authorization header format", nil))
+		return
+	}
+
+	tokenString := authHeader[len(bearerPrefix):]
+	if tokenString == "" {
+		logger.RequestLogger(c, "auth").Warn().
+			Str("operation", "logout").
+			Str("user_id", user.ID).
+			Msg("Empty token provided for logout")
+		c.JSON(http.StatusBadRequest, response.BadRequest("token not provided", nil))
+		return
+	}
+
+	// Get blacklist service
+	blacklist := cache.GetTokenBlacklist()
+
+	// Blacklist the current access token
+	err := blacklist.BlacklistToken(tokenString, "user logout")
+	if err != nil {
+		logger.RequestLogger(c, "auth").Error().
+			Err(err).
+			Str("operation", "logout").
+			Str("user_id", user.ID).
+			Msg("Failed to blacklist token during logout")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError(
+			"logout failed",
+			nil,
+		))
+		return
+	}
+
+	// Blacklist all tokens for this user to invalidate refresh tokens
+	if user.LogtoID != nil && *user.LogtoID != "" {
+		if blErr := blacklist.BlacklistAllUserTokens(*user.LogtoID, "user logout"); blErr != nil {
+			logger.RequestLogger(c, "auth").Warn().
+				Err(blErr).
+				Str("operation", "logout").
+				Str("user_id", user.ID).
+				Msg("Failed to blacklist user-level tokens during logout")
+		}
+	}
+
+	// Invalidate cached user profile
+	if user.LogtoID != nil && *user.LogtoID != "" {
+		if rc := cache.GetRedisClient(); rc != nil {
+			_ = rc.Delete("user_profile:" + *user.LogtoID)
+		}
+	}
+
+	// Log successful logout
+	logger.RequestLogger(c, "auth").Info().
+		Str("operation", "logout_success").
+		Str("user_id", user.ID).
+		Str("username", user.Username).
+		Msg("User successfully logged out and token blacklisted")
+
+	c.JSON(http.StatusOK, response.OK(
+		"logout successful",
+		gin.H{
+			"message": "token has been invalidated",
+		},
+	))
+}

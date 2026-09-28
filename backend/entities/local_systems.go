@@ -1,0 +1,891 @@
+/*
+ * Copyright (C) 2025 Nethesis S.r.l.
+ * http://www.nethesis.it - info@nethesis.it
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * author: Edoardo Spadoni <edoardo.spadoni@nethesis.it>
+ */
+
+package entities
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/lib/pq"
+	"github.com/nethesis/my/backend/database"
+	"github.com/nethesis/my/backend/models"
+)
+
+// LocalSystemRepository implements SystemRepository for local database
+type LocalSystemRepository struct {
+	db *sql.DB
+}
+
+// NewLocalSystemRepository creates a new local system repository
+func NewLocalSystemRepository() *LocalSystemRepository {
+	return &LocalSystemRepository{
+		db: database.DB,
+	}
+}
+
+// Create creates a new system in the local database
+func (r *LocalSystemRepository) Create(req *models.CreateSystemRequest) (*models.System, error) {
+	// Import the service dynamically to avoid circular imports
+	// For now, return error indicating method needs implementation
+	return nil, fmt.Errorf("Create method not yet implemented - use SystemsService directly")
+}
+
+// GetByID retrieves a specific system by ID without access validation (validation is done at service level)
+func (r *LocalSystemRepository) GetByID(id string) (*models.System, error) {
+	return r.getByID(id, false)
+}
+
+// GetByIDIncludingDeleted is like GetByID but also returns soft-deleted rows.
+// Destructive flows that still need (org_id, system_key) after a soft delete
+// (GDPR-compliant backup purge before hard destroy) go through this method.
+func (r *LocalSystemRepository) GetByIDIncludingDeleted(id string) (*models.System, error) {
+	return r.getByID(id, true)
+}
+
+func (r *LocalSystemRepository) getByID(id string, includeDeleted bool) (*models.System, error) {
+	whereClause := "WHERE s.id = $1 AND s.deleted_at IS NULL"
+	if includeDeleted {
+		whereClause = "WHERE s.id = $1"
+	}
+	// first_heartbeat: the heartbeat row is inserted by the first beat and
+	// upserted by every later one, so its created_at marks the first contact.
+	// first_inventory: the oldest surviving snapshot is the first one ever
+	// received — inventory retention always keeps the per-system baseline
+	// (MIN(id)) — and MIN(created_at) is served by
+	// idx_inventory_records_system_id_created_at.
+	query := `
+		SELECT s.id, s.name, s.type, s.status, s.fqdn, s.ipv4_address, s.ipv6_address, s.version,
+		       s.system_key, s.organization_id, s.custom_data, s.notes, s.created_at, s.updated_at, s.created_by, s.registered_at, s.unregistered_at, s.suspended_at, s.suspended_by_org_id, h.last_heartbeat, s.last_inventory_at,
+		       h.created_at as first_heartbeat,
+		       (SELECT MIN(ir.created_at) FROM inventory_records ir WHERE ir.system_id = s.id) as first_inventory,
+		       COALESCE(uo.name, 'Owner') as organization_name,
+		       COALESCE(uo.org_type, 'owner') as organization_type,
+		       COALESCE(uo.db_id, '') as organization_db_id
+		FROM systems s
+		LEFT JOIN system_heartbeats h ON s.id = h.system_id
+		LEFT JOIN unified_organizations uo ON s.organization_id = uo.logto_id
+		` + whereClause
+
+	system := &models.System{}
+	var customDataJSON []byte
+	var createdByJSON []byte
+	var fqdn, ipv4Address, ipv6Address, version sql.NullString
+	var registeredAt, unregisteredAt, suspendedAt, lastHeartbeat, lastInventory sql.NullTime
+	var firstHeartbeat, firstInventory sql.NullTime
+	var suspendedByOrgID sql.NullString
+	var organizationName, organizationType, organizationDBID sql.NullString
+
+	err := r.db.QueryRow(query, id).Scan(
+		&system.ID, &system.Name, &system.Type, &system.Status, &fqdn,
+		&ipv4Address, &ipv6Address, &version, &system.SystemKey, &system.Organization.LogtoID,
+		&customDataJSON, &system.Notes, &system.CreatedAt, &system.UpdatedAt, &createdByJSON, &registeredAt, &unregisteredAt, &suspendedAt, &suspendedByOrgID, &lastHeartbeat, &lastInventory,
+		&firstHeartbeat, &firstInventory,
+		&organizationName, &organizationType, &organizationDBID,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("system not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query system: %w", err)
+	}
+
+	// Convert NullString to string
+	system.FQDN = fqdn.String
+	system.IPv4Address = ipv4Address.String
+	system.IPv6Address = ipv6Address.String
+	system.Version = version.String
+	system.Organization.ID = organizationDBID.String
+	system.Organization.Name = organizationName.String
+	system.Organization.Type = organizationType.String
+
+	// Convert registered_at
+	if registeredAt.Valid {
+		system.RegisteredAt = &registeredAt.Time
+	}
+
+	if unregisteredAt.Valid {
+		system.UnregisteredAt = &unregisteredAt.Time
+	}
+
+	// Convert suspended_at
+	if suspendedAt.Valid {
+		system.SuspendedAt = &suspendedAt.Time
+	}
+	if suspendedByOrgID.Valid {
+		system.SuspendedByOrgID = &suspendedByOrgID.String
+	}
+
+	// Parse custom_data JSON
+	if len(customDataJSON) > 0 {
+		if err := json.Unmarshal(customDataJSON, &system.CustomData); err != nil {
+			system.CustomData = make(map[string]string)
+		}
+	} else {
+		system.CustomData = make(map[string]string)
+	}
+
+	// Parse created_by JSON
+	if len(createdByJSON) > 0 {
+		_ = json.Unmarshal(createdByJSON, &system.CreatedBy) // Ignore JSON unmarshal errors - keep default zero value
+	}
+	fillCreatorOrgTypes(r.db, &system.CreatedBy)
+
+	// Set heartbeat and inventory timestamps
+	if lastHeartbeat.Valid {
+		system.LastHeartbeat = &lastHeartbeat.Time
+	}
+	if lastInventory.Valid {
+		system.LastInventory = &lastInventory.Time
+	}
+	if firstHeartbeat.Valid {
+		system.FirstHeartbeat = &firstHeartbeat.Time
+	}
+	if firstInventory.Valid {
+		system.FirstInventory = &firstInventory.Time
+	}
+
+	return system, nil
+}
+
+// Update updates an existing system with access validation
+func (r *LocalSystemRepository) Update(id string, req *models.UpdateSystemRequest) (*models.System, error) {
+	// Import the service dynamically to avoid circular imports
+	// For now, return error indicating method needs implementation
+	return nil, fmt.Errorf("Update method not yet implemented - use SystemsService directly")
+}
+
+// Delete deletes a system with access validation
+func (r *LocalSystemRepository) Delete(id string) error {
+	// Import the service dynamically to avoid circular imports
+	// For now, return error indicating method needs implementation
+	return fmt.Errorf("Delete method not yet implemented - use SystemsService directly")
+}
+
+// statusFilterClause renders the `status` query filter as a parenthesised SQL
+// fragment plus the positional arguments it consumes. The clause is empty when
+// no status is requested, so the caller can skip it.
+//
+// Three kinds of value are accepted:
+//   - unknown/active/inactive/deleted: matched against the systems.status column
+//   - suspended: virtual, matched on suspended_at
+//   - no_inventory: virtual, systems that have been in contact but never
+//     delivered an inventory
+//
+// The parts are OR'd together. Suspended systems are excluded from the column
+// match unless "suspended" is selected too, so the two do not overlap; deleted
+// rows are exempt from that exclusion because deleted wins over suspended (a
+// suspended-then-archived system must still match status=deleted).
+// "no_inventory" is additive instead: such a system is also active or inactive,
+// so it deliberately overlaps with those. Its predicate mirrors the
+// missing-inventory warning icon in the systems table, so the filtered count
+// equals the number of flagged rows on screen.
+//
+// argOffset is the number of placeholders the caller already consumed: the
+// first placeholder generated here is $argOffset+1.
+func statusFilterClause(filterStatuses []string, argOffset int) (string, []interface{}) {
+	hasSuspended := false
+	hasNoInventory := false
+	var dbStatuses []string
+	for _, s := range filterStatuses {
+		switch s {
+		case "suspended":
+			hasSuspended = true
+		case "no_inventory":
+			hasNoInventory = true
+		default:
+			dbStatuses = append(dbStatuses, s)
+		}
+	}
+
+	if len(dbStatuses) == 0 && !hasSuspended && !hasNoInventory {
+		return "", nil
+	}
+
+	var statusParts []string
+	var args []interface{}
+
+	if len(dbStatuses) > 0 {
+		placeholders := make([]string, len(dbStatuses))
+		for i, s := range dbStatuses {
+			placeholders[i] = fmt.Sprintf("$%d", argOffset+i+1)
+			args = append(args, s)
+		}
+		condition := fmt.Sprintf("s.status IN (%s)", strings.Join(placeholders, ","))
+		if !hasSuspended {
+			condition = fmt.Sprintf("(%s AND (s.suspended_at IS NULL OR s.deleted_at IS NOT NULL))", condition)
+		}
+		statusParts = append(statusParts, condition)
+	}
+
+	if hasSuspended {
+		statusParts = append(statusParts, "(s.suspended_at IS NOT NULL AND s.deleted_at IS NULL)")
+	}
+
+	if hasNoInventory {
+		statusParts = append(statusParts, "(s.last_inventory_at IS NULL AND s.status <> 'unknown')")
+	}
+
+	return "(" + strings.Join(statusParts, " OR ") + ")", args
+}
+
+// addonFilterClause renders the `addon` query filter: the system holds at
+// least one of the selected add-ons. Only grants valid right now count — an
+// expired or revoked grant is not an add-on the system has. EXISTS keeps one
+// row per system where several of the selected add-ons are held.
+func addonFilterClause(filterAddons []string, argOffset int) (string, []interface{}) {
+	if len(filterAddons) == 0 {
+		return "", nil
+	}
+
+	clause := fmt.Sprintf(`EXISTS (SELECT 1 FROM system_entitlements se WHERE se.system_id = s.id AND se.entitlement = ANY($%d::text[]) AND se.revoked_at IS NULL AND (se.valid_until IS NULL OR se.valid_until > NOW()))`, argOffset+1)
+	return clause, []interface{}{pq.Array(filterAddons)}
+}
+
+// ListByCreatedByOrganizations returns paginated list of systems owned by the given organizations with filters
+func (r *LocalSystemRepository) ListByCreatedByOrganizations(ctx context.Context, allowedOrgIDs []string, page, pageSize int, search, sortBy, sortDirection string, f models.SystemListFilters) ([]*models.System, int, error) {
+	filterName := f.Name
+	filterSystemKeys := f.SystemKeys
+	filterTypes := f.Types
+	filterCreatedBy := f.CreatedBy
+	filterVersions := f.Versions
+	filterOrgIDs := f.OrganizationIDs
+	filterStatuses := f.Statuses
+
+	// nil = owner (no RBAC filter), empty = no access
+	if allowedOrgIDs != nil && len(allowedOrgIDs) == 0 {
+		return []*models.System{}, 0, nil
+	}
+
+	offset := (page - 1) * pageSize
+
+	// Check if status filter includes "deleted"
+	hasDeletedFilter := false
+	for _, status := range filterStatuses {
+		if status == "deleted" {
+			hasDeletedFilter = true
+			break
+		}
+	}
+
+	// Build WHERE clause: nil means owner (skip org filter), non-nil means RBAC filter
+	var whereClause string
+	var args []interface{}
+	if allowedOrgIDs != nil {
+		// Use ANY($1::text[]) instead of individual placeholders for efficiency.
+		// Filter on the current owning organization (systems.organization_id),
+		// not on the creator org (created_by ->> 'organization_id'): a
+		// reassigned system must follow the new owner's RBAC scope.
+		args = []interface{}{pq.Array(allowedOrgIDs)}
+		if hasDeletedFilter {
+			whereClause = "s.organization_id = ANY($1::text[])"
+		} else {
+			whereClause = "s.deleted_at IS NULL AND s.organization_id = ANY($1::text[])"
+		}
+	} else {
+		// Owner: no org filter needed
+		if hasDeletedFilter {
+			whereClause = "1=1"
+		} else {
+			whereClause = "s.deleted_at IS NULL"
+		}
+	}
+
+	// Add search condition (handle nullable fields with COALESCE)
+	if search != "" {
+		searchPattern := "%" + search + "%"
+		whereClause += fmt.Sprintf(" AND (s.name ILIKE $%d OR COALESCE(s.type, '') ILIKE $%d OR COALESCE(s.status, '') ILIKE $%d OR s.fqdn ILIKE $%d OR s.version ILIKE $%d OR s.created_by ->> 'name' ILIKE $%d OR s.created_by ->> 'email' ILIKE $%d OR s.system_key ILIKE $%d OR COALESCE(s.ipv4_address::text, '') ILIKE $%d OR COALESCE(s.ipv6_address::text, '') ILIKE $%d)",
+			len(args)+1, len(args)+2, len(args)+3, len(args)+4, len(args)+5, len(args)+6, len(args)+7, len(args)+8, len(args)+9, len(args)+10)
+		args = append(args, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern)
+	}
+
+	// Add filter conditions
+	if filterName != "" {
+		whereClause += fmt.Sprintf(" AND s.name ILIKE $%d", len(args)+1)
+		args = append(args, "%"+filterName+"%")
+	}
+
+	if len(filterSystemKeys) > 0 {
+		keyPlaceholders := make([]string, len(filterSystemKeys))
+		baseIndex := len(args)
+		for i, key := range filterSystemKeys {
+			keyPlaceholders[i] = fmt.Sprintf("$%d", baseIndex+i+1)
+			args = append(args, key)
+		}
+		whereClause += fmt.Sprintf(" AND s.system_key IN (%s)", strings.Join(keyPlaceholders, ","))
+	}
+
+	// Add multiple value filters with IN clauses
+	if len(filterTypes) > 0 {
+		typePlaceholders := make([]string, len(filterTypes))
+		baseIndex := len(args)
+		for i, t := range filterTypes {
+			typePlaceholders[i] = fmt.Sprintf("$%d", baseIndex+i+1)
+			args = append(args, t)
+		}
+		whereClause += fmt.Sprintf(" AND s.type IN (%s)", strings.Join(typePlaceholders, ","))
+	}
+
+	if len(filterCreatedBy) > 0 {
+		// Build separate conditions for each ID to check both user_id and organization_id
+		// Each ID gets checked against both fields with OR logic
+		conditions := make([]string, len(filterCreatedBy))
+		for i, id := range filterCreatedBy {
+			placeholder := fmt.Sprintf("$%d", len(args)+1)
+			args = append(args, id)
+			// Match either user_id OR organization_id for this specific ID
+			conditions[i] = fmt.Sprintf("(s.created_by ->> 'user_id' = %s OR s.created_by ->> 'organization_id' = %s)", placeholder, placeholder)
+		}
+		// Combine all conditions with OR (match any of the provided IDs)
+		whereClause += fmt.Sprintf(" AND (%s)", strings.Join(conditions, " OR "))
+	}
+
+	if len(filterVersions) > 0 {
+		// Version filter now uses prefixed format "product:version" (e.g., "nsec:1.2.3")
+		// to avoid ambiguity when same version exists for multiple products
+		versionConditions := make([]string, len(filterVersions))
+		baseIndex := len(args)
+
+		for i, prefixedVersion := range filterVersions {
+			// Split prefixed version into product and version parts
+			parts := strings.SplitN(prefixedVersion, ":", 2)
+			if len(parts) == 2 {
+				// Prefixed format: match both type and version
+				productPlaceholder := fmt.Sprintf("$%d", baseIndex+1)
+				versionPlaceholder := fmt.Sprintf("$%d", baseIndex+2)
+				versionConditions[i] = fmt.Sprintf("(s.type = %s AND s.version = %s)", productPlaceholder, versionPlaceholder)
+				args = append(args, parts[0], parts[1])
+				baseIndex += 2
+			} else {
+				// Fallback for non-prefixed format: match version only (backward compatibility)
+				versionPlaceholder := fmt.Sprintf("$%d", baseIndex+1)
+				versionConditions[i] = fmt.Sprintf("(s.version = %s)", versionPlaceholder)
+				args = append(args, prefixedVersion)
+				baseIndex += 1
+			}
+		}
+
+		whereClause += fmt.Sprintf(" AND (%s)", strings.Join(versionConditions, " OR "))
+	}
+
+	if len(filterOrgIDs) > 0 {
+		// Filter by logto_id (systems.organization_id stores logto_id)
+		orgPlaceholders := make([]string, len(filterOrgIDs))
+		baseIndex := len(args)
+		for i, orgID := range filterOrgIDs {
+			orgPlaceholders[i] = fmt.Sprintf("$%d", baseIndex+i+1)
+			args = append(args, orgID)
+		}
+		whereClause += fmt.Sprintf(" AND s.organization_id IN (%s)", strings.Join(orgPlaceholders, ","))
+	}
+
+	if statusClause, statusArgs := statusFilterClause(filterStatuses, len(args)); statusClause != "" {
+		whereClause += " AND " + statusClause
+		args = append(args, statusArgs...)
+	}
+
+	if addonClause, addonArgs := addonFilterClause(f.Addons, len(args)); addonClause != "" {
+		whereClause += " AND " + addonClause
+		args = append(args, addonArgs...)
+	}
+
+	// Build ORDER BY clause
+	orderBy := "s.created_at DESC"
+	if sortBy != "" {
+		columnMap := map[string]string{
+			"name":              "LOWER(s.name)",
+			"type":              "LOWER(s.type)",
+			"status":            "LOWER(s.status)",
+			"fqdn":              "LOWER(s.fqdn)",
+			"version":           "s.version",
+			"system_key":        "LOWER(s.system_key)",
+			"created_at":        "s.created_at",
+			"updated_at":        "s.updated_at",
+			"creator_name":      "LOWER(s.created_by ->> 'name')",
+			"organization_name": "LOWER(uo.name)",
+		}
+
+		if column, exists := columnMap[sortBy]; exists {
+			direction := "ASC"
+			if sortDirection == "desc" {
+				direction = "DESC"
+			}
+			orderBy = fmt.Sprintf("%s %s", column, direction)
+		}
+	}
+
+	// Single query with COUNT(*) OVER() to get total count + paginated results
+	query := fmt.Sprintf(`
+		SELECT s.id, s.name, s.type, s.status, s.fqdn, s.ipv4_address, s.ipv6_address, s.version,
+		       s.system_key, s.organization_id, s.custom_data, s.notes, s.created_at, s.updated_at, s.deleted_at, s.registered_at, s.unregistered_at, s.suspended_at, s.suspended_by_org_id, s.created_by, h.last_heartbeat, s.last_inventory_at,
+		       COALESCE(uo.name, 'Owner') as organization_name,
+		       COALESCE(uo.org_type, 'owner') as organization_type,
+		       COALESCE(uo.db_id, '') as organization_db_id,
+		       COUNT(*) OVER() as total_count
+		FROM systems s
+		LEFT JOIN system_heartbeats h ON s.id = h.system_id
+		LEFT JOIN unified_organizations uo ON s.organization_id = uo.logto_id
+		WHERE %s
+		ORDER BY %s
+		LIMIT $%d OFFSET $%d
+	`, whereClause, orderBy, len(args)+1, len(args)+2)
+
+	listArgs := make([]interface{}, len(args)+2)
+	copy(listArgs, args)
+	listArgs[len(args)] = pageSize
+	listArgs[len(args)+1] = offset
+
+	rows, err := r.db.QueryContext(ctx, query, listArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to query systems: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var totalCount int
+	var systems []*models.System
+	for rows.Next() {
+		system := &models.System{}
+		var customDataJSON, createdByJSON []byte
+		var fqdn, ipv4Address, ipv6Address, version sql.NullString
+		var deletedAt, registeredAt, unregisteredAt, suspendedAt, lastHeartbeat, lastInventory sql.NullTime
+		var suspendedByOrgID sql.NullString
+		var organizationName, organizationType, organizationDBID sql.NullString
+
+		err := rows.Scan(
+			&system.ID, &system.Name, &system.Type, &system.Status, &fqdn,
+			&ipv4Address, &ipv6Address, &version, &system.SystemKey, &system.Organization.LogtoID,
+			&customDataJSON, &system.Notes, &system.CreatedAt, &system.UpdatedAt, &deletedAt, &registeredAt, &unregisteredAt, &suspendedAt, &suspendedByOrgID, &createdByJSON, &lastHeartbeat, &lastInventory,
+			&organizationName, &organizationType, &organizationDBID,
+			&totalCount,
+		)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to scan system: %w", err)
+		}
+
+		// Convert NullString to string
+		system.FQDN = fqdn.String
+		system.IPv4Address = ipv4Address.String
+		system.IPv6Address = ipv6Address.String
+		system.Version = version.String
+		system.Organization.ID = organizationDBID.String
+		system.Organization.Name = organizationName.String
+		system.Organization.Type = organizationType.String
+
+		// Set deleted_at if present
+		if deletedAt.Valid {
+			system.DeletedAt = &deletedAt.Time
+		}
+
+		// Set registered_at if present
+		if registeredAt.Valid {
+			system.RegisteredAt = &registeredAt.Time
+		}
+
+		if unregisteredAt.Valid {
+			system.UnregisteredAt = &unregisteredAt.Time
+		}
+
+		// Set suspended_at if present
+		if suspendedAt.Valid {
+			system.SuspendedAt = &suspendedAt.Time
+		}
+		if suspendedByOrgID.Valid {
+			system.SuspendedByOrgID = &suspendedByOrgID.String
+		}
+
+		// Set heartbeat and inventory timestamps if present
+		if lastHeartbeat.Valid {
+			system.LastHeartbeat = &lastHeartbeat.Time
+		}
+		if lastInventory.Valid {
+			system.LastInventory = &lastInventory.Time
+		}
+
+		// Parse custom_data JSON
+		if len(customDataJSON) > 0 {
+			if err := json.Unmarshal(customDataJSON, &system.CustomData); err != nil {
+				system.CustomData = make(map[string]string)
+			}
+		} else {
+			system.CustomData = make(map[string]string)
+		}
+
+		// Parse created_by JSON
+		if len(createdByJSON) > 0 {
+			_ = json.Unmarshal(createdByJSON, &system.CreatedBy)
+		}
+
+		systems = append(systems, system)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating systems: %w", err)
+	}
+
+	fillCreatorOrgTypes(r.db, creatorRefsOf(systems, func(sys *models.System) models.CreatorOrgRef { return &sys.CreatedBy })...)
+
+	return systems, totalCount, nil
+}
+
+// GetTotalsByCreatedByOrganizations returns total counts and status for systems created by users in specified organizations
+func (r *LocalSystemRepository) GetTotalsByCreatedByOrganizations(allowedOrgIDs []string, timeoutMinutes int) (*models.SystemTotals, error) {
+	// nil = owner (no filter), empty = no access
+	if allowedOrgIDs != nil && len(allowedOrgIDs) == 0 {
+		return &models.SystemTotals{
+			Total:          0,
+			Active:         0,
+			Inactive:       0,
+			Unknown:        0,
+			TimeoutMinutes: timeoutMinutes,
+		}, nil
+	}
+
+	// Calculate cutoff time for active/inactive determination
+	timeout := time.Duration(timeoutMinutes) * time.Minute
+	cutoff := time.Now().Add(-timeout)
+
+	args := []interface{}{cutoff}
+	orgClause := ""
+	if allowedOrgIDs != nil {
+		args = append(args, pq.Array(allowedOrgIDs))
+		// Filter on current owning organization, not creator: a reassigned
+		// system must contribute to the new owner's totals.
+		orgClause = " AND s.organization_id = ANY($2::text[])"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			COUNT(*) as total,
+			COALESCE(SUM(CASE WHEN h.last_heartbeat IS NOT NULL AND h.last_heartbeat > $1 THEN 1 ELSE 0 END), 0) as active,
+			COALESCE(SUM(CASE WHEN h.last_heartbeat IS NOT NULL AND h.last_heartbeat <= $1 THEN 1 ELSE 0 END), 0) as inactive,
+			COALESCE(SUM(CASE WHEN h.last_heartbeat IS NULL THEN 1 ELSE 0 END), 0) as unknown
+		FROM systems s
+		LEFT JOIN system_heartbeats h ON s.id = h.system_id
+		WHERE s.deleted_at IS NULL%s
+	`, orgClause)
+
+	var total, active, inactive, unknown int
+	err := r.db.QueryRow(query, args...).Scan(&total, &active, &inactive, &unknown)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get systems totals: %w", err)
+	}
+
+	return &models.SystemTotals{
+		Total:          total,
+		Active:         active,
+		Inactive:       inactive,
+		Unknown:        unknown,
+		TimeoutMinutes: timeoutMinutes,
+	}, nil
+}
+
+// SuspendSystem suspends a single system by ID
+func (r *LocalSystemRepository) SuspendSystem(id string) error {
+	now := time.Now()
+	query := `UPDATE systems SET suspended_at = $2, updated_at = $2 WHERE id = $1 AND deleted_at IS NULL AND suspended_at IS NULL`
+
+	result, err := r.db.Exec(query, id, now)
+	if err != nil {
+		return fmt.Errorf("failed to suspend system: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("system not found or already suspended/deleted")
+	}
+
+	return nil
+}
+
+// ReactivateSystem reactivates a suspended system by clearing suspended_at and suspended_by_org_id
+func (r *LocalSystemRepository) ReactivateSystem(id string) error {
+	now := time.Now()
+	query := `UPDATE systems SET suspended_at = NULL, suspended_by_org_id = NULL, updated_at = $2 WHERE id = $1 AND deleted_at IS NULL AND suspended_at IS NOT NULL`
+
+	result, err := r.db.Exec(query, id, now)
+	if err != nil {
+		return fmt.Errorf("failed to reactivate system: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("system not found or not suspended")
+	}
+
+	return nil
+}
+
+// scanSystemKeys collects the system_key column from a RETURNING/SELECT result set.
+func scanSystemKeys(rows *sql.Rows) ([]string, error) {
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("failed to scan system_key: %w", err)
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate system_keys: %w", err)
+	}
+	return keys, nil
+}
+
+// SuspendSystemsByOrgID suspends all active systems belonging to an organization (cascade suspension)
+// Returns the system_keys of the suspended systems so the caller can invalidate their cached credentials.
+func (r *LocalSystemRepository) SuspendSystemsByOrgID(orgID string) ([]string, error) {
+	now := time.Now()
+
+	query := `
+		UPDATE systems
+		SET suspended_at = $2, suspended_by_org_id = $1, updated_at = $2
+		WHERE organization_id = $1 AND deleted_at IS NULL AND suspended_at IS NULL
+		RETURNING system_key
+	`
+
+	rows, err := r.db.Query(query, orgID, now)
+	if err != nil {
+		return nil, fmt.Errorf("failed to cascade suspend systems: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	return scanSystemKeys(rows)
+}
+
+// SuspendSystemsByMultipleOrgIDs suspends all active systems belonging to any of the given organizations
+// The suspendedByOrgID is the org that initiated the cascade
+func (r *LocalSystemRepository) SuspendSystemsByMultipleOrgIDs(orgIDs []string, suspendedByOrgID string) ([]string, error) {
+	if len(orgIDs) == 0 {
+		return nil, nil
+	}
+
+	now := time.Now()
+
+	placeholders := make([]string, len(orgIDs))
+	args := make([]interface{}, len(orgIDs))
+	for i, id := range orgIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	inClause := strings.Join(placeholders, ",")
+
+	suspendedByIdx := len(orgIDs) + 1
+	nowIdx := len(orgIDs) + 2
+	query := fmt.Sprintf(`
+		UPDATE systems
+		SET suspended_at = $%d, suspended_by_org_id = $%d, updated_at = $%d
+		WHERE organization_id IN (%s) AND deleted_at IS NULL AND suspended_at IS NULL
+		RETURNING system_key
+	`, nowIdx, suspendedByIdx, nowIdx, inClause)
+
+	updateArgs := make([]interface{}, 0, len(orgIDs)+2)
+	updateArgs = append(updateArgs, args...)
+	updateArgs = append(updateArgs, suspendedByOrgID, now)
+
+	rows, err := r.db.Query(query, updateArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to cascade suspend systems: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	return scanSystemKeys(rows)
+}
+
+// ReactivateSystemsByOrgID reactivates systems that were cascade-suspended by this organization
+// Returns the system_keys of the reactivated systems so the caller can invalidate their cached credentials.
+func (r *LocalSystemRepository) ReactivateSystemsByOrgID(orgID string) ([]string, error) {
+	now := time.Now()
+
+	query := `
+		UPDATE systems
+		SET suspended_at = NULL, suspended_by_org_id = NULL, updated_at = $2
+		WHERE suspended_by_org_id = $1 AND deleted_at IS NULL AND suspended_at IS NOT NULL
+		RETURNING system_key
+	`
+
+	rows, err := r.db.Query(query, orgID, now)
+	if err != nil {
+		return nil, fmt.Errorf("failed to cascade reactivate systems: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	return scanSystemKeys(rows)
+}
+
+// SoftDeleteSystemsByOrgID soft-deletes all active systems belonging to an organization (cascade deletion)
+// Returns the count of deleted systems
+func (r *LocalSystemRepository) SoftDeleteSystemsByOrgID(orgID string) (int, error) {
+	now := time.Now()
+
+	query := `
+		UPDATE systems
+		SET deleted_at = $2, deleted_by_org_id = $1, status = 'deleted', updated_at = $2
+		WHERE organization_id = $1 AND deleted_at IS NULL
+	`
+
+	result, err := r.db.Exec(query, orgID, now)
+	if err != nil {
+		return 0, fmt.Errorf("failed to cascade soft-delete systems: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	return int(rowsAffected), nil
+}
+
+// RestoreSystemsByDeletedByOrgID restores systems that were cascade-deleted by a specific organization
+func (r *LocalSystemRepository) RestoreSystemsByDeletedByOrgID(deletedByOrgID string) (int, error) {
+	now := time.Now()
+
+	query := `
+		UPDATE systems
+		SET deleted_at = NULL,
+		    deleted_by_org_id = NULL,
+		    status = CASE WHEN unregistered_at IS NOT NULL THEN 'unregistered' ELSE 'unknown' END,
+		    updated_at = $2
+		WHERE deleted_by_org_id = $1 AND deleted_at IS NOT NULL
+	`
+
+	result, err := r.db.Exec(query, deletedByOrgID, now)
+	if err != nil {
+		return 0, fmt.Errorf("failed to cascade restore systems: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	return int(rowsAffected), nil
+}
+
+// HardDelete permanently removes a system from the database
+func (r *LocalSystemRepository) HardDelete(id string) error {
+	query := `DELETE FROM systems WHERE id = $1`
+
+	result, err := r.db.Exec(query, id)
+	if err != nil {
+		return fmt.Errorf("failed to hard-delete system: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("system not found")
+	}
+
+	return nil
+}
+
+// HardDeleteByOrgID permanently removes all systems belonging to an organization
+func (r *LocalSystemRepository) HardDeleteByOrgID(orgID string) (int, error) {
+	query := `DELETE FROM systems WHERE organization_id = $1`
+
+	result, err := r.db.Exec(query, orgID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to hard-delete systems by org: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	return int(rowsAffected), nil
+}
+
+// HardDeleteByMultipleOrgIDs permanently removes all systems belonging to any of the given organizations
+func (r *LocalSystemRepository) HardDeleteByMultipleOrgIDs(orgIDs []string) (int, error) {
+	if len(orgIDs) == 0 {
+		return 0, nil
+	}
+
+	placeholders := make([]string, len(orgIDs))
+	args := make([]interface{}, len(orgIDs))
+	for i, id := range orgIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	inClause := strings.Join(placeholders, ",")
+
+	query := fmt.Sprintf(`DELETE FROM systems WHERE organization_id IN (%s)`, inClause)
+
+	result, err := r.db.Exec(query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("failed to hard-delete systems by multiple orgs: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	return int(rowsAffected), nil
+}
+
+// SoftDeleteSystemsByMultipleOrgIDs soft-deletes all active systems belonging to any of the given organizations
+// The deletedByOrgID is the org that initiated the cascade
+func (r *LocalSystemRepository) SoftDeleteSystemsByMultipleOrgIDs(orgIDs []string, deletedByOrgID string) (int, error) {
+	if len(orgIDs) == 0 {
+		return 0, nil
+	}
+
+	now := time.Now()
+
+	placeholders := make([]string, len(orgIDs))
+	args := make([]interface{}, len(orgIDs))
+	for i, id := range orgIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	inClause := strings.Join(placeholders, ",")
+
+	deletedByIdx := len(orgIDs) + 1
+	nowIdx := len(orgIDs) + 2
+	query := fmt.Sprintf(`
+		UPDATE systems
+		SET deleted_at = $%d, deleted_by_org_id = $%d, status = 'deleted', updated_at = $%d
+		WHERE organization_id IN (%s) AND deleted_at IS NULL
+	`, nowIdx, deletedByIdx, nowIdx, inClause)
+
+	updateArgs := make([]interface{}, 0, len(orgIDs)+2)
+	updateArgs = append(updateArgs, args...)
+	updateArgs = append(updateArgs, deletedByOrgID, now)
+
+	result, err := r.db.Exec(query, updateArgs...)
+	if err != nil {
+		return 0, fmt.Errorf("failed to cascade soft-delete systems: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	return int(rowsAffected), nil
+}

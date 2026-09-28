@@ -1,0 +1,786 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { PAGE_SIZE_OPTIONS } from '@/lib/tablePageSize'
+import {
+  faMagnifyingGlass,
+  faBoxArchive,
+  faServer,
+  faEye,
+  faPenToSquare,
+  faFilePdf,
+  faFileCsv,
+  faKey,
+  faRotateLeft,
+  faCirclePause,
+  faCirclePlay,
+  faBomb,
+  faTriangleExclamation,
+} from '@fortawesome/free-solid-svg-icons'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import {
+  NeTable,
+  NeTableHead,
+  NeTableHeadCell,
+  NeTableBody,
+  NeTableRow,
+  NeTableCell,
+  NePaginator,
+  NeButton,
+  NeEmptyState,
+  NeInlineNotification,
+  NeTextInput,
+  NeDropdown,
+  type SortEvent,
+  NeSortDropdown,
+  type NeDropdownFilterV2Option,
+  NeDropdownFilterV2,
+  NeTooltip,
+  type NeDropdownItem,
+  formatRelativeTime,
+} from '@nethesis/vue-components'
+import { computed, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { savePageSizeToStorage } from '@/lib/tablePageSize'
+import { canManageSystems, canDestroySystems } from '@/lib/permissions'
+import { useSystems } from '@/queries/systems/systems'
+import { exportSystem, getProductName, SYSTEMS_TABLE_ID, type System } from '@/lib/systems/systems'
+import router from '@/router'
+import CreateOrEditSystemDrawer from './CreateOrEditSystemDrawer.vue'
+import DeleteSystemModal from './DeleteSystemModal.vue'
+import { useSystemFilters } from '@/queries/systems/systemFilters'
+import UserAvatar from '../users/UserAvatar.vue'
+import { buildVersionFilterOptions } from '@/lib/systems/systemFilters'
+import RegenerateSecretModal from './RegenerateSecretModal.vue'
+import SecretRegeneratedModal from './SecretRegeneratedModal.vue'
+import ClickToCopy from '../common/ClickToCopy.vue'
+import RestoreSystemModal from './RestoreSystemModal.vue'
+import SuspendSystemModal from './SuspendSystemModal.vue'
+import ReactivateSystemModal from './ReactivateSystemModal.vue'
+import DestroySystemModal from './DestroySystemModal.vue'
+import SystemStatusIcon from './SystemStatusIcon.vue'
+import UpdatingSpinner from '@/components/common/UpdatingSpinner.vue'
+import OrganizationDropdownFilter from '@/components/organizations/OrganizationDropdownFilter.vue'
+import { isUserCustomer } from '@/lib/organizations/organizations.ts'
+import OrganizationIconAndLink from '../organizations/OrganizationIconAndLink.vue'
+import SystemLogoAndLink from './SystemLogoAndLink.vue'
+import CreatorOrganization from '@/components/organizations/CreatorOrganization.vue'
+
+const { isShownCreateSystemDrawer = false } = defineProps<{
+  isShownCreateSystemDrawer: boolean
+}>()
+
+const emit = defineEmits(['close-drawer'])
+
+const { t, locale } = useI18n()
+const {
+  state,
+  asyncStatus,
+  pageNum,
+  pageSize,
+  textFilter,
+  productFilter,
+  createdByFilter,
+  versionFilter,
+  statusFilter,
+  organizationFilter,
+  addonFilter,
+  includeHierarchy,
+  sortBy,
+  sortDescending,
+  areDefaultFiltersApplied,
+  resetFilters,
+  resetStatusFilter,
+} = useSystems()
+const { state: systemFiltersState } = useSystemFilters()
+
+const currentSystem = ref<System | undefined>()
+const isShownCreateOrEditSystemDrawer = ref(false)
+const isShownDeleteSystemModal = ref(false)
+const isShownRestoreSystemModal = ref(false)
+const isShownRegenerateSecretModal = ref(false)
+const isShownSecretRegeneratedModal = ref(false)
+const isShownSuspendSystemModal = ref(false)
+const isShownReactivateSystemModal = ref(false)
+const isShownDestroySystemModal = ref(false)
+const newSecret = ref<string>('')
+
+const statusFilterOptions = ref<NeDropdownFilterV2Option[]>([
+  {
+    id: 'active',
+    label: t('systems.status_active'),
+  },
+  {
+    id: 'inactive',
+    label: t('systems.status_inactive'),
+  },
+  {
+    id: 'unknown',
+    label: t('systems.status_unknown'),
+  },
+  {
+    id: 'suspended',
+    label: t('common.suspended'),
+  },
+  { id: 'deleted', label: t('systems.status_deleted') },
+])
+
+const systemsPage = computed(() => {
+  return state.value.data?.systems
+})
+
+const pagination = computed(() => {
+  return state.value.data?.pagination
+})
+
+const productFilterOptions = computed(() => {
+  if (!systemFiltersState.value.data || !systemFiltersState.value.data.products) {
+    return []
+  } else {
+    return systemFiltersState.value.data.products.map((productId) => ({
+      id: productId,
+      label: getProductName(productId),
+    }))
+  }
+})
+
+const versionFilterOptions = computed(() => {
+  if (!systemFiltersState.value.data || !systemFiltersState.value.data.versions) {
+    return []
+  } else {
+    if (productFilter.value.length === 0) {
+      // no product selected, show all versions
+      return buildVersionFilterOptions(systemFiltersState.value.data.versions)
+    }
+
+    // filter versions based on selected products
+    const selectedProductIds = productFilter.value.map((o) => o.id)
+    const productVersions = systemFiltersState.value.data.versions.filter((el) =>
+      selectedProductIds.includes(el.product),
+    )
+    return buildVersionFilterOptions(productVersions)
+  }
+})
+
+const createdByFilterOptions = computed<NeDropdownFilterV2Option[]>(() => {
+  if (!systemFiltersState.value.data || !systemFiltersState.value.data.created_by) {
+    return []
+  } else {
+    return systemFiltersState.value.data.created_by.map((createdBy) => ({
+      id: createdBy.user_id,
+      label: createdBy.name,
+      description: createdBy.organization_name,
+    }))
+  }
+})
+
+// Only the add-ons someone in the hierarchy actually holds: the endpoint
+// leaves out the ones that could only ever return an empty list.
+const addonFilterOptions = computed<NeDropdownFilterV2Option[]>(() => {
+  if (!systemFiltersState.value.data || !systemFiltersState.value.data.addons) {
+    return []
+  } else {
+    return systemFiltersState.value.data.addons.map((addon) => ({
+      id: addon.id,
+      label: addon.display_name,
+    }))
+  }
+})
+
+const isNoDataEmptyStateShown = computed(() => {
+  return (
+    !systemsPage.value?.length && state.value.status === 'success' && areDefaultFiltersApplied.value
+  )
+})
+
+const isNoMatchEmptyStateShown = computed(() => {
+  return (
+    !systemsPage.value?.length &&
+    state.value.status === 'success' &&
+    !areDefaultFiltersApplied.value
+  )
+})
+
+const noEmptyStateShown = computed(() => {
+  return !isNoDataEmptyStateShown.value && !isNoMatchEmptyStateShown.value
+})
+
+watch(
+  () => isShownCreateSystemDrawer,
+  () => {
+    if (isShownCreateSystemDrawer) {
+      showCreateSystemDrawer()
+    }
+  },
+  { immediate: true },
+)
+
+watch(
+  () => productFilter.value,
+  () => {
+    // reset version filter when product filter changes
+    versionFilter.value = []
+  },
+)
+
+function showCreateSystemDrawer() {
+  currentSystem.value = undefined
+  isShownCreateOrEditSystemDrawer.value = true
+}
+
+function showEditSystemDrawer(system: System) {
+  currentSystem.value = system
+  isShownCreateOrEditSystemDrawer.value = true
+}
+
+function showDeleteSystemModal(system: System) {
+  currentSystem.value = system
+  isShownDeleteSystemModal.value = true
+}
+
+function showRestoreSystemModal(system: System) {
+  currentSystem.value = system
+  isShownRestoreSystemModal.value = true
+}
+
+function showRegenerateSecretModal(system: System) {
+  currentSystem.value = system
+  isShownRegenerateSecretModal.value = true
+}
+
+function showSuspendSystemModal(system: System) {
+  currentSystem.value = system
+  isShownSuspendSystemModal.value = true
+}
+
+function showReactivateSystemModal(system: System) {
+  currentSystem.value = system
+  isShownReactivateSystemModal.value = true
+}
+
+function showDestroySystemModal(system: System) {
+  currentSystem.value = system
+  isShownDestroySystemModal.value = true
+}
+
+function onCloseDrawer() {
+  isShownCreateOrEditSystemDrawer.value = false
+  emit('close-drawer')
+}
+
+function getKebabMenuItems(system: System) {
+  const items: NeDropdownItem[] = []
+  const canManage = canManageSystems()
+  const isDeleted = system.status === 'deleted'
+
+  if (canManage && !isDeleted) {
+    items.push({
+      id: 'editSystem',
+      label: t('common.edit'),
+      icon: faPenToSquare,
+      action: () => showEditSystemDrawer(system),
+    })
+  }
+
+  items.push(
+    {
+      id: 'exportToPdf',
+      label: t('systems.export_to_pdf'),
+      icon: faFilePdf,
+      action: () => exportSystem(system, 'pdf'),
+    },
+    {
+      id: 'exportToCsv',
+      label: t('systems.export_to_csv'),
+      icon: faFileCsv,
+      action: () => exportSystem(system, 'csv'),
+    },
+  )
+
+  if (canManage && !isDeleted) {
+    if (system.suspended_at) {
+      items.push({
+        id: 'reactivateSystem',
+        label: t('common.reactivate'),
+        icon: faCirclePlay,
+        action: () => showReactivateSystemModal(system),
+      })
+    } else {
+      if (!system.registered_at) {
+        items.push({
+          id: 'regenerateSecret',
+          label: t('systems.regenerate_secret'),
+          icon: faKey,
+          action: () => showRegenerateSecretModal(system),
+        })
+      }
+
+      items.push({
+        id: 'suspendSystem',
+        label: t('common.suspend'),
+        icon: faCirclePause,
+        action: () => showSuspendSystemModal(system),
+      })
+    }
+
+    items.push({
+      id: 'deleteSystem',
+      label: t('common.archive'),
+      icon: faBoxArchive,
+      danger: true,
+      action: () => showDeleteSystemModal(system),
+    })
+  }
+
+  if (canManage && isDeleted) {
+    items.push({
+      id: 'restoreSystem',
+      label: t('common.restore'),
+      icon: faRotateLeft,
+      action: () => showRestoreSystemModal(system),
+    })
+  }
+
+  if (canDestroySystems()) {
+    items.push({
+      id: 'destroySystem',
+      label: t('common.destroy'),
+      icon: faBomb,
+      danger: true,
+      action: () => showDestroySystemModal(system),
+    })
+  }
+
+  return items
+}
+
+const onSort = (payload: SortEvent) => {
+  sortBy.value = payload.key as keyof System
+  sortDescending.value = payload.descending
+}
+
+const goToSystemDetails = (system: System) => {
+  router.push({ name: 'system_detail', params: { systemId: system.id } }).catch((error) => {
+    // router.push() swallows navigation failures by default; log them so an
+    // intermittent "URL changes but the page doesn't" report leaves a trace
+    console.error('[goToSystemDetails]', error)
+  })
+}
+
+function onSecretRegenerated(secret: string) {
+  newSecret.value = secret
+  isShownSecretRegeneratedModal.value = true
+}
+
+function onCloseSecretRegeneratedModal() {
+  isShownSecretRegeneratedModal.value = false
+  newSecret.value = ''
+}
+</script>
+
+<template>
+  <div>
+    <!-- get systems error notification -->
+    <NeInlineNotification
+      v-if="state.status === 'error'"
+      kind="error"
+      :title="$t('systems.cannot_retrieve_systems')"
+      :description="state.error.message"
+      class="mb-6"
+    />
+    <!-- company hierarchy filter notification -->
+    <NeInlineNotification
+      v-if="includeHierarchy && organizationFilter.length === 1"
+      kind="info"
+      :title="$t('systems.hierarchy_filter_title')"
+      :description="
+        $t('systems.hierarchy_filter_description', { name: organizationFilter[0].label })
+      "
+      :secondary-button-label="$t('systems.hierarchy_filter_exact')"
+      class="mb-6"
+      @secondary-click="includeHierarchy = false"
+    />
+    <!-- table toolbar -->
+    <div class="mb-6 flex items-center gap-4">
+      <div class="flex w-full items-end justify-between gap-4">
+        <!-- filters -->
+        <div class="flex flex-wrap items-center gap-4">
+          <!-- text filter -->
+          <NeTextInput
+            v-model="textFilter"
+            @blur="textFilter = textFilter.trim()"
+            is-search
+            :placeholder="$t('systems.filter_systems')"
+            class="max-w-48 sm:max-w-sm"
+          />
+          <NeDropdownFilterV2
+            v-model="productFilter"
+            kind="checkbox"
+            :disabled="systemFiltersState.status === 'pending'"
+            :label="t('systems.product')"
+            :options="productFilterOptions"
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+          />
+          <NeDropdownFilterV2
+            v-model="versionFilter"
+            kind="checkbox"
+            :disabled="systemFiltersState.status === 'pending'"
+            :label="t('systems.version')"
+            :options="versionFilterOptions"
+            show-options-filter
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+          />
+          <NeDropdownFilterV2
+            v-model="createdByFilter"
+            kind="checkbox"
+            :disabled="systemFiltersState.status === 'pending'"
+            :label="t('systems.created_by')"
+            :options="createdByFilterOptions"
+            show-options-filter
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+          />
+          <OrganizationDropdownFilter v-if="!isUserCustomer()" v-model="organizationFilter" />
+          <!-- add-on filter -->
+          <NeDropdownFilterV2
+            v-model="addonFilter"
+            kind="checkbox"
+            :disabled="systemFiltersState.status === 'pending'"
+            :label="t('addons.addon')"
+            :options="addonFilterOptions"
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+          />
+          <!-- status filter -->
+          <NeDropdownFilterV2
+            v-model="statusFilter"
+            kind="checkbox"
+            :label="t('common.status')"
+            :options="statusFilterOptions"
+            :show-clear-filter="false"
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :custom-action-label="t('ne_dropdown_filter.reset_selection')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+            @custom-action="resetStatusFilter"
+          />
+          <!-- sort dropdown -->
+          <NeSortDropdown
+            v-model:sort-key="sortBy"
+            v-model:sort-descending="sortDescending"
+            :label="t('sort.sort')"
+            :options="[
+              { id: 'name', label: t('systems.name') },
+              { id: 'version', label: t('systems.version') },
+              { id: 'fqdn', label: t('systems.fqdn') },
+              { id: 'organization_name', label: t('systems.organization') },
+              { id: 'creator_name', label: t('systems.created_by') },
+              { id: 'status', label: t('systems.status') },
+            ]"
+            :open-menu-aria-label="t('ne_dropdown.open_menu')"
+            :sort-by-label="t('sort.sort_by')"
+            :sort-direction-label="t('sort.direction')"
+            :ascending-label="t('sort.ascending')"
+            :descending-label="t('sort.descending')"
+            align-to-right
+          />
+          <NeButton kind="tertiary" @click="resetFilters">
+            {{ t('systems.reset_filters') }}
+          </NeButton>
+        </div>
+        <!-- update indicator -->
+        <UpdatingSpinner v-if="asyncStatus === 'loading' && state.status !== 'pending'" />
+      </div>
+    </div>
+    <!-- empty state -->
+    <NeEmptyState
+      v-if="isNoDataEmptyStateShown"
+      :title="$t('systems.no_systems')"
+      :icon="faServer"
+      class="bg-white dark:bg-gray-950"
+    />
+    <!-- no system matching filter -->
+    <NeEmptyState
+      v-else-if="isNoMatchEmptyStateShown"
+      :title="$t('systems.no_systems_found')"
+      :description="$t('common.try_changing_search_filters')"
+      :icon="faMagnifyingGlass"
+      class="bg-white dark:bg-gray-950"
+    >
+      <NeButton kind="tertiary" @click="resetFilters">
+        {{ $t('systems.reset_filters') }}
+      </NeButton>
+    </NeEmptyState>
+    <NeTable
+      v-if="noEmptyStateShown"
+      :sort-key="sortBy"
+      :sort-descending="sortDescending"
+      :aria-label="$t('systems.title')"
+      card-breakpoint="2xl"
+      :loading="state.status === 'pending'"
+      :skeleton-columns="5"
+      :skeleton-rows="7"
+    >
+      <NeTableHead>
+        <NeTableHeadCell sortable column-key="name" @sort="onSort">{{
+          $t('systems.name')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="version" @sort="onSort">{{
+          $t('systems.version')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="fqdn" @sort="onSort">{{
+          $t('systems.fqdn_ip_address')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="organization_name" @sort="onSort">{{
+          $t('systems.organization')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="creator_name" @sort="onSort">{{
+          $t('systems.created_by')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="status" @sort="onSort">{{
+          $t('systems.status')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell>
+          <!-- no header for actions -->
+        </NeTableHeadCell>
+      </NeTableHead>
+      <NeTableBody>
+        <NeTableRow v-for="item in systemsPage" :key="item.id">
+          <NeTableCell :data-label="$t('systems.name')" class="break-all">
+            <div :class="{ 'opacity-50': item.status === 'deleted' }">
+              <SystemLogoAndLink
+                :system-id="item.status === 'deleted' ? '' : item.id"
+                :system-name="item.name"
+                :system-type="item.type"
+              />
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('systems.version')" class="break-all 2xl:break-normal">
+            <div :class="{ 'opacity-50': item.status === 'deleted' }">
+              {{ item.version || '-' }}
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('systems.fqdn_ip_address')" class="break-all">
+            <div
+              class="flex flex-col items-start space-y-0.5"
+              :class="{ 'opacity-50': item.status === 'deleted' }"
+            >
+              <ClickToCopy v-if="item.fqdn" :text="item.fqdn" tooltip-placement="top" />
+              <ClickToCopy
+                v-if="item.ipv4_address"
+                :text="item.ipv4_address"
+                tooltip-placement="bottom"
+              />
+              <div v-if="item.ipv6_address">
+                {{ item.ipv6_address }}
+              </div>
+              <div v-if="!item.fqdn && !item.ipv4_address && !item.ipv6_address">-</div>
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('systems.organization')">
+            <div :class="{ 'opacity-50': item.status === 'deleted' }">
+              <OrganizationIconAndLink v-if="item.organization" :organization="item.organization" />
+              <span v-else>-</span>
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('systems.created_by')">
+            <div :class="{ 'opacity-50': item.status === 'deleted' }">
+              <template v-if="item.created_by">
+                <div class="flex items-center gap-2">
+                  <UserAvatar
+                    size="sm"
+                    :is-owner="item.created_by.username === 'owner'"
+                    :name="item.created_by.name"
+                    :logto-id="item.created_by.user_id"
+                  />
+                  <div class="space-y-0.5">
+                    <div>{{ item.created_by.name || '-' }}</div>
+                    <div
+                      v-if="item.created_by.organization_name"
+                      class="text-gray-500 dark:text-gray-400"
+                    >
+                      <CreatorOrganization :creator="item.created_by" />
+                    </div>
+                  </div>
+                </div>
+              </template>
+              <template v-else>-</template>
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('systems.status')">
+            <div class="flex items-center gap-2">
+              <template v-if="item.status">
+                <NeTooltip
+                  v-if="
+                    item.status === 'active' ||
+                    item.status === 'inactive' ||
+                    item.status === 'unknown'
+                  "
+                  trigger-event="mouseenter focus"
+                  placement="top"
+                >
+                  <template #trigger>
+                    <div class="flex items-center gap-2">
+                      <SystemStatusIcon :status="item.status" />
+                      {{ t(`systems.status_${item.status}`) }}
+                    </div>
+                  </template>
+                  <template #content>
+                    <template v-if="item.status === 'unknown'">
+                      {{ $t('system_detail.no_heartbeat_yet') }}
+                    </template>
+                    <template v-else>
+                      {{
+                        $t('system_detail.last_heartbeat_time', {
+                          time: item.last_heartbeat
+                            ? formatRelativeTime(new Date(item.last_heartbeat), locale)
+                            : '-',
+                        })
+                      }}
+                    </template>
+                  </template>
+                </NeTooltip>
+                <template v-else>
+                  <SystemStatusIcon :status="item.status" />
+                  {{ t(`systems.status_${item.status}`) }}
+                </template>
+              </template>
+              <span v-else>-</span>
+              <!-- no inventory warning (do not show for pending/unknown status) -->
+              <NeTooltip
+                v-if="!item.last_inventory && item.status !== 'unknown'"
+                trigger-event="mouseenter focus"
+                placement="top"
+              >
+                <template #trigger>
+                  <FontAwesomeIcon
+                    :icon="faTriangleExclamation"
+                    class="size-4 text-amber-700 dark:text-amber-500"
+                    aria-hidden="true"
+                  />
+                </template>
+                <template #content>
+                  {{ $t('system_detail.no_inventory_available') }}
+                </template>
+              </NeTooltip>
+            </div>
+          </NeTableCell>
+          <NeTableCell :data-label="$t('common.actions')">
+            <div class="-ml-2.5 flex gap-2 2xl:ml-0 2xl:justify-end">
+              <NeButton
+                v-if="item.status !== 'deleted'"
+                kind="tertiary"
+                @click="goToSystemDetails(item)"
+              >
+                <template #prefix>
+                  <FontAwesomeIcon :icon="faEye" class="h-4 w-4" aria-hidden="true" />
+                </template>
+                {{ $t('common.details') }}
+              </NeButton>
+              <!-- kebab menu -->
+              <NeDropdown :items="getKebabMenuItems(item)" :align-to-right="true" />
+            </div>
+          </NeTableCell>
+        </NeTableRow>
+      </NeTableBody>
+      <template #paginator>
+        <NePaginator
+          :current-page="pageNum"
+          :total-rows="pagination?.total_count || 0"
+          :page-size="pageSize"
+          :page-sizes="PAGE_SIZE_OPTIONS"
+          :nav-pagination-label="$t('ne_table.pagination')"
+          :next-label="$t('ne_table.go_to_next_page')"
+          :previous-label="$t('ne_table.go_to_previous_page')"
+          :range-of-total-label="$t('ne_table.of')"
+          :page-size-label="$t('ne_table.show')"
+          @select-page="
+            (page: number) => {
+              pageNum = page
+            }
+          "
+          @select-page-size="
+            (size: number) => {
+              pageSize = size
+              savePageSizeToStorage(SYSTEMS_TABLE_ID, size)
+            }
+          "
+        />
+      </template>
+    </NeTable>
+    <!-- side drawer -->
+    <CreateOrEditSystemDrawer
+      :is-shown="isShownCreateOrEditSystemDrawer"
+      :current-system="currentSystem"
+      @close="onCloseDrawer"
+    />
+    <!-- delete system modal -->
+    <DeleteSystemModal
+      :visible="isShownDeleteSystemModal"
+      :system="currentSystem"
+      @close="isShownDeleteSystemModal = false"
+    />
+    <!-- restore system modal -->
+    <RestoreSystemModal
+      :visible="isShownRestoreSystemModal"
+      :system="currentSystem"
+      @close="isShownRestoreSystemModal = false"
+    />
+    <!-- suspend system modal -->
+    <SuspendSystemModal
+      :visible="isShownSuspendSystemModal"
+      :system="currentSystem"
+      @close="isShownSuspendSystemModal = false"
+    />
+    <!-- reactivate system modal -->
+    <ReactivateSystemModal
+      :visible="isShownReactivateSystemModal"
+      :system="currentSystem"
+      @close="isShownReactivateSystemModal = false"
+    />
+    <!-- destroy system modal -->
+    <DestroySystemModal
+      :visible="isShownDestroySystemModal"
+      :system="currentSystem"
+      @close="isShownDestroySystemModal = false"
+    />
+    <!-- regenerate secret modal -->
+    <RegenerateSecretModal
+      :visible="isShownRegenerateSecretModal"
+      :system="currentSystem"
+      @close="isShownRegenerateSecretModal = false"
+      @secret-regenerated="onSecretRegenerated"
+    />
+    <!-- secret regenerated modal -->
+    <SecretRegeneratedModal
+      :visible="isShownSecretRegeneratedModal"
+      :system="currentSystem"
+      :new-secret="newSecret"
+      @close="onCloseSecretRegeneratedModal"
+    />
+  </div>
+</template>

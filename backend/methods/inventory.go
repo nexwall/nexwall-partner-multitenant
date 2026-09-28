@@ -1,0 +1,592 @@
+/*
+ * Copyright (C) 2025 Nethesis S.r.l.
+ * http://www.nethesis.it - info@nethesis.it
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * author: Edoardo Spadoni <edoardo.spadoni@nethesis.it>
+ */
+
+package methods
+
+import (
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/nethesis/my/backend/helpers"
+	"github.com/nethesis/my/backend/logger"
+	"github.com/nethesis/my/backend/response"
+	"github.com/nethesis/my/backend/services/local"
+)
+
+// GetSystemInventoryHistory handles GET /api/systems/:id/inventory - retrieves paginated inventory history
+func GetSystemInventoryHistory(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context for access validation
+	userID, userOrgID, userOrgRole, _ := helpers.GetUserContextExtended(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, response.Unauthorized("user context required", nil))
+		return
+	}
+
+	// Validate system access
+	systemsService := local.NewSystemsService()
+	_, err := systemsService.GetSystem(systemID, userOrgRole, userOrgID)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Parse pagination parameters
+	page := 1
+	pageSize := 20
+	if pageStr := c.Query("page"); pageStr != "" {
+		if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+			page = p
+		}
+	}
+	if pageSizeStr := c.Query("page_size"); pageSizeStr != "" {
+		if ps, err := strconv.Atoi(pageSizeStr); err == nil && ps > 0 && ps <= 200 {
+			pageSize = ps
+		}
+	}
+
+	// Parse date filters
+	var fromDate, toDate *time.Time
+	if fromStr := c.Query("from_date"); fromStr != "" {
+		if fd, err := time.Parse(time.RFC3339, fromStr); err == nil {
+			fromDate = &fd
+		}
+	}
+	if toStr := c.Query("to_date"); toStr != "" {
+		if td, err := time.Parse(time.RFC3339, toStr); err == nil {
+			toDate = &td
+		}
+	}
+
+	// Get inventory history
+	inventoryService := local.NewInventoryService()
+	records, totalCount, err := inventoryService.GetInventoryHistory(systemID, page, pageSize, fromDate, toDate)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Int("page", page).
+			Int("page_size", pageSize).
+			Msg("Failed to retrieve inventory history")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to retrieve inventory history", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Log the action
+	logger.RequestLogger(c, "inventory").Info().
+		Str("operation", "get_inventory_history").
+		Str("system_id", systemID).
+		Int("count", len(records)).
+		Int("total", totalCount).
+		Msg("Inventory history requested")
+
+	// Return paginated results
+	c.JSON(http.StatusOK, response.OK("inventory history retrieved successfully", gin.H{
+		"records":    helpers.EnsureSlice(records),
+		"pagination": helpers.BuildPaginationInfo(page, pageSize, totalCount),
+	}))
+}
+
+// GetSystemLatestInventory handles GET /api/systems/:id/inventory/latest - retrieves latest inventory
+func GetSystemLatestInventory(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context for access validation
+	userID, userOrgID, userOrgRole, _ := helpers.GetUserContextExtended(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, response.Unauthorized("user context required", nil))
+		return
+	}
+
+	// Validate system access
+	systemsService := local.NewSystemsService()
+	_, err := systemsService.GetSystem(systemID, userOrgRole, userOrgID)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Get latest inventory
+	inventoryService := local.NewInventoryService()
+	record, err := inventoryService.GetLatestInventory(systemID)
+	if err != nil {
+		if err.Error() == "no inventory found for system "+systemID {
+			// Return 200 with null when no inventory exists (not an error condition)
+			logger.RequestLogger(c, "inventory").Info().
+				Str("operation", "get_latest_inventory").
+				Str("system_id", systemID).
+				Msg("No inventory available for system")
+
+			c.JSON(http.StatusOK, response.OK("no inventory available", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Msg("Failed to retrieve latest inventory")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to retrieve latest inventory", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Log the action
+	logger.RequestLogger(c, "inventory").Info().
+		Str("operation", "get_latest_inventory").
+		Str("system_id", systemID).
+		Int64("inventory_id", record.ID).
+		Msg("Latest inventory requested")
+
+	// Return latest inventory
+	c.JSON(http.StatusOK, response.OK("latest inventory retrieved successfully", record))
+}
+
+// GetSystemInventoryByID handles GET /api/systems/:id/inventory/:inventory_id - retrieves a specific inventory record
+func GetSystemInventoryByID(c *gin.Context) {
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	inventoryIDStr := c.Param("inventory_id")
+	inventoryID, err := strconv.ParseInt(inventoryIDStr, 10, 64)
+	if err != nil || inventoryID <= 0 {
+		c.JSON(http.StatusBadRequest, response.BadRequest("invalid inventory ID", nil))
+		return
+	}
+
+	userID, userOrgID, userOrgRole, _ := helpers.GetUserContextExtended(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, response.Unauthorized("user context required", nil))
+		return
+	}
+
+	systemsService := local.NewSystemsService()
+	_, err = systemsService.GetSystem(systemID, userOrgRole, userOrgID)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	inventoryService := local.NewInventoryService()
+	record, err := inventoryService.GetInventoryByID(systemID, inventoryID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("inventory record not found", nil))
+			return
+		}
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Int64("inventory_id", inventoryID).
+			Msg("Failed to retrieve inventory record")
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to retrieve inventory record", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	logger.RequestLogger(c, "inventory").Info().
+		Str("operation", "get_inventory_by_id").
+		Str("system_id", systemID).
+		Int64("inventory_id", inventoryID).
+		Msg("Inventory record requested")
+
+	c.JSON(http.StatusOK, response.OK("inventory record retrieved successfully", record))
+}
+
+// GetSystemInventoryTimeline handles GET /api/systems/:id/inventory/timeline - retrieves date-grouped timeline
+func GetSystemInventoryTimeline(c *gin.Context) {
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	userID, userOrgID, userOrgRole, _ := helpers.GetUserContextExtended(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, response.Unauthorized("user context required", nil))
+		return
+	}
+
+	systemsService := local.NewSystemsService()
+	_, err := systemsService.GetSystem(systemID, userOrgRole, userOrgID)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Parse pagination
+	page := 1
+	pageSize := 20
+	if pageStr := c.Query("page"); pageStr != "" {
+		if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+			page = p
+		}
+	}
+	if pageSizeStr := c.Query("page_size"); pageSizeStr != "" {
+		if ps, err := strconv.Atoi(pageSizeStr); err == nil && ps > 0 && ps <= 200 {
+			pageSize = ps
+		}
+	}
+
+	// Parse filters
+	severities := c.QueryArray("severity")
+	categories := c.QueryArray("category")
+	diffTypes := c.QueryArray("diff_type")
+
+	var fromDate, toDate *time.Time
+	if fromStr := c.Query("from_date"); fromStr != "" {
+		if fd, err := time.Parse(time.RFC3339, fromStr); err == nil {
+			fromDate = &fd
+		}
+	}
+	if toStr := c.Query("to_date"); toStr != "" {
+		if td, err := time.Parse(time.RFC3339, toStr); err == nil {
+			toDate = &td
+		}
+	}
+
+	// Parse search filter
+	search := strings.TrimSpace(c.Query("search"))
+
+	inventoryService := local.NewInventoryService()
+	summary, groups, totalCount, err := inventoryService.GetInventoryTimeline(systemID, page, pageSize, severities, categories, diffTypes, fromDate, toDate, search)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Msg("Failed to retrieve inventory timeline")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to retrieve inventory timeline", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	logger.RequestLogger(c, "inventory").Info().
+		Str("operation", "get_inventory_timeline").
+		Str("system_id", systemID).
+		Int("groups", len(groups)).
+		Int("total", totalCount).
+		Strs("severity", severities).
+		Strs("category", categories).
+		Msg("Inventory timeline requested")
+
+	c.JSON(http.StatusOK, response.OK("inventory timeline retrieved successfully", gin.H{
+		"summary":    summary,
+		"groups":     helpers.EnsureSlice(groups),
+		"pagination": helpers.BuildPaginationInfo(page, pageSize, totalCount),
+	}))
+}
+
+// GetSystemInventoryChanges handles GET /api/systems/:id/inventory/changes - retrieves changes summary
+func GetSystemInventoryChanges(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context for access validation
+	userID, userOrgID, userOrgRole, _ := helpers.GetUserContextExtended(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, response.Unauthorized("user context required", nil))
+		return
+	}
+
+	// Validate system access
+	systemsService := local.NewSystemsService()
+	_, err := systemsService.GetSystem(systemID, userOrgRole, userOrgID)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Get changes summary
+	inventoryService := local.NewInventoryService()
+	summary, err := inventoryService.GetChangesSummary(systemID)
+	if err != nil {
+		if err.Error() == "no inventory found for system "+systemID {
+			// Return 200 with null when no inventory exists (not an error condition)
+			logger.RequestLogger(c, "inventory").Info().
+				Str("operation", "get_changes_summary").
+				Str("system_id", systemID).
+				Msg("No inventory available for system")
+
+			c.JSON(http.StatusOK, response.OK("no inventory available", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Msg("Failed to retrieve changes summary")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to retrieve changes summary", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Log the action
+	logger.RequestLogger(c, "inventory").Info().
+		Str("operation", "get_changes_summary").
+		Str("system_id", systemID).
+		Int("total_changes", summary.TotalChanges).
+		Msg("Changes summary requested")
+
+	// Return changes summary
+	c.JSON(http.StatusOK, response.OK("changes summary retrieved successfully", summary))
+}
+
+// GetSystemLatestInventoryChanges handles GET /api/systems/:id/inventory/changes/latest - retrieves latest batch changes summary
+func GetSystemLatestInventoryChanges(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context for access validation
+	userID, userOrgID, userOrgRole, _ := helpers.GetUserContextExtended(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, response.Unauthorized("user context required", nil))
+		return
+	}
+
+	// Validate system access
+	systemsService := local.NewSystemsService()
+	_, err := systemsService.GetSystem(systemID, userOrgRole, userOrgID)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Get latest changes summary
+	inventoryService := local.NewInventoryService()
+	summary, err := inventoryService.GetLatestInventoryChangesSummary(systemID)
+	if err != nil {
+		if err.Error() == "no inventory found for system "+systemID {
+			// Return 200 with null when no inventory exists (not an error condition)
+			logger.RequestLogger(c, "inventory").Info().
+				Str("operation", "get_latest_inventory_changes").
+				Str("system_id", systemID).
+				Msg("No inventory available for system")
+
+			c.JSON(http.StatusOK, response.OK("no inventory available", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Msg("Failed to retrieve latest inventory changes summary")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to retrieve latest inventory changes summary", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Log the action
+	logger.RequestLogger(c, "inventory").Info().
+		Str("operation", "get_latest_inventory_changes").
+		Str("system_id", systemID).
+		Int("total_changes", summary.TotalChanges).
+		Msg("Latest inventory changes summary requested")
+
+	// Return latest changes summary
+	c.JSON(http.StatusOK, response.OK("latest inventory changes summary retrieved successfully", summary))
+}
+
+// GetSystemInventoryDiffs handles GET /api/systems/:id/inventory/diffs - retrieves paginated diffs
+func GetSystemInventoryDiffs(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context for access validation
+	userID, userOrgID, userOrgRole, _ := helpers.GetUserContextExtended(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, response.Unauthorized("user context required", nil))
+		return
+	}
+
+	// Validate system access
+	systemsService := local.NewSystemsService()
+	_, err := systemsService.GetSystem(systemID, userOrgRole, userOrgID)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Parse pagination parameters
+	page := 1
+	pageSize := 20
+	if pageStr := c.Query("page"); pageStr != "" {
+		if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+			page = p
+		}
+	}
+	if pageSizeStr := c.Query("page_size"); pageSizeStr != "" {
+		if ps, err := strconv.Atoi(pageSizeStr); err == nil && ps > 0 && ps <= 200 {
+			pageSize = ps
+		}
+	}
+
+	// Parse filters
+	severities := c.QueryArray("severity")
+	categories := c.QueryArray("category")
+	diffTypes := c.QueryArray("diff_type")
+
+	// Parse inventory_id filter (repeated params: ?inventory_id=42&inventory_id=43)
+	var inventoryIDs []int64
+	for _, idStr := range c.QueryArray("inventory_id") {
+		if id, err := strconv.ParseInt(idStr, 10, 64); err == nil {
+			inventoryIDs = append(inventoryIDs, id)
+		}
+	}
+
+	// Parse date filters
+	var fromDate, toDate *time.Time
+	if fromStr := c.Query("from_date"); fromStr != "" {
+		if fd, err := time.Parse(time.RFC3339, fromStr); err == nil {
+			fromDate = &fd
+		}
+	}
+	if toStr := c.Query("to_date"); toStr != "" {
+		if td, err := time.Parse(time.RFC3339, toStr); err == nil {
+			toDate = &td
+		}
+	}
+
+	// Parse search filter
+	search := strings.TrimSpace(c.Query("search"))
+
+	// Get inventory diffs
+	inventoryService := local.NewInventoryService()
+	diffs, totalCount, err := inventoryService.GetInventoryDiffs(systemID, page, pageSize, severities, categories, diffTypes, fromDate, toDate, inventoryIDs, search)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Int("page", page).
+			Int("page_size", pageSize).
+			Strs("severity", severities).
+			Strs("category", categories).
+			Strs("diff_type", diffTypes).
+			Msg("Failed to retrieve inventory diffs")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to retrieve inventory diffs", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Log the action
+	logger.RequestLogger(c, "inventory").Info().
+		Str("operation", "get_inventory_diffs").
+		Str("system_id", systemID).
+		Int("count", len(diffs)).
+		Int("total", totalCount).
+		Strs("severity", severities).
+		Strs("category", categories).
+		Msg("Inventory diffs requested")
+
+	// Return paginated results
+	c.JSON(http.StatusOK, response.OK("inventory diffs retrieved successfully", gin.H{
+		"diffs":      helpers.EnsureSlice(diffs),
+		"pagination": helpers.BuildPaginationInfo(page, pageSize, totalCount),
+	}))
+}
+
+// GetSystemLatestInventoryDiff handles GET /api/systems/:id/inventory/diffs/latest - retrieves latest diffs batch
+func GetSystemLatestInventoryDiff(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context for access validation
+	userID, userOrgID, userOrgRole, _ := helpers.GetUserContextExtended(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, response.Unauthorized("user context required", nil))
+		return
+	}
+
+	// Validate system access
+	systemsService := local.NewSystemsService()
+	_, err := systemsService.GetSystem(systemID, userOrgRole, userOrgID)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Get latest diffs batch
+	inventoryService := local.NewInventoryService()
+	diffs, err := inventoryService.GetLatestInventoryDiffs(systemID)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Msg("Failed to retrieve latest inventory diffs")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to retrieve latest inventory diffs", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Log the action
+	logEvent := logger.RequestLogger(c, "inventory").Info().
+		Str("operation", "get_latest_inventory_diffs").
+		Str("system_id", systemID).
+		Int("count", len(diffs))
+
+	if len(diffs) > 0 {
+		logEvent.Int64("inventory_id", diffs[0].InventoryID)
+	}
+
+	logEvent.Msg("Latest inventory diffs batch requested")
+
+	// Prepare response data
+	responseData := gin.H{
+		"diffs": helpers.EnsureSlice(diffs),
+		"count": len(diffs),
+	}
+
+	// Add current_inventory_id only if there are diffs
+	if len(diffs) > 0 {
+		responseData["current_inventory_id"] = diffs[0].InventoryID
+	}
+
+	// Return latest diffs batch
+	c.JSON(http.StatusOK, response.OK("latest inventory diffs retrieved successfully", responseData))
+}

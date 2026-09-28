@@ -1,0 +1,1976 @@
+/*
+ * Copyright (C) 2025 Nethesis S.r.l.
+ * http://www.nethesis.it - info@nethesis.it
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * author: Edoardo Spadoni <edoardo.spadoni@nethesis.it>
+ */
+
+package local
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/nethesis/my/backend/cache"
+	"github.com/nethesis/my/backend/database"
+	"github.com/nethesis/my/backend/entities"
+	"github.com/nethesis/my/backend/helpers"
+	"github.com/nethesis/my/backend/logger"
+	"github.com/nethesis/my/backend/models"
+	"github.com/nethesis/my/backend/response"
+	"github.com/nethesis/my/backend/services/email"
+	"github.com/nethesis/my/backend/services/logto"
+)
+
+// ValidationError represents a validation error that should be returned as 400 instead of 500
+type ValidationError struct {
+	StatusCode int
+	ErrorData  response.ErrorData
+}
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("validation error (status %d)", e.StatusCode)
+}
+
+// LocalUserService handles local-first user CRUD operations with Logto sync
+type LocalUserService struct {
+	userRepo    *entities.LocalUserRepository
+	logtoClient *logto.LogtoManagementClient
+}
+
+// NewUserService creates a new local user service
+func NewUserService() *LocalUserService {
+	return &LocalUserService{
+		userRepo:    entities.NewLocalUserRepository(),
+		logtoClient: logto.NewManagementClient(),
+	}
+}
+
+// =============================================================================
+// PUBLIC METHODS
+// =============================================================================
+
+// CreateUser creates a user locally and syncs to Logto. creator is the
+// snapshot of the authenticated user performing the action, stored in the
+// dedicated users.created_by column (display/filter only - RBAC stays on
+// organization_id / custom_data.createdBy). callerUserRoles are the technical
+// role names of the authenticated caller: creating users in the Owner
+// organization is restricted to the Owner user role (every Owner-org member
+// shares the same org role, so only the technical role can tell them apart).
+func (s *LocalUserService) CreateUser(req *models.CreateLocalUserRequest, creator *models.OrgCreator, createdByOrgID string, callerUserRoles []string) (*models.LocalUser, error) {
+	// Normalize phone to digits-only at the entry point so both the local DB write
+	// and the Logto call see the same shape — avoids drift where the local DB ends
+	// up with formatted values (e.g. "+39 333 1234567") while Logto stores the
+	// digits-only version.
+	if req.Phone != nil && *req.Phone != "" {
+		normalized := NormalizePhoneForLogto(*req.Phone)
+		req.Phone = &normalized
+	}
+
+	// Generate username from email if not provided (clean for Logto format)
+	if req.Username == "" {
+		req.Username = s.generateUsernameFromEmail(req.Email)
+	}
+
+	// Security: Prevent creation of users with reserved username "owner"
+	if strings.ToLower(req.Username) == "owner" {
+		return nil, &ValidationError{
+			StatusCode: 400,
+			ErrorData: response.ErrorData{
+				Errors: []response.ValidationError{
+					{
+						Key:     "username",
+						Message: "username 'owner' is reserved and cannot be used",
+						Value:   req.Username,
+					},
+				},
+			},
+		}
+	}
+
+	// Security: creating users in the Owner organization is restricted to org
+	// role Owner, and the technical roles must pair with the target org (Staff
+	// and owner-tier roles live only inside the Owner organization).
+	isOwnerOrgTarget := false
+	if req.OrganizationID != nil {
+		isOwnerOrg, err := s.isOwnerOrganization(*req.OrganizationID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to validate organization: %w", err)
+		}
+		if isOwnerOrg && !models.HasOwnerUserRole(callerUserRoles) {
+			return nil, &ValidationError{
+				StatusCode: 403,
+				ErrorData: response.ErrorData{
+					Errors: []response.ValidationError{
+						{
+							Key:     "organization_id",
+							Message: "only the Owner role can create users in the Owner organization",
+							Value:   *req.OrganizationID,
+						},
+					},
+				},
+			}
+		}
+		isOwnerOrgTarget = isOwnerOrg
+	}
+	if validationErr := s.validateOwnerOrgRolePairing(isOwnerOrgTarget, req.UserRoleIDs); validationErr != nil {
+		return nil, validationErr
+	}
+
+	// Always generate a temporary password for new users
+	tempPassword, err := helpers.GeneratePassword()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate temporary password: %w", err)
+	}
+	logger.Info().
+		Str("username", req.Username).
+		Str("email", req.Email).
+		Msg("Generated temporary password for new user")
+
+	// 1. Create in Logto FIRST for validation (before consuming local resources)
+	// Start with user-provided custom data (allows custom fields)
+	customData := make(map[string]interface{})
+	if req.CustomData != nil {
+		for k, v := range req.CustomData {
+			customData[k] = v
+		}
+	}
+
+	// System fields - these override any user-provided values and are always maintained
+	customData["organizationId"] = req.OrganizationID
+	customData["userRoleIds"] = req.UserRoleIDs
+	customData["createdBy"] = createdByOrgID
+	// Set initial creation timestamp
+	customData["createdAt"] = time.Now().Format(time.RFC3339)
+
+	logtoUserReq := models.CreateUserRequest{
+		Username:     req.Username,
+		Password:     tempPassword,
+		Name:         req.Name,
+		PrimaryEmail: req.Email,
+		CustomData:   customData,
+	}
+
+	// Phone is already normalized at the entry point of CreateUser
+	if req.Phone != nil && *req.Phone != "" {
+		logtoUserReq.PrimaryPhone = *req.Phone
+	}
+
+	logtoUser, err := s.logtoClient.CreateUser(logtoUserReq)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("username", req.Username).
+			Str("email", req.Email).
+			Msg("Failed to create user in Logto - validation failed")
+
+		// Parse the error with context for better error handling
+		context := map[string]interface{}{
+			"email":    req.Email,
+			"phone":    req.Phone,
+			"username": req.Username,
+		}
+		parsedErr := s.parseLogtoError(err, context)
+
+		// No rollback needed since we haven't created anything locally yet
+		return nil, fmt.Errorf("failed to create user in Logto: %w", parsedErr)
+	}
+
+	// 2. Begin transaction for local operations (after Logto validation passes)
+	tx, err := database.DB.Begin()
+	if err != nil {
+		// Cleanup the Logto user since we can't proceed with local creation
+		if deleteErr := s.logtoClient.DeleteUser(logtoUser.ID); deleteErr != nil {
+			logger.Warn().
+				Err(deleteErr).
+				Str("logto_user_id", logtoUser.ID).
+				Msg("Failed to cleanup Logto user after local transaction failure")
+		}
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 3. Create in local DB inside the transaction (after Logto validation passes)
+	req.CreatedBy = creator
+	user, err := s.userRepo.CreateWithTx(tx, req)
+	if err != nil {
+		// Cleanup the Logto user since local creation failed
+		if deleteErr := s.logtoClient.DeleteUser(logtoUser.ID); deleteErr != nil {
+			logger.Warn().
+				Err(deleteErr).
+				Str("logto_user_id", logtoUser.ID).
+				Msg("Failed to cleanup Logto user after local creation failure")
+		}
+		// Transaction will be rolled back by defer
+		return nil, fmt.Errorf("failed to create user locally: %w", err)
+	}
+
+	// 4. Assign user roles if provided
+	if len(req.UserRoleIDs) > 0 {
+		err = s.logtoClient.AssignUserRoles(logtoUser.ID, req.UserRoleIDs)
+		if err != nil {
+			logger.Error().
+				Err(err).
+				Str("user_id", user.ID).
+				Str("logto_user_id", logtoUser.ID).
+				Strs("user_role_ids", req.UserRoleIDs).
+				Msg("Failed to assign user roles to Logto user - rolling back local creation")
+
+			// Delete the created Logto user to keep consistency
+			if deleteErr := s.logtoClient.DeleteUser(logtoUser.ID); deleteErr != nil {
+				logger.Warn().
+					Err(deleteErr).
+					Str("logto_user_id", logtoUser.ID).
+					Msg("Failed to cleanup Logto user after role assignment failure")
+			}
+
+			// Transaction will be rolled back by defer
+			return nil, fmt.Errorf("failed to assign user roles to Logto user: %w", err)
+		}
+
+		logger.Info().
+			Str("user_id", user.ID).
+			Str("logto_user_id", logtoUser.ID).
+			Strs("user_role_ids", req.UserRoleIDs).
+			Msg("User roles assigned successfully")
+	}
+
+	// 5. Assign user to organization if provided
+	if req.OrganizationID != nil && *req.OrganizationID != "" {
+		err = s.logtoClient.AssignUserToOrganization(*req.OrganizationID, logtoUser.ID)
+		if err != nil {
+			logger.Error().
+				Err(err).
+				Str("user_id", user.ID).
+				Str("logto_user_id", logtoUser.ID).
+				Str("organization_id", *req.OrganizationID).
+				Msg("Failed to assign user to organization in Logto - rolling back local creation")
+
+			// Delete the created Logto user to keep consistency
+			if deleteErr := s.logtoClient.DeleteUser(logtoUser.ID); deleteErr != nil {
+				logger.Warn().
+					Err(deleteErr).
+					Str("logto_user_id", logtoUser.ID).
+					Msg("Failed to cleanup Logto user after organization assignment failure")
+			}
+
+			// Transaction will be rolled back by defer
+			return nil, fmt.Errorf("failed to assign user to organization in Logto: %w", err)
+		}
+
+		logger.Info().
+			Str("user_id", user.ID).
+			Str("logto_user_id", logtoUser.ID).
+			Str("organization_id", *req.OrganizationID).
+			Msg("User assigned to organization successfully")
+
+		// 6. Determine and assign organization role
+		orgRoleName, err := s.determineOrganizationRoleName(*req.OrganizationID)
+		if err != nil {
+			logger.Error().
+				Err(err).
+				Str("user_id", user.ID).
+				Str("logto_user_id", logtoUser.ID).
+				Str("organization_id", *req.OrganizationID).
+				Msg("Failed to determine organization role - rolling back local creation")
+
+			// Delete the created Logto user to keep consistency
+			if deleteErr := s.logtoClient.DeleteUser(logtoUser.ID); deleteErr != nil {
+				logger.Warn().
+					Err(deleteErr).
+					Str("logto_user_id", logtoUser.ID).
+					Msg("Failed to cleanup Logto user after organization role resolution failure")
+			}
+
+			// Transaction will be rolled back by defer
+			return nil, fmt.Errorf("failed to determine organization role: %w", err)
+		}
+		if orgRoleName != "" {
+			// Get the organization role ID from Logto by name
+			orgRole, err := s.logtoClient.GetOrganizationRoleByName(orgRoleName)
+			if err != nil {
+				logger.Error().
+					Err(err).
+					Str("user_id", user.ID).
+					Str("logto_user_id", logtoUser.ID).
+					Str("organization_id", *req.OrganizationID).
+					Str("org_role_name", orgRoleName).
+					Msg("Failed to get organization role from Logto - rolling back local creation")
+
+				// Delete the created Logto user to keep consistency
+				if deleteErr := s.logtoClient.DeleteUser(logtoUser.ID); deleteErr != nil {
+					logger.Warn().
+						Err(deleteErr).
+						Str("logto_user_id", logtoUser.ID).
+						Msg("Failed to cleanup Logto user after organization role lookup failure")
+				}
+
+				// Transaction will be rolled back by defer
+				return nil, fmt.Errorf("failed to get organization role from Logto: %w", err)
+			}
+
+			// Assign organization role using the ID
+			err = s.logtoClient.AssignOrganizationRolesToUser(*req.OrganizationID, logtoUser.ID, []string{orgRole.ID}, nil)
+			if err != nil {
+				logger.Error().
+					Err(err).
+					Str("user_id", user.ID).
+					Str("logto_user_id", logtoUser.ID).
+					Str("organization_id", *req.OrganizationID).
+					Str("org_role_name", orgRoleName).
+					Str("org_role_id", orgRole.ID).
+					Msg("Failed to assign organization role to user in Logto - rolling back local creation")
+
+				// Delete the created Logto user to keep consistency
+				if deleteErr := s.logtoClient.DeleteUser(logtoUser.ID); deleteErr != nil {
+					logger.Warn().
+						Err(deleteErr).
+						Str("logto_user_id", logtoUser.ID).
+						Msg("Failed to cleanup Logto user after organization role assignment failure")
+				}
+
+				// Transaction will be rolled back by defer
+				return nil, fmt.Errorf("failed to assign organization role to user in Logto: %w", err)
+			}
+
+			logger.Info().
+				Str("user_id", user.ID).
+				Str("logto_user_id", logtoUser.ID).
+				Str("organization_id", *req.OrganizationID).
+				Str("org_role_name", orgRoleName).
+				Str("org_role_id", orgRole.ID).
+				Msg("Organization role assigned successfully")
+		}
+	}
+
+	// 7. Mark as synced (inside the transaction so logto_id commits atomically)
+	err = s.markUserSynced(tx, user.ID, logtoUser.ID)
+	if err != nil {
+		logger.Warn().
+			Err(err).
+			Str("user_id", user.ID).
+			Msg("Failed to mark user as synced")
+	} else {
+		// Reflect the sync on the in-memory object so the create response carries
+		// logto_id immediately, instead of forcing the client to issue a follow-up GET.
+		syncedAt := time.Now()
+		user.LogtoID = &logtoUser.ID
+		user.LogtoSyncedAt = &syncedAt
+	}
+
+	// 8. Commit transaction
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	createdByUserID := ""
+	if creator != nil {
+		createdByUserID = creator.UserID
+	}
+	logger.Info().
+		Str("user_id", user.ID).
+		Str("username", user.Username).
+		Str("logto_user_id", logtoUser.ID).
+		Str("created_by", createdByUserID).
+		Msg("User created successfully with Logto sync")
+
+	// 9. Send welcome email with temporary password (non-blocking)
+	if req.Email != "" {
+		go func() {
+			welcomeService := email.NewWelcomeEmailService()
+
+			// Get enriched user data using existing repository logic
+			userRepo := entities.NewLocalUserRepository()
+			enrichedUser, err := userRepo.GetByID(logtoUser.ID)
+			if err != nil {
+				logger.Error().
+					Err(err).
+					Str("user_id", user.ID).
+					Str("username", user.Username).
+					Str("email", req.Email).
+					Msg("Failed to get enriched user data for welcome email")
+				return
+			}
+
+			// Extract organization data from enriched user object
+			orgName := "the organization" // fallback
+			orgType := ""
+			if enrichedUser.Organization != nil {
+				if enrichedUser.Organization.Name != "" {
+					orgName = enrichedUser.Organization.Name
+				}
+				// Determine organization type from the organization ID (best
+				// effort — the welcome email falls back to defaults on error)
+				if roleName, roleErr := s.determineOrganizationRoleName(enrichedUser.Organization.LogtoID); roleErr == nil {
+					orgType = roleName
+				}
+			}
+
+			// Extract user roles data from enriched user object
+			userRoles := make([]string, len(enrichedUser.Roles))
+			for i, role := range enrichedUser.Roles {
+				userRoles[i] = role.Name
+			}
+
+			// Determine the organization language for email localization
+			language := "it" // default language
+			if enrichedUser.Organization != nil {
+				language = s.getOrganizationLanguage(enrichedUser.Organization.LogtoID, orgType)
+			}
+
+			// Send welcome email using existing method
+			err = welcomeService.SendWelcomeEmail(
+				enrichedUser.Email,
+				enrichedUser.Name,
+				orgName,
+				orgType,
+				userRoles,
+				tempPassword,
+				language,
+			)
+
+			if err != nil {
+				logger.Error().
+					Err(err).
+					Str("user_id", enrichedUser.ID).
+					Str("username", enrichedUser.Username).
+					Str("email", req.Email).
+					Str("organization_name", orgName).
+					Strs("user_roles", userRoles).
+					Msg("Failed to send welcome email to user")
+			} else {
+				logger.Info().
+					Str("user_id", enrichedUser.ID).
+					Str("username", enrichedUser.Username).
+					Str("email", req.Email).
+					Str("organization_name", orgName).
+					Strs("user_roles", userRoles).
+					Msg("Welcome email sent successfully to user")
+			}
+		}()
+	}
+
+	return user, nil
+}
+
+// GetUser retrieves a user by ID with RBAC validation
+func (s *LocalUserService) GetUser(id, userOrgRole, userOrgID string) (*models.LocalUser, error) {
+	// Get the user first
+	user, err := s.userRepo.GetByID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate hierarchical access - user must be able to access the target user's organization
+	var targetUserOrgID string
+	if user.OrganizationID != nil {
+		targetUserOrgID = *user.OrganizationID
+	}
+
+	if canAccess, reason := s.CanAccessUser(userOrgRole, userOrgID, targetUserOrgID); !canAccess {
+		return nil, fmt.Errorf("access denied: %s", reason)
+	}
+
+	return user, nil
+}
+
+// GetUserByLogtoID retrieves a user by Logto ID (without RBAC validation, used for auth)
+func (s *LocalUserService) GetUserByLogtoID(logtoID string) (*models.LocalUser, error) {
+	return s.userRepo.GetByLogtoID(logtoID)
+}
+
+// IsUserActive reports whether the account may hold a session: it has no
+// local row (the bootstrap owner) or its row is neither soft-deleted nor
+// suspended. A lookup failure is an error, never "active".
+func (s *LocalUserService) IsUserActive(logtoID string) (bool, error) {
+	found, deleted, suspended, err := s.userRepo.LifecycleByLogtoID(logtoID)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return true, nil
+	}
+	return !deleted && !suspended, nil
+}
+
+// UpdateLatestLogin updates the latest_login_at timestamp for a user
+func (s *LocalUserService) UpdateLatestLogin(userID string) error {
+	return s.userRepo.UpdateLatestLogin(userID)
+}
+
+// ListUsers returns paginated list of users based on hierarchical RBAC
+func (s *LocalUserService) ListUsers(userOrgRole, userOrgID string, page, pageSize int, search, sortBy, sortDirection string, organizationFilter, statuses, roleFilter, createdByFilter []string) ([]*models.LocalUser, int, error) {
+	return s.userRepo.List(userOrgRole, userOrgID, page, pageSize, search, sortBy, sortDirection, organizationFilter, statuses, roleFilter, createdByFilter)
+}
+
+// GetTotals returns user totals (with enabled/suspended breakdown) based on hierarchical RBAC
+func (s *LocalUserService) GetTotals(userOrgRole, userOrgID string) (*models.UserTotals, error) {
+	return s.userRepo.GetTotals(userOrgRole, userOrgID)
+}
+
+// GetUsersTrend returns trend data for users over a specified period
+func (s *LocalUserService) GetUsersTrend(period int, userOrgRole, userOrgID string) (*models.TrendResponse, error) {
+	// Get trend data from repository
+	dataPoints, currentTotal, previousTotal, err := s.userRepo.GetTrend(userOrgRole, userOrgID, period)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert data points to model format
+	trendDataPoints := make([]models.TrendDataPoint, len(dataPoints))
+	for i, dp := range dataPoints {
+		trendDataPoints[i] = models.TrendDataPoint{
+			Date:  dp.Date,
+			Count: dp.Count,
+		}
+	}
+
+	// Calculate delta and percentage
+	delta := currentTotal - previousTotal
+	deltaPercentage := 0.0
+	if previousTotal > 0 {
+		deltaPercentage = (float64(delta) / float64(previousTotal)) * 100
+	}
+
+	// Determine trend direction
+	trend := "stable"
+	if delta > 0 {
+		trend = "up"
+	} else if delta < 0 {
+		trend = "down"
+	}
+
+	// Get period label
+	periodLabel := map[int]string{
+		7:   "7 days",
+		30:  "30 days",
+		180: "180 days",
+		365: "365 days",
+	}[period]
+
+	return &models.TrendResponse{
+		Period:          period,
+		PeriodLabel:     periodLabel,
+		CurrentTotal:    currentTotal,
+		PreviousTotal:   previousTotal,
+		Delta:           delta,
+		DeltaPercentage: deltaPercentage,
+		Trend:           trend,
+		DataPoints:      trendDataPoints,
+	}, nil
+}
+
+// UpdateUser updates a user locally and syncs to Logto. callerUserRoles are
+// the technical role names of the authenticated caller: updating users of the
+// Owner organization (or moving users into it) is restricted to the Owner user
+// role — every Owner-org member shares the same org role, so only the
+// technical role can tell the break-glass tier apart from Staff.
+func (s *LocalUserService) UpdateUser(id string, req *models.UpdateLocalUserRequest, updatedByUserID, updatedByOrgID, updatedByOrgRole string, callerUserRoles []string) (*models.LocalUser, error) {
+	// Normalize phone at the entry point so both the local DB write and the Logto
+	// call see the same shape (digits-only). The empty-string case is preserved —
+	// it signals an explicit "clear the phone".
+	if req.Phone != nil && *req.Phone != "" {
+		normalized := NormalizePhoneForLogto(*req.Phone)
+		req.Phone = &normalized
+	}
+
+	// 1. Get current user before update to detect organization changes and for validation
+	currentUser, err := s.userRepo.GetByID(id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current user for update: %w", err)
+	}
+
+	// Check if user is synced to Logto
+	if currentUser.LogtoID == nil {
+		return nil, fmt.Errorf("user not synced to Logto yet - missing logto_id")
+	}
+
+	// Security: an organization change must land inside the caller's own
+	// hierarchy. The handler's CanUpdateUser only vouches for the user's
+	// CURRENT organization; without this check a reseller Admin could lift a
+	// colleague into the parent distributor (or a sibling reseller) and have it
+	// inherit that organization's reach.
+	if req.OrganizationID != nil && (currentUser.OrganizationID == nil || *req.OrganizationID != *currentUser.OrganizationID) {
+		if canMove, reason := s.CanMoveUserToOrganization(updatedByOrgRole, updatedByOrgID, *req.OrganizationID); !canMove {
+			return nil, &ValidationError{
+				StatusCode: 403,
+				ErrorData: response.ErrorData{
+					Errors: []response.ValidationError{
+						{
+							Key:     "organization_id",
+							Message: reason,
+							Value:   *req.OrganizationID,
+						},
+					},
+				},
+			}
+		}
+	}
+
+	// 2. Validate changes in Logto FIRST (before consuming local resources)
+
+	// Security: Prevent updating users to reserved username "owner"
+	if req.Username != nil && strings.ToLower(*req.Username) == "owner" {
+		return nil, &ValidationError{
+			StatusCode: 400,
+			ErrorData: response.ErrorData{
+				Errors: []response.ValidationError{
+					{
+						Key:     "username",
+						Message: "username 'owner' is reserved and cannot be used",
+						Value:   *req.Username,
+					},
+				},
+			},
+		}
+	}
+
+	// Security: managing the Owner organization's membership (updating one of
+	// its users, or moving a user into it) is restricted to the Owner user
+	// role, and the resulting (organization, technical roles) combination must
+	// respect the pairing: Staff and owner-tier roles live only inside the
+	// Owner organization.
+	targetIsOwnerOrg := false
+	if req.OrganizationID != nil {
+		isOwnerOrg, err := s.isOwnerOrganization(*req.OrganizationID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to validate organization: %w", err)
+		}
+		targetIsOwnerOrg = isOwnerOrg
+	} else if currentUser.OrganizationID != nil && *currentUser.OrganizationID != "" {
+		// Org unchanged: the local tables are enough to recognise the Owner
+		// organization (the one absent from all three), no Logto round-trip.
+		// Fail-closed: a type the partner tables cannot vouch for (lookup
+		// error included) is treated as the Owner organization.
+		targetIsOwnerOrg = !models.IsPartnerOrgType(s.GetOrganizationType(*currentUser.OrganizationID))
+	}
+	currentIsOwnerOrg := currentUser.OrganizationID != nil && *currentUser.OrganizationID != "" &&
+		!models.IsPartnerOrgType(s.GetOrganizationType(*currentUser.OrganizationID))
+	if (targetIsOwnerOrg || currentIsOwnerOrg) && !models.HasOwnerUserRole(callerUserRoles) {
+		return nil, &ValidationError{
+			StatusCode: 403,
+			ErrorData: response.ErrorData{
+				Errors: []response.ValidationError{
+					{
+						Key:     "organization_id",
+						Message: "only the Owner role can manage users of the Owner organization",
+					},
+				},
+			},
+		}
+	}
+	if req.OrganizationID != nil || req.UserRoleIDs != nil {
+		// Validate the pairing on the effective state after the update.
+		effectiveRoleIDs := currentUser.UserRoleIDs
+		if req.UserRoleIDs != nil {
+			effectiveRoleIDs = *req.UserRoleIDs
+		}
+		if validationErr := s.validateOwnerOrgRolePairing(targetIsOwnerOrg, effectiveRoleIDs); validationErr != nil {
+			return nil, validationErr
+		}
+	}
+
+	updateReq := models.UpdateUserRequest{}
+	if req.Username != nil {
+		updateReq.Username = req.Username
+	}
+	if req.Name != nil {
+		updateReq.Name = req.Name
+	}
+	if req.Email != nil {
+		updateReq.PrimaryEmail = req.Email
+	}
+	if req.Phone != nil {
+		// req.Phone has already been normalized at the entry point of UpdateUser.
+		// Empty string is preserved as the "clear phone" signal.
+		updateReq.PrimaryPhone = req.Phone
+	}
+
+	// Update custom data with user info
+	// Start with existing custom data to preserve user-defined fields
+	customData := make(map[string]interface{})
+	if currentUser.CustomData != nil {
+		for k, v := range currentUser.CustomData {
+			customData[k] = v
+		}
+	}
+
+	// Merge user-provided custom data (allows users to update their custom fields)
+	if req.CustomData != nil {
+		for k, v := range *req.CustomData {
+			customData[k] = v
+		}
+	}
+
+	// System fields - these override any user-provided values and are always maintained
+	// Update organization if provided in request
+	if req.OrganizationID != nil {
+		customData["organizationId"] = req.OrganizationID
+	} else {
+		// Preserve existing organizationId
+		customData["organizationId"] = currentUser.OrganizationID
+	}
+
+	// Update user roles if provided in request
+	if req.UserRoleIDs != nil {
+		customData["userRoleIds"] = req.UserRoleIDs
+	} else {
+		// Preserve existing userRoleIds
+		customData["userRoleIds"] = currentUser.UserRoleIDs
+	}
+
+	// CRITICAL: Preserve original createdBy - never change it
+	if existingCreatedBy, exists := customData["createdBy"]; exists {
+		customData["createdBy"] = existingCreatedBy
+	} else {
+		// Fallback if somehow missing (should not happen in normal operation)
+		customData["createdBy"] = updatedByOrgID
+	}
+
+	// Add update tracking (these are additional fields, not replacements)
+	customData["updatedBy"] = updatedByOrgID
+	customData["updatedAt"] = time.Now().Format(time.RFC3339)
+
+	updateReq.CustomData = customData
+
+	// Try the update in Logto first for validation
+	_, err = s.logtoClient.UpdateUser(*currentUser.LogtoID, updateReq)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("user_id", id).
+			Str("username", currentUser.Username).
+			Msg("Failed to validate user update in Logto")
+
+		// Parse the error with context for better error handling
+		context := map[string]interface{}{
+			"email":    req.Email,
+			"phone":    req.Phone,
+			"username": req.Username,
+		}
+		parsedErr := s.parseLogtoError(err, context)
+
+		// No rollback needed since we haven't changed anything locally yet
+		return nil, fmt.Errorf("failed to validate user update in Logto: %w", parsedErr)
+	}
+
+	// 3. Begin transaction for local operations (after Logto validation passes)
+	tx, err := database.DB.Begin()
+	if err != nil {
+		// Revert the Logto changes since we can't proceed with local update
+		// We need to restore the original data in Logto
+		originalReq := models.UpdateUserRequest{
+			Username:     &currentUser.Username,
+			Name:         &currentUser.Name,
+			PrimaryEmail: &currentUser.Email,
+		}
+		if currentUser.Phone != nil {
+			originalReq.PrimaryPhone = currentUser.Phone
+		}
+		// Restore original custom data
+		originalCustomData := make(map[string]interface{})
+		if currentUser.CustomData != nil {
+			for k, v := range currentUser.CustomData {
+				originalCustomData[k] = v
+			}
+		}
+		originalReq.CustomData = originalCustomData
+
+		if _, revertErr := s.logtoClient.UpdateUser(*currentUser.LogtoID, originalReq); revertErr != nil {
+			logger.Warn().
+				Err(revertErr).
+				Str("user_id", id).
+				Msg("Failed to revert Logto changes after local transaction failure")
+		}
+
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 4. Update in local DB (after Logto validation passes)
+	user, err := s.userRepo.Update(id, req)
+	if err != nil {
+		// Revert the Logto changes since local update failed
+		originalReq := models.UpdateUserRequest{
+			Username:     &currentUser.Username,
+			Name:         &currentUser.Name,
+			PrimaryEmail: &currentUser.Email,
+		}
+		if currentUser.Phone != nil {
+			originalReq.PrimaryPhone = currentUser.Phone
+		}
+		// Restore original custom data
+		originalCustomData := make(map[string]interface{})
+		if currentUser.CustomData != nil {
+			for k, v := range currentUser.CustomData {
+				originalCustomData[k] = v
+			}
+		}
+		originalReq.CustomData = originalCustomData
+
+		if _, revertErr := s.logtoClient.UpdateUser(*currentUser.LogtoID, originalReq); revertErr != nil {
+			logger.Warn().
+				Err(revertErr).
+				Str("user_id", id).
+				Msg("Failed to revert Logto changes after local update failure")
+		}
+
+		// Transaction will be rolled back by defer
+		return nil, fmt.Errorf("failed to update user locally: %w", err)
+	}
+
+	// 5. Update user roles if provided
+	if req.UserRoleIDs != nil {
+		// Get current user roles from Logto to know what to remove
+		currentRoles, err := s.logtoClient.GetUserRoles(*user.LogtoID)
+		if err != nil {
+			logger.Warn().
+				Err(err).
+				Str("user_id", id).
+				Str("logto_user_id", *user.LogtoID).
+				Msg("Failed to get current user roles from Logto for update")
+		} else {
+			// Remove all current roles
+			if len(currentRoles) > 0 {
+				currentRoleIDs := make([]string, len(currentRoles))
+				for i, role := range currentRoles {
+					currentRoleIDs[i] = role.ID
+				}
+
+				err = s.logtoClient.RemoveUserRoles(*user.LogtoID, currentRoleIDs)
+				if err != nil {
+					logger.Error().
+						Err(err).
+						Str("user_id", id).
+						Str("logto_user_id", *user.LogtoID).
+						Strs("current_role_ids", currentRoleIDs).
+						Msg("Failed to remove current user roles from Logto")
+					// Continue anyway to try assigning new roles
+				} else {
+					logger.Info().
+						Str("user_id", id).
+						Str("logto_user_id", *user.LogtoID).
+						Strs("removed_role_ids", currentRoleIDs).
+						Msg("Current user roles removed successfully")
+				}
+			}
+		}
+
+		// Assign new roles if any
+		if len(*req.UserRoleIDs) > 0 {
+			err = s.logtoClient.AssignUserRoles(*user.LogtoID, *req.UserRoleIDs)
+			if err != nil {
+				logger.Error().
+					Err(err).
+					Str("user_id", id).
+					Str("logto_user_id", *user.LogtoID).
+					Strs("new_user_role_ids", *req.UserRoleIDs).
+					Msg("Failed to assign new user roles to Logto user")
+				// Don't fail the entire operation for role assignment issues
+			} else {
+				logger.Info().
+					Str("user_id", id).
+					Str("logto_user_id", *user.LogtoID).
+					Strs("new_user_role_ids", *req.UserRoleIDs).
+					Msg("New user roles assigned successfully")
+			}
+		}
+	}
+
+	// 6. Update organization assignment if provided
+	if req.OrganizationID != nil {
+		newOrgID := *req.OrganizationID
+
+		logger.Info().
+			Str("user_id", id).
+			Str("logto_user_id", *user.LogtoID).
+			Str("new_org_id", newOrgID).
+			Msg("Organization assignment update requested")
+
+		// IMPORTANT: Remove user from ALL organizations in Logto first (not just from old org in local DB)
+		// This ensures clean state even if there were inconsistencies
+		currentLogtoOrgs, err := s.logtoClient.GetUserOrganizations(*user.LogtoID)
+		if err != nil {
+			logger.Warn().
+				Err(err).
+				Str("user_id", id).
+				Str("logto_user_id", *user.LogtoID).
+				Msg("Failed to get current user organizations from Logto - attempting update anyway")
+		} else if len(currentLogtoOrgs) > 0 {
+			logger.Info().
+				Str("user_id", id).
+				Str("logto_user_id", *user.LogtoID).
+				Int("org_count", len(currentLogtoOrgs)).
+				Msg("Removing user from all current Logto organizations")
+
+			for _, logtoOrg := range currentLogtoOrgs {
+				oldOrgLogtoID := logtoOrg.ID
+				// Get current organization roles to remove them
+				oldOrgRoles, err := s.logtoClient.GetUserOrganizationRoles(oldOrgLogtoID, *user.LogtoID)
+				if err != nil {
+					logger.Warn().
+						Err(err).
+						Str("user_id", id).
+						Str("logto_user_id", *user.LogtoID).
+						Str("old_org_logto_id", oldOrgLogtoID).
+						Msg("Failed to get current organization roles for removal")
+				} else if len(oldOrgRoles) > 0 {
+					// Remove organization roles first (Logto requirement)
+					for _, role := range oldOrgRoles {
+						err = s.logtoClient.RemoveUserFromOrganizationRole(oldOrgLogtoID, *user.LogtoID, role.ID)
+						if err != nil {
+							logger.Warn().
+								Err(err).
+								Str("user_id", id).
+								Str("logto_user_id", *user.LogtoID).
+								Str("old_org_logto_id", oldOrgLogtoID).
+								Str("role_id", role.ID).
+								Msg("Failed to remove user from old organization role")
+						}
+					}
+				}
+
+				// Remove from organization
+				err = s.logtoClient.RemoveUserFromOrganization(oldOrgLogtoID, *user.LogtoID)
+				if err != nil {
+					logger.Warn().
+						Err(err).
+						Str("user_id", id).
+						Str("logto_user_id", *user.LogtoID).
+						Str("old_org_logto_id", oldOrgLogtoID).
+						Msg("Failed to remove user from old organization")
+				} else {
+					logger.Info().
+						Str("user_id", id).
+						Str("logto_user_id", *user.LogtoID).
+						Str("old_org_logto_id", oldOrgLogtoID).
+						Msg("User removed from old organization successfully")
+				}
+			}
+		}
+
+		// Add to new organization
+		if newOrgID != "" {
+			err = s.logtoClient.AssignUserToOrganization(newOrgID, *user.LogtoID)
+			if err != nil {
+				logger.Error().
+					Err(err).
+					Str("user_id", id).
+					Str("logto_user_id", *user.LogtoID).
+					Str("new_org_id", newOrgID).
+					Msg("Failed to assign user to new organization")
+			} else {
+				logger.Info().
+					Str("user_id", id).
+					Str("logto_user_id", *user.LogtoID).
+					Str("new_org_id", newOrgID).
+					Msg("User assigned to new organization successfully")
+
+				// Determine and assign new organization role
+				newOrgRoleName, roleErr := s.determineOrganizationRoleName(newOrgID)
+				if roleErr != nil {
+					logger.Error().
+						Err(roleErr).
+						Str("user_id", id).
+						Str("logto_user_id", *user.LogtoID).
+						Str("new_org_id", newOrgID).
+						Msg("Failed to determine new organization role")
+				}
+				if newOrgRoleName != "" {
+					// Get the organization role ID from Logto by name
+					newOrgRole, err := s.logtoClient.GetOrganizationRoleByName(newOrgRoleName)
+					if err != nil {
+						logger.Error().
+							Err(err).
+							Str("user_id", id).
+							Str("logto_user_id", *user.LogtoID).
+							Str("new_org_id", newOrgID).
+							Str("new_org_role_name", newOrgRoleName).
+							Msg("Failed to get new organization role from Logto")
+					} else {
+						// Assign new organization role
+						err = s.logtoClient.AssignOrganizationRolesToUser(newOrgID, *user.LogtoID, []string{newOrgRole.ID}, nil)
+						if err != nil {
+							logger.Error().
+								Err(err).
+								Str("user_id", id).
+								Str("logto_user_id", *user.LogtoID).
+								Str("new_org_id", newOrgID).
+								Str("new_org_role_name", newOrgRoleName).
+								Str("new_org_role_id", newOrgRole.ID).
+								Msg("Failed to assign new organization role to user")
+						} else {
+							logger.Info().
+								Str("user_id", id).
+								Str("logto_user_id", *user.LogtoID).
+								Str("new_org_id", newOrgID).
+								Str("new_org_role_name", newOrgRoleName).
+								Str("new_org_role_id", newOrgRole.ID).
+								Msg("New organization role assigned successfully")
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 7. Mark as synced
+	err = s.markUserSynced(database.DB, id, *user.LogtoID)
+	if err != nil {
+		logger.Warn().
+			Err(err).
+			Str("user_id", id).
+			Msg("Failed to mark user as synced after update")
+	}
+
+	// 8. Commit transaction
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	logger.Info().
+		Str("user_id", id).
+		Str("username", user.Username).
+		Str("updated_by", updatedByUserID).
+		Msg("User updated successfully with Logto sync")
+
+	// 9. Fetch updated user data from repository to return with fresh organization info
+	updatedUser, err := s.userRepo.GetByID(id)
+	if err != nil {
+		logger.Warn().
+			Err(err).
+			Str("user_id", id).
+			Msg("Failed to fetch updated user data - returning cached data")
+		return user, nil
+	}
+
+	return updatedUser, nil
+}
+
+// DeleteUser soft-deletes a user locally (no Logto deletion)
+func (s *LocalUserService) DeleteUser(id, deletedByUserID, deletedByOrgID string) error {
+	// Get user before deletion for logging
+	user, err := s.userRepo.GetByID(id)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Soft delete in local DB
+	err = s.userRepo.Delete(id)
+	if err != nil {
+		return fmt.Errorf("failed to delete user locally: %w", err)
+	}
+
+	logger.Info().
+		Str("user_id", id).
+		Str("username", user.Username).
+		Str("deleted_by", deletedByUserID).
+		Msg("User soft-deleted successfully")
+
+	return nil
+}
+
+// RestoreUser restores a soft-deleted user locally
+// RestoreUser restores a soft-deleted user. restoredByUserRoles are the
+// caller's technical role names: restoring an Owner-organization user is
+// restricted to the Owner user role.
+func (s *LocalUserService) RestoreUser(id, restoredByUserID, restoredByOrgID, restoredByOrgRole string, restoredByUserRoles []string) error {
+	// Get user including deleted
+	user, err := s.userRepo.GetByIDIncludeDeleted(id)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	if user.DeletedAt == nil {
+		return fmt.Errorf("user is not deleted")
+	}
+
+	// Verify RBAC permissions (hierarchy check). The user's organization may
+	// itself be soft-deleted (org deletion cascades to its users), so archived
+	// orgs must still count as part of the hierarchy here.
+	if user.OrganizationID != nil {
+		if !s.IsOrganizationInHierarchyIncludeDeleted(restoredByOrgRole, restoredByOrgID, *user.OrganizationID) {
+			return fmt.Errorf("access denied: insufficient permissions to restore this user")
+		}
+
+		// Guard: never restore a user into an org that is still archived — it
+		// would leave an active user referencing a deleted org. Restoring the
+		// org already brings its users back via cascade.
+		var orgArchived bool
+		query := `
+			SELECT EXISTS(
+				SELECT 1 FROM distributors WHERE logto_id = $1 AND deleted_at IS NOT NULL
+				UNION ALL
+				SELECT 1 FROM resellers WHERE logto_id = $1 AND deleted_at IS NOT NULL
+				UNION ALL
+				SELECT 1 FROM customers WHERE logto_id = $1 AND deleted_at IS NOT NULL
+			)
+		`
+		if err := database.DB.QueryRow(query, *user.OrganizationID).Scan(&orgArchived); err != nil {
+			return fmt.Errorf("failed to check organization status: %w", err)
+		}
+		if orgArchived {
+			return fmt.Errorf("organization is deleted and must be restored first")
+		}
+
+		// Owner-organization membership stays an Owner-role exclusive: Staff
+		// cannot restore other Owner-organization users. Fail-closed: a type
+		// the partner tables cannot vouch for counts as the Owner organization
+		// (the org is alive here — the archived case returned above).
+		if !models.IsPartnerOrgType(s.GetOrganizationType(*user.OrganizationID)) && !models.HasOwnerUserRole(restoredByUserRoles) {
+			return fmt.Errorf("access denied: only the Owner role can restore users in the Owner organization")
+		}
+	}
+
+	if user.LogtoID == nil {
+		return fmt.Errorf("user has no logto_id")
+	}
+
+	// Restore the user locally
+	err = s.userRepo.Restore(*user.LogtoID)
+	if err != nil {
+		return fmt.Errorf("failed to restore user: %w", err)
+	}
+
+	logger.Info().
+		Str("user_id", id).
+		Str("username", user.Username).
+		Str("restored_by", restoredByUserID).
+		Msg("User restored successfully")
+
+	return nil
+}
+
+// DestroyUser permanently deletes a user from DB and Logto
+func (s *LocalUserService) DestroyUser(id, destroyedByUserID, destroyedByOrgID, destroyedByOrgRole string) error {
+	// Get user including deleted
+	user, err := s.userRepo.GetByIDIncludeDeleted(id)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Verify RBAC permissions (hierarchy check, including soft-deleted orgs —
+	// see RestoreUser)
+	if user.OrganizationID != nil {
+		if !s.IsOrganizationInHierarchyIncludeDeleted(destroyedByOrgRole, destroyedByOrgID, *user.OrganizationID) {
+			return fmt.Errorf("access denied: insufficient permissions to destroy this user")
+		}
+	}
+
+	if user.LogtoID == nil {
+		return fmt.Errorf("user has no logto_id")
+	}
+
+	// 1. Hard-delete from DB
+	err = s.userRepo.HardDelete(*user.LogtoID)
+	if err != nil {
+		return fmt.Errorf("failed to hard-delete user from DB: %w", err)
+	}
+
+	// 2. Delete from Logto
+	err = s.logtoClient.DeleteUser(*user.LogtoID)
+	if err != nil {
+		logger.Warn().
+			Err(err).
+			Str("user_id", id).
+			Str("logto_id", *user.LogtoID).
+			Msg("Failed to delete user from Logto (user already removed from DB)")
+	}
+
+	logger.Info().
+		Str("user_id", id).
+		Str("username", user.Username).
+		Str("destroyed_by", destroyedByUserID).
+		Msg("User permanently destroyed")
+
+	return nil
+}
+
+// ResetUserPassword resets a user's password with Logto validation
+func (s *LocalUserService) ResetUserPassword(userID, password string) error {
+	err := s.logtoClient.ResetUserPassword(userID, password)
+	if err != nil {
+		// Parse the error with context for better error handling
+		context := map[string]interface{}{
+			"password": password,
+		}
+		parsedErr := s.parseLogtoError(err, context)
+		return parsedErr
+	}
+	return nil
+}
+
+// CanCreateUser validates if a user can create another user based on hierarchical permissions
+func (s *LocalUserService) CanCreateUser(userOrgRole, userOrgID string, req *models.CreateLocalUserRequest) (bool, string) {
+	switch userOrgRole {
+	case "owner":
+		return true, ""
+	case "distributor":
+		// Distributor can create users in organizations they manage hierarchically
+		if req.OrganizationID != nil {
+			if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, *req.OrganizationID) {
+				return true, ""
+			}
+		}
+		return false, "distributors can only create users in organizations they manage"
+	case "reseller":
+		// Reseller can create users in organizations they manage hierarchically
+		if req.OrganizationID != nil {
+			if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, *req.OrganizationID) {
+				return true, ""
+			}
+		}
+		return false, "resellers can only create users in their own organization or customers they manage"
+	case "customer":
+		// Customer can only create users in their own organization
+		if req.OrganizationID != nil && *req.OrganizationID == userOrgID {
+			return true, ""
+		}
+		return false, "customers can only create users in their own organization"
+	default:
+		return false, "insufficient permissions to create users"
+	}
+}
+
+// CanMoveUserToOrganization validates the destination of an organization
+// change (PUT /users/:id with organization_id). It mirrors CanCreateUser: the
+// caller must be entitled to place a user in the destination, otherwise
+// moving an existing one there would be a way around that rule. Customers
+// never move users: their only reachable organization is their own.
+func (s *LocalUserService) CanMoveUserToOrganization(userOrgRole, userOrgID, destinationOrgID string) (bool, string) {
+	if destinationOrgID == "" {
+		return false, "destination organization required"
+	}
+	switch strings.ToLower(userOrgRole) {
+	case "owner":
+		return true, ""
+	case "distributor":
+		if s.IsOrganizationInHierarchy("distributor", userOrgID, destinationOrgID) {
+			return true, ""
+		}
+		return false, "distributors can only move users to organizations they manage"
+	case "reseller":
+		if s.IsOrganizationInHierarchy("reseller", userOrgID, destinationOrgID) {
+			return true, ""
+		}
+		return false, "resellers can only move users to their own organization or customers they manage"
+	case "customer":
+		return false, "customers cannot move users to another organization"
+	default:
+		return false, "insufficient permissions to move users"
+	}
+}
+
+// CanReadUser validates if a user can read another user's details based on
+// hierarchical permissions.
+//
+// Read access follows the same hierarchy as update: GET /users already lists
+// these users through helpers.AppendOrgFilter, so a narrower rule here would
+// contradict the list — a reseller would see a user of its own customer in the
+// list and get 403 on its detail.
+func (s *LocalUserService) CanReadUser(userOrgRole, userOrgID, targetUserOrgID string) (bool, string) {
+	switch userOrgRole {
+	case "owner":
+		return true, ""
+	case "distributor":
+		// Distributor can read users in organizations they manage hierarchically
+		if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, targetUserOrgID) {
+			return true, ""
+		}
+		return false, "distributors can only read users in organizations they manage"
+	case "reseller":
+		// Reseller can read users in organizations they manage hierarchically
+		if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, targetUserOrgID) {
+			return true, ""
+		}
+		return false, "resellers can only read users in their own organization or customers they manage"
+	case "customer":
+		// Customer can only read users in their own organization
+		if targetUserOrgID == userOrgID {
+			return true, ""
+		}
+		return false, "customers can only read users in their own organization"
+	default:
+		return false, "insufficient permissions to read users"
+	}
+}
+
+// CanUpdateUser validates if a user can update another user based on hierarchical permissions
+func (s *LocalUserService) CanUpdateUser(userOrgRole, userOrgID, targetUserOrgID string) (bool, string) {
+	switch userOrgRole {
+	case "owner":
+		return true, ""
+	case "distributor":
+		// Distributor can update users in organizations they manage hierarchically
+		if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, targetUserOrgID) {
+			return true, ""
+		}
+		return false, "distributors can only update users in organizations they manage"
+	case "reseller":
+		// Reseller can update users in organizations they manage hierarchically
+		if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, targetUserOrgID) {
+			return true, ""
+		}
+		return false, "resellers can only update users in their own organization or customers they manage"
+	case "customer":
+		// Customer can only update users in their own organization
+		if targetUserOrgID == userOrgID {
+			return true, ""
+		}
+		return false, "customers can only update users in their own organization"
+	default:
+		return false, "insufficient permissions to update users"
+	}
+}
+
+// CanDeleteUser validates if a user can delete another user based on hierarchical permissions
+func (s *LocalUserService) CanDeleteUser(userOrgRole, userOrgID, targetUserOrgID string) (bool, string) {
+	switch userOrgRole {
+	case "owner":
+		return true, ""
+	case "distributor":
+		// Distributor can delete users in organizations they manage hierarchically
+		if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, targetUserOrgID) {
+			return true, ""
+		}
+		return false, "distributors can only delete users in organizations they manage"
+	case "reseller":
+		// Reseller can delete users in organizations they manage hierarchically
+		if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, targetUserOrgID) {
+			return true, ""
+		}
+		return false, "resellers can only delete users in their own organization or customers they manage"
+	case "customer":
+		// Customer can only delete users in their own organization
+		if targetUserOrgID == userOrgID {
+			return true, ""
+		}
+		return false, "customers can only delete users in their own organization"
+	default:
+		return false, "insufficient permissions to delete users"
+	}
+}
+
+// CanSuspendUser checks if the user can suspend another user based on RBAC hierarchy
+func (s *LocalUserService) CanSuspendUser(userOrgRole, userOrgID, targetUserOrgID string) (bool, string) {
+	// First check: verify the target organization type is manageable by the user's role
+	// This prevents users from suspending users in higher-level organizations
+	// Only perform this check if the database is available
+	if database.DB != nil {
+		targetOrgType := s.GetOrganizationType(targetUserOrgID)
+		if !s.CanAccessOrgType(userOrgRole, targetOrgType) {
+			return false, "cannot suspend users in higher-level organizations"
+		}
+	}
+
+	// Second check: verify the specific organization is in the user's hierarchy
+	switch userOrgRole {
+	case "owner":
+		return true, ""
+	case "distributor":
+		// Distributor can suspend users in organizations they manage hierarchically
+		if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, targetUserOrgID) {
+			return true, ""
+		}
+		return false, "distributors can only suspend users in organizations they manage"
+	case "reseller":
+		// Reseller can suspend users in organizations they manage hierarchically
+		if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, targetUserOrgID) {
+			return true, ""
+		}
+		return false, "resellers can only suspend users in their own organization or customers they manage"
+	case "customer":
+		// Customer can only suspend users in their own organization
+		if targetUserOrgID == userOrgID {
+			return true, ""
+		}
+		return false, "customers can only suspend users in their own organization"
+	default:
+		return false, "insufficient permissions to suspend users"
+	}
+}
+
+// CanAccessUser validates if a user can access another user based on hierarchical permissions
+func (s *LocalUserService) CanAccessUser(userOrgRole, userOrgID, targetUserOrgID string) (bool, string) {
+	switch userOrgRole {
+	case "owner":
+		return true, ""
+	case "distributor":
+		// Distributor can access users in organizations they manage hierarchically
+		if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, targetUserOrgID) {
+			return true, ""
+		}
+		return false, "distributors can only access users in organizations they manage"
+	case "reseller":
+		// Reseller can access users in organizations they manage hierarchically
+		if s.IsOrganizationInHierarchy(userOrgRole, userOrgID, targetUserOrgID) {
+			return true, ""
+		}
+		return false, "resellers can only access users in their own organization or customers they manage"
+	case "customer":
+		// Customer can only access users in their own organization
+		if targetUserOrgID == userOrgID {
+			return true, ""
+		}
+		return false, "customers can only access users in their own organization"
+	default:
+		return false, "insufficient permissions to access users"
+	}
+}
+
+// IsOrganizationInHierarchy checks if targetOrgID is in the hierarchy under userOrgID.
+// Soft-deleted organizations are excluded from the hierarchy.
+func (s *LocalUserService) IsOrganizationInHierarchy(userOrgRole, userOrgID, targetOrgID string) bool {
+	return s.isOrganizationInHierarchy(userOrgRole, userOrgID, targetOrgID, false)
+}
+
+// IsOrganizationInHierarchyIncludeDeleted checks hierarchy membership including
+// soft-deleted organizations. Restore/destroy flows must use this variant: their
+// target is deleted by definition, so the default check would always deny it.
+func (s *LocalUserService) IsOrganizationInHierarchyIncludeDeleted(userOrgRole, userOrgID, targetOrgID string) bool {
+	return s.isOrganizationInHierarchy(userOrgRole, userOrgID, targetOrgID, true)
+}
+
+func (s *LocalUserService) isOrganizationInHierarchy(userOrgRole, userOrgID, targetOrgID string, includeDeleted bool) bool {
+	if userOrgID == targetOrgID {
+		return true // Direct match
+	}
+
+	// Ownership (custom_data->>'createdBy') is unaffected by soft-delete; the
+	// deleted_at filters only decide whether archived orgs count as reachable.
+	delFilter := " AND deleted_at IS NULL"
+	joinDelFilter := " AND c.deleted_at IS NULL AND r.deleted_at IS NULL"
+	if includeDeleted {
+		delFilter = ""
+		joinDelFilter = ""
+	}
+
+	switch userOrgRole {
+	case "owner":
+		// Owner-organization roles can reach everything, but validate the
+		// organization exists
+		if database.DB == nil {
+			return false
+		}
+		var count int
+		query := `
+			SELECT COUNT(*) FROM (
+				SELECT 1 FROM distributors WHERE logto_id = $1` + delFilter + `
+				UNION ALL
+				SELECT 1 FROM resellers WHERE logto_id = $1` + delFilter + `
+				UNION ALL
+				SELECT 1 FROM customers WHERE logto_id = $1` + delFilter + `
+			) orgs
+		`
+		err := database.DB.QueryRow(query, targetOrgID).Scan(&count)
+		if err == nil && count > 0 {
+			return true
+		}
+		// Also allow Owner's own organization (direct match already handled above,
+		// but the owner org is not in distributors/resellers/customers tables)
+		return targetOrgID == userOrgID
+
+	case "distributor":
+		// Distributor can manage:
+		// 1. Their own organization
+		// 2. Resellers created by them
+		// 3. Customers created by them or their resellers
+		var exists bool
+		query := `
+			SELECT EXISTS(
+				SELECT 1 FROM resellers WHERE logto_id = $1 AND custom_data->>'createdBy' = $2` + delFilter + `
+				UNION ALL
+				SELECT 1 FROM customers WHERE logto_id = $1 AND custom_data->>'createdBy' = $2` + delFilter + `
+				UNION ALL
+				SELECT 1 FROM customers c JOIN resellers r ON c.custom_data->>'createdBy' = r.logto_id
+				WHERE c.logto_id = $1 AND r.custom_data->>'createdBy' = $2` + joinDelFilter + `
+			)
+		`
+		err := database.DB.QueryRow(query, targetOrgID, userOrgID).Scan(&exists)
+		if err == nil && exists {
+			return true
+		}
+
+	case "reseller":
+		// Reseller can manage:
+		// 1. Their own organization
+		// 2. Customers created by them
+
+		// Check if target is a customer created by this reseller
+		var count int
+		query := `SELECT COUNT(*) FROM customers WHERE logto_id = $1 AND custom_data->>'createdBy' = $2` + delFilter
+		err := database.DB.QueryRow(query, targetOrgID, userOrgID).Scan(&count)
+		if err == nil && count > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// GetOrganizationType determines the type of organization based on its ID
+// Returns "distributor", "reseller", "customer", or "owner" (if not found in any table)
+// Uses a single optimized query with EXISTS for better performance
+func (s *LocalUserService) GetOrganizationType(orgID string) string {
+	if orgID == "" || database.DB == nil {
+		return "owner" // Empty org ID or no DB is treated as owner-level for safety
+	}
+
+	var orgType string
+	query := `
+		SELECT CASE
+			WHEN EXISTS (SELECT 1 FROM distributors WHERE logto_id = $1 AND deleted_at IS NULL) THEN 'distributor'
+			WHEN EXISTS (SELECT 1 FROM resellers WHERE logto_id = $1 AND deleted_at IS NULL) THEN 'reseller'
+			WHEN EXISTS (SELECT 1 FROM customers WHERE logto_id = $1 AND deleted_at IS NULL) THEN 'customer'
+			ELSE 'owner'
+		END
+	`
+	err := database.DB.QueryRow(query, orgID).Scan(&orgType)
+	if err != nil {
+		// Fail closed: an unknown type denies every CanAccessOrgType check
+		// (the old fallback silently granted owner-level to the target).
+		return ""
+	}
+	return orgType
+}
+
+// CanAccessOrgType checks if userOrgRole can manage targetOrgType based on role hierarchy
+// Hierarchy: owner > distributor > reseller > customer
+func (s *LocalUserService) CanAccessOrgType(userOrgRole, targetOrgType string) bool {
+	hierarchy := map[string]int{
+		"owner":       4,
+		"distributor": 3,
+		"reseller":    2,
+		"customer":    1,
+	}
+
+	userLevel, ok := hierarchy[userOrgRole]
+	if !ok {
+		return false
+	}
+
+	targetLevel, ok := hierarchy[targetOrgType]
+	if !ok {
+		return false
+	}
+
+	// User can manage targets at or below their level
+	return userLevel >= targetLevel
+}
+
+// GetHierarchicalOrganizationIDs returns all organization IDs that the user can manage
+func (s *LocalUserService) GetHierarchicalOrganizationIDs(userOrgRole, userOrgID string) ([]string, error) {
+	return s.userRepo.GetHierarchicalOrganizationIDs(userOrgRole, userOrgID)
+}
+
+// SuspendUser suspends a user both locally and in Logto
+func (s *LocalUserService) SuspendUser(id, suspendedByUserID, suspendedByOrgID string) error {
+	tx, err := database.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Get user before suspension for logging and logto_id
+	user, err := s.userRepo.GetByID(id)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// 1. Suspend in local DB first
+	err = s.userRepo.SuspendUser(id)
+	if err != nil {
+		return fmt.Errorf("failed to suspend user locally: %w", err)
+	}
+
+	// 2. Suspend in Logto using logto_id
+	if user.LogtoID != nil {
+		err = s.logtoClient.SuspendUser(*user.LogtoID)
+		if err != nil {
+			logger.Logger.Error().
+				Str("component", "user-service").
+				Str("action", "suspend-user").
+				Str("user_id", id).
+				Str("logto_id", *user.LogtoID).
+				Err(err).
+				Msg("Failed to suspend user in Logto, local suspension rolled back")
+			return fmt.Errorf("failed to suspend user in Logto: %w", err)
+		}
+	}
+
+	// Commit transaction
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("failed to commit suspension transaction: %w", err)
+	}
+
+	logger.Logger.Info().
+		Str("component", "user-service").
+		Str("action", "suspend-user").
+		Str("user_id", id).
+		Str("username", user.Username).
+		Str("suspended_by_user_id", suspendedByUserID).
+		Str("suspended_by_org_id", suspendedByOrgID).
+		Msg("User suspended successfully")
+
+	return nil
+}
+
+// ReactivateUser reactivates a suspended user both locally and in Logto
+func (s *LocalUserService) ReactivateUser(id, reactivatedByUserID, reactivatedByOrgID string) error {
+	tx, err := database.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Get user before reactivation for logging and logto_id
+	user, err := s.userRepo.GetByID(id)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// 1. Reactivate in local DB first
+	err = s.userRepo.ReactivateUser(id)
+	if err != nil {
+		return fmt.Errorf("failed to reactivate user locally: %w", err)
+	}
+
+	// 2. Reactivate in Logto using logto_id
+	if user.LogtoID != nil {
+		err = s.logtoClient.ReactivateUser(*user.LogtoID)
+		if err != nil {
+			logger.Logger.Error().
+				Str("component", "user-service").
+				Str("action", "reactivate-user").
+				Str("user_id", id).
+				Str("logto_id", *user.LogtoID).
+				Err(err).
+				Msg("Failed to reactivate user in Logto, local reactivation rolled back")
+			return fmt.Errorf("failed to reactivate user in Logto: %w", err)
+		}
+	}
+
+	// Commit transaction
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("failed to commit reactivation transaction: %w", err)
+	}
+
+	logger.Logger.Info().
+		Str("component", "user-service").
+		Str("action", "reactivate-user").
+		Str("user_id", id).
+		Str("username", user.Username).
+		Str("reactivated_by_user_id", reactivatedByUserID).
+		Str("reactivated_by_org_id", reactivatedByOrgID).
+		Msg("User reactivated successfully")
+
+	return nil
+}
+
+// =============================================================================
+// PRIVATE METHODS
+// =============================================================================
+
+// sqlExecer is satisfied by *sql.DB and *sql.Tx so a write can run either
+// standalone or inside a caller's transaction.
+type sqlExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// markUserSynced marks a user as synced with Logto. The executor lets the create
+// flow run this UPDATE inside its transaction so the logto_id is committed
+// atomically with the user row.
+func (s *LocalUserService) markUserSynced(exec sqlExecer, id, logtoID string) error {
+	query := `UPDATE users SET logto_id = $1, logto_synced_at = $2 WHERE id = $3`
+	_, err := exec.Exec(query, logtoID, time.Now(), id)
+	return err
+}
+
+// NormalizePhoneForLogto keeps only the decimal digits of `phone` and drops
+// everything else (the leading `+`, spaces, tabs, dots, dashes, parentheses, …)
+// so that every path that hands a phone over to Logto (single create, single
+// update, account self-service, CSV bulk import) feeds Logto the same shape
+// it expects: digits only.
+//
+// Example: "+39 333 1234567" -> "393331234567", "(+39) 333.123-4567" -> "393331234567"
+func NormalizePhoneForLogto(phone string) string {
+	var b strings.Builder
+	b.Grow(len(phone))
+	for _, r := range phone {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// generateUsernameFromEmail converts email to valid Logto username format with conflict resolution
+func (s *LocalUserService) generateUsernameFromEmail(email string) string {
+	baseUsername := s.generateBaseUsernameFromEmail(email)
+
+	// Check for username conflicts and add suffix if needed
+	username := baseUsername
+	suffix := 1
+
+	for s.isUsernameExists(username) {
+		username = fmt.Sprintf("%s_%d", baseUsername, suffix)
+		suffix++
+
+		// Safety check to prevent infinite loop (very unlikely but defensive)
+		if suffix > 1000 {
+			// Use a timestamp-based suffix as ultimate fallback
+			username = fmt.Sprintf("%s_%d", baseUsername, time.Now().Unix())
+			break
+		}
+	}
+
+	return username
+}
+
+// generateBaseUsernameFromEmail converts email to valid Logto username format (without conflict resolution)
+func (s *LocalUserService) generateBaseUsernameFromEmail(email string) string {
+	// Take the local part of email (before @)
+	localPart := strings.Split(email, "@")[0]
+
+	// Replace invalid characters with underscores
+	reg := regexp.MustCompile(`[^A-Za-z0-9_]`)
+	baseUsername := reg.ReplaceAllString(localPart, "_")
+
+	// Ensure it starts with letter or underscore
+	if len(baseUsername) > 0 && !regexp.MustCompile(`^[A-Za-z_]`).MatchString(baseUsername) {
+		baseUsername = "_" + baseUsername
+	}
+
+	// Ensure it's not empty (fallback)
+	if baseUsername == "" {
+		baseUsername = "user_" + strings.ReplaceAll(email, "@", "_at_")
+		baseUsername = reg.ReplaceAllString(baseUsername, "_")
+	}
+
+	return baseUsername
+}
+
+// isUsernameExists checks if a username already exists in the local database.
+// Soft-deleted users are included on purpose: they still exist in Logto (only
+// DestroyUser removes them there), so their username is still taken and Logto
+// would reject a new user reusing it.
+func (s *LocalUserService) isUsernameExists(username string) bool {
+	var count int
+	query := `SELECT COUNT(*) FROM users WHERE username = $1`
+	err := database.DB.QueryRow(query, username).Scan(&count)
+	if err != nil {
+		logger.Warn().
+			Err(err).
+			Str("username", username).
+			Msg("Failed to check username existence, assuming it exists for safety")
+		return true // Assume it exists for safety
+	}
+	return count > 0
+}
+
+// parseLogtoError parses Logto API errors and returns a ValidationError for client errors
+func (s *LocalUserService) parseLogtoError(err error, context map[string]interface{}) error {
+	if err == nil {
+		return nil
+	}
+
+	errorStr := err.Error()
+
+	// Check if it's a Logto API error with status code
+	if strings.Contains(errorStr, "status ") {
+		// Extract status code and JSON body
+		parts := strings.Split(errorStr, "status ")
+		if len(parts) >= 2 {
+			statusAndBody := parts[len(parts)-1]
+			colonIndex := strings.Index(statusAndBody, ": ")
+			if colonIndex > 0 {
+				statusStr := statusAndBody[:colonIndex]
+				jsonBody := statusAndBody[colonIndex+2:]
+
+				// Parse status code
+				var statusCode int
+				if _, parseErr := fmt.Sscanf(statusStr, "%d", &statusCode); parseErr == nil {
+					// Check if it's a client error (4xx)
+					if statusCode >= 400 && statusCode < 500 {
+						// Parse JSON error body
+						var logtoError interface{}
+						if jsonErr := json.Unmarshal([]byte(jsonBody), &logtoError); jsonErr == nil {
+							// Use existing response package to normalize Logto error
+							errorData := response.NormalizeLogtoErrorWithContext(logtoError, context)
+
+							return &ValidationError{
+								StatusCode: statusCode,
+								ErrorData:  errorData,
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Return original error if not parseable or not a client error
+	return err
+}
+
+// determineOrganizationRoleName determines the organization role name based on
+// organization type in database. Every member of the Owner organization (the
+// one absent from all three partner tables) gets the "Owner" org role: the
+// Owner/Staff distinction lives entirely on the technical (user) roles.
+func (s *LocalUserService) determineOrganizationRoleName(organizationID string) (string, error) {
+	var orgType string
+	query := `
+		SELECT CASE
+			WHEN EXISTS (SELECT 1 FROM distributors WHERE logto_id = $1 AND deleted_at IS NULL) THEN 'distributor'
+			WHEN EXISTS (SELECT 1 FROM resellers WHERE logto_id = $1 AND deleted_at IS NULL) THEN 'reseller'
+			WHEN EXISTS (SELECT 1 FROM customers WHERE logto_id = $1 AND deleted_at IS NULL) THEN 'customer'
+			ELSE 'owner'
+		END
+	`
+	err := database.DB.QueryRow(query, organizationID).Scan(&orgType)
+	if err != nil {
+		// Fail closed: never guess an org role (the old fallback silently
+		// handed out "Owner").
+		return "", fmt.Errorf("failed to determine organization type: %w", err)
+	}
+
+	roleNames := map[string]string{
+		"distributor": "Distributor",
+		"reseller":    "Reseller",
+		"customer":    "Customer",
+		"owner":       "Owner",
+	}
+	return roleNames[orgType], nil
+}
+
+// validateOwnerOrgRolePairing enforces the pairing between the Owner
+// organization and its technical roles: the "Owner" role is never assignable
+// (it belongs to the bootstrap owner account only, seeded at init); inside the
+// Owner organization only "Staff" is assignable; "Staff" is never assignable
+// outside it.
+func (s *LocalUserService) validateOwnerOrgRolePairing(targetIsOwnerOrg bool, userRoleIDs []string) *ValidationError {
+	if len(userRoleIDs) == 0 {
+		return nil
+	}
+	names := cache.GetRoleNames().GetNames(userRoleIDs)
+
+	// Fail closed in every branch: an id the role cache cannot resolve (stale
+	// cache, role created after startup) must not slip past the name checks.
+	if len(names) != len(userRoleIDs) {
+		return &ValidationError{
+			StatusCode: 400,
+			ErrorData: response.ErrorData{
+				Errors: []response.ValidationError{
+					{Key: "user_role_ids", Message: "unable to validate roles"},
+				},
+			},
+		}
+	}
+
+	for _, name := range names {
+		if strings.EqualFold(name, models.OwnerUserRole) {
+			return &ValidationError{
+				StatusCode: 400,
+				ErrorData: response.ErrorData{
+					Errors: []response.ValidationError{
+						{
+							Key:     "user_role_ids",
+							Message: "the Owner role cannot be assigned",
+							Value:   name,
+						},
+					},
+				},
+			}
+		}
+	}
+
+	if targetIsOwnerOrg {
+		// Every role must be Staff.
+		for _, name := range names {
+			if !strings.EqualFold(name, models.StaffUserRole) {
+				return &ValidationError{
+					StatusCode: 400,
+					ErrorData: response.ErrorData{
+						Errors: []response.ValidationError{
+							{
+								Key:     "user_role_ids",
+								Message: "only the Staff role can be assigned in the Owner organization",
+								Value:   name,
+							},
+						},
+					},
+				}
+			}
+		}
+		return nil
+	}
+
+	for _, name := range names {
+		if strings.EqualFold(name, models.StaffUserRole) {
+			return &ValidationError{
+				StatusCode: 400,
+				ErrorData: response.ErrorData{
+					Errors: []response.ValidationError{
+						{
+							Key:     "user_role_ids",
+							Message: "this role can only be assigned to users of the Owner organization",
+							Value:   name,
+						},
+					},
+				},
+			}
+		}
+	}
+	return nil
+}
+
+// getOrganizationLanguage fetches the language from an organization's custom_data JSONB column.
+// It queries the correct table (distributors/resellers/customers) based on orgType.
+// Returns "it" as the default language if not set or on error.
+func (s *LocalUserService) getOrganizationLanguage(organizationID, orgType string) string {
+	var tableName string
+	switch strings.ToLower(orgType) {
+	case "distributor":
+		tableName = "distributors"
+	case "reseller":
+		tableName = "resellers"
+	case "customer":
+		tableName = "customers"
+	default:
+		return "it"
+	}
+
+	var language *string
+	//nolint:gosec // tableName is from a hardcoded switch, not user input
+	query := fmt.Sprintf(
+		`SELECT custom_data->>'language' FROM %s WHERE logto_id = $1 AND deleted_at IS NULL`,
+		tableName,
+	)
+	err := database.DB.QueryRow(query, organizationID).Scan(&language)
+	if err != nil || language == nil || *language == "" {
+		return "it"
+	}
+	return *language
+}
+
+// isOwnerOrganization checks if the given organization ID belongs to the Owner organization
+// by verifying with Logto API if the organization name is "Owner"
+func (s *LocalUserService) isOwnerOrganization(organizationID string) (bool, error) {
+	// The Owner organization is the one that exists in Logto only: no row in
+	// any of the three partner tables. Identity, not display name — a partner
+	// organization named "Owner", or a rename of the Owner organization in
+	// Logto, must not move this gate. Same oracle as every other Owner-org
+	// check (models.IsPartnerOrgType), fail-closed on lookup errors.
+	if organizationID == "" {
+		return false, fmt.Errorf("organization id required")
+	}
+	return !models.IsPartnerOrgType(s.GetOrganizationType(organizationID)), nil
+}

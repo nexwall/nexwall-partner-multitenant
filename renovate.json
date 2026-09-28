@@ -1,0 +1,37 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["local>NethServer/.github:vue3"],
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "lockFileMaintenance": {
+    "schedule": [
+      "before 6am on monday"
+    ]
+  },
+  "ignoreTests": false,
+  "packageRules": [
+    {
+      "description": "Docusaurus requires all @docusaurus/* packages at the same version",
+      "matchPackagePrefixes": ["@docusaurus/"],
+      "groupName": "docusaurus"
+    },
+    {
+      "description": "Automerge patch updates",
+      "matchUpdateTypes": ["patch"],
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Automerge minor updates only if tests pass",
+      "matchUpdateTypes": ["minor"],
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Do not automerge major updates",
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    }
+  ]
+}

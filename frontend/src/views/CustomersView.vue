@@ -1,0 +1,180 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { NeButton, NeDropdown, NeHeading } from '@nethesis/vue-components'
+import CustomersTable from '@/components/customers/CustomersTable.vue'
+import ImportOrganizationsModal from '@/components/organizations/ImportOrganizationsModal.vue'
+import { ref } from 'vue'
+import {
+  faChevronDown,
+  faCircleArrowUp,
+  faCirclePlus,
+  faFileCsv,
+  faFilePdf,
+} from '@fortawesome/free-solid-svg-icons'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import { canManageCustomers } from '@/lib/permissions'
+import { useCustomers } from '@/queries/organizations/customers'
+import { useI18n } from 'vue-i18n'
+import {
+  getExport,
+  getImportTemplate,
+  validateCustomersImport,
+  confirmCustomersImport,
+  CUSTOMERS_KEY,
+  CUSTOMERS_TOTAL_KEY,
+  type CustomerStatus,
+} from '@/lib/organizations/customers'
+import { downloadFile } from '@/lib/common'
+import { useRoute, useRouter } from 'vue-router'
+
+const { t } = useI18n()
+const route = useRoute()
+const router = useRouter()
+const {
+  state,
+  debouncedTextFilter,
+  statusFilter,
+  createdByFilter,
+  organizationFilter,
+  includeHierarchy,
+  sortBy,
+  sortDescending,
+  applyHierarchyFilter,
+  resetFilters,
+} = useCustomers()
+
+// apply the parent company filter requested via query params, then clean the URL
+const {
+  organization_id: orgId,
+  organization_name: orgName,
+  include_hierarchy: includeHierarchyParam,
+} = route.query
+
+if (typeof orgId === 'string' && orgId && typeof orgName === 'string' && orgName) {
+  if (includeHierarchyParam === 'true') {
+    applyHierarchyFilter({ id: orgId, label: orgName })
+  } else {
+    resetFilters()
+    // the filter renders the label carried by the selection: pass the organization
+    // name, as it may not be among the options the dropdown has loaded
+    organizationFilter.value = [{ id: orgId, label: orgName }]
+  }
+  router.replace({ query: {} })
+}
+
+const isShownCreateCustomerDrawer = ref(false)
+const isShownImportCustomersModal = ref(false)
+
+function getBulkActionsMenuItems() {
+  return [
+    ...(canManageCustomers()
+      ? [
+          {
+            id: 'importCustomers',
+            label: t('customers.import_customers'),
+            icon: faCircleArrowUp,
+            action: () => (isShownImportCustomersModal.value = true),
+          },
+        ]
+      : []),
+    {
+      id: 'exportFilteredToPdf',
+      label: t('customers.export_customers_to_pdf'),
+      icon: faFilePdf,
+      action: () => exportCustomers('pdf'),
+      disabled: !state.value.data?.customers.length,
+    },
+    {
+      id: 'exportFilteredToCsv',
+      label: t('customers.export_customers_to_csv'),
+      icon: faFileCsv,
+      action: () => exportCustomers('csv'),
+      disabled: !state.value.data?.customers.length,
+    },
+  ]
+}
+
+async function exportCustomers(format: 'pdf' | 'csv') {
+  try {
+    const exportData = await getExport(
+      format,
+      debouncedTextFilter.value,
+      statusFilter.value.map((o) => o.id) as CustomerStatus[],
+      createdByFilter.value.map((o) => o.id),
+      organizationFilter.value.map((o) => o.id),
+      includeHierarchy.value,
+      sortBy.value,
+      sortDescending.value,
+    )
+    const fileName = `${t('customers.title')}.${format}`
+    downloadFile(exportData, fileName, format)
+  } catch (error) {
+    console.error(`Cannot export customers to ${format}:`, error)
+    throw error
+  }
+}
+</script>
+
+<template>
+  <div>
+    <NeHeading tag="h3" class="mb-7">{{ $t('customers.title') }}</NeHeading>
+    <div class="mb-8 flex flex-col items-start justify-between gap-6 xl:flex-row">
+      <div class="max-w-2xl text-gray-500 dark:text-gray-400">
+        {{ $t('customers.page_description') }}
+      </div>
+      <div class="flex flex-row-reverse items-center gap-4 xl:flex-row">
+        <NeDropdown
+          :items="getBulkActionsMenuItems()"
+          align-to-right
+          :openMenuAriaLabel="$t('ne_dropdown.open_menu')"
+        >
+          <template #button>
+            <NeButton>
+              <template #suffix>
+                <FontAwesomeIcon
+                  :icon="faChevronDown"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                /> </template
+              >{{ $t('common.actions') }}</NeButton
+            >
+          </template>
+        </NeDropdown>
+        <!-- create customer -->
+        <NeButton
+          v-if="canManageCustomers()"
+          kind="primary"
+          size="lg"
+          class="shrink-0"
+          @click="isShownCreateCustomerDrawer = true"
+        >
+          <template #prefix>
+            <FontAwesomeIcon :icon="faCirclePlus" aria-hidden="true" />
+          </template>
+          {{ $t('customers.create_customer') }}
+        </NeButton>
+      </div>
+    </div>
+    <CustomersTable
+      :isShownCreateCustomerDrawer="isShownCreateCustomerDrawer"
+      @close-drawer="isShownCreateCustomerDrawer = false"
+    />
+    <!-- import customers modal -->
+    <ImportOrganizationsModal
+      :is-shown="isShownImportCustomersModal"
+      entity-name="customers"
+      entity-label="customer"
+      :cache-keys="{ main: CUSTOMERS_KEY, total: CUSTOMERS_TOTAL_KEY }"
+      :api="{
+        getTemplate: getImportTemplate,
+        validate: validateCustomersImport,
+        confirm: confirmCustomersImport,
+      }"
+      @close="isShownImportCustomersModal = false"
+    />
+  </div>
+</template>

@@ -1,0 +1,1066 @@
+/*
+Copyright (C) 2025 Nethesis S.r.l.
+SPDX-License-Identifier: AGPL-3.0-or-later
+*/
+
+package entities
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/lib/pq"
+	"github.com/nethesis/my/backend/database"
+	"github.com/nethesis/my/backend/models"
+)
+
+// LocalApplicationRepository implements repository for applications
+type LocalApplicationRepository struct {
+	db *sql.DB
+}
+
+// NewLocalApplicationRepository creates a new local application repository
+func NewLocalApplicationRepository() *LocalApplicationRepository {
+	return &LocalApplicationRepository{
+		db: database.DB,
+	}
+}
+
+// applicationOnLiveSystem restricts a query on "applications a" to rows whose
+// system is not soft-deleted. Deleting a system does not cascade to its
+// applications (they must survive a restore), so every read path enforces
+// the invariant itself; the hard delete relies on the FK cascade instead.
+const applicationOnLiveSystem = "EXISTS (SELECT 1 FROM systems s2 WHERE s2.id = a.system_id AND s2.deleted_at IS NULL)"
+
+// certifiedApplication restricts a query on "applications a" to the certified,
+// user-facing applications the applications list shows.
+const certifiedApplication = "a.deleted_at IS NULL AND a.is_user_facing = TRUE AND (a.inventory_data->>'certification_level')::int IN (4, 5)"
+
+// assignedApplicationsCount builds the SQL expression counting the certified
+// applications assigned to the organizations selected by orgSet (any
+// expression valid inside IN (...): a column, a placeholder or a subquery).
+func assignedApplicationsCount(orgSet string) string {
+	return "(SELECT COUNT(*) FROM applications a WHERE " + certifiedApplication + " AND " + applicationOnLiveSystem + " AND a.organization_id IN (" + orgSet + "))"
+}
+
+// unassignedApplicationsCount builds the SQL expression counting the certified
+// applications with no organization hosted on the systems of the organizations
+// selected by orgSet. Applications stay unassigned until a partner assigns
+// them to a customer, so an application with no organization belongs to the
+// organization of the system hosting it.
+func unassignedApplicationsCount(orgSet string) string {
+	return "(SELECT COUNT(*) FROM applications a JOIN systems s2 ON s2.id = a.system_id AND s2.deleted_at IS NULL WHERE " + certifiedApplication + " AND (a.organization_id IS NULL OR a.organization_id = '') AND s2.organization_id IN (" + orgSet + "))"
+}
+
+// certifiedApplicationsCount builds the SQL expression counting every
+// certified application of the organizations selected by orgSet. Two indexed
+// counts rather than a COALESCE on the two columns: the latter forces a
+// sequential scan of applications per row.
+func certifiedApplicationsCount(orgSet string) string {
+	return "(" + assignedApplicationsCount(orgSet) + " + " + unassignedApplicationsCount(orgSet) + ")"
+}
+
+// GetByID retrieves a specific application by ID
+func (r *LocalApplicationRepository) GetByID(id string) (*models.Application, error) {
+	query := `
+		SELECT a.id, a.system_id, a.module_id, a.instance_of, a.name, a.source, a.display_name, a.node_id, a.node_label,
+		       a.version, a.organization_id, a.organization_type, a.status, a.inventory_data,
+		       a.backup_data, a.services_data, a.url, a.notes, a.is_user_facing,
+		       a.created_at, a.updated_at, a.first_seen_at, a.last_inventory_at, a.deleted_at,
+		       s.name as system_name,
+		       COALESCE(uo.name, 'Owner') as organization_name,
+		       uo.db_id as organization_db_id
+		FROM applications a
+		LEFT JOIN systems s ON a.system_id = s.id
+		LEFT JOIN unified_organizations uo ON a.organization_id = uo.logto_id
+		WHERE a.id = $1 AND a.deleted_at IS NULL AND ` + applicationOnLiveSystem + `
+	`
+
+	app := &models.Application{}
+	var appName, appSource, displayName, nodeLabel, version, orgID, orgType, url, notes sql.NullString
+	var nodeID sql.NullInt32
+	var lastInventoryAt, deletedAt sql.NullTime
+	var systemName, orgName, orgDbID sql.NullString
+	var inventoryData, backupData, servicesData []byte
+
+	err := r.db.QueryRow(query, id).Scan(
+		&app.ID, &app.SystemID, &app.ModuleID, &app.InstanceOf, &appName, &appSource, &displayName, &nodeID, &nodeLabel,
+		&version, &orgID, &orgType, &app.Status, &inventoryData,
+		&backupData, &servicesData, &url, &notes, &app.IsUserFacing,
+		&app.CreatedAt, &app.UpdatedAt, &app.FirstSeenAt, &lastInventoryAt, &deletedAt,
+		&systemName, &orgName, &orgDbID,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("application not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query application: %w", err)
+	}
+
+	// Convert nullable fields
+	if appName.Valid {
+		app.Name = &appName.String
+	}
+	if appSource.Valid {
+		app.Source = &appSource.String
+	}
+	if displayName.Valid {
+		app.DisplayName = &displayName.String
+	}
+	if nodeID.Valid {
+		nodeIDInt := int(nodeID.Int32)
+		app.NodeID = &nodeIDInt
+	}
+	if nodeLabel.Valid {
+		app.NodeLabel = &nodeLabel.String
+	}
+	if version.Valid {
+		app.Version = &version.String
+	}
+	if orgID.Valid {
+		app.OrganizationID = &orgID.String
+	}
+	if orgType.Valid {
+		app.OrganizationType = &orgType.String
+	}
+	if url.Valid {
+		app.URL = &url.String
+	}
+	if notes.Valid {
+		app.Notes = &notes.String
+	}
+	if lastInventoryAt.Valid {
+		app.LastInventoryAt = &lastInventoryAt.Time
+	}
+	if deletedAt.Valid {
+		app.DeletedAt = &deletedAt.Time
+	}
+
+	// Set JSONB fields
+	app.InventoryData = inventoryData
+	app.BackupData = backupData
+	app.ServicesData = servicesData
+
+	// Set system summary
+	if systemName.Valid {
+		app.System = &models.SystemSummary{
+			ID:   app.SystemID,
+			Name: systemName.String,
+		}
+	}
+
+	// Set organization summary
+	if orgID.Valid && orgName.Valid {
+		app.Organization = &models.OrganizationSummary{
+			ID:      orgDbID.String,
+			LogtoID: orgID.String,
+			Name:    orgName.String,
+			Type:    orgType.String,
+		}
+	}
+
+	return app, nil
+}
+
+// GetBySystemAndModuleID retrieves an application by system_id and module_id
+func (r *LocalApplicationRepository) GetBySystemAndModuleID(systemID, moduleID string) (*models.Application, error) {
+	query := `
+		SELECT id FROM applications
+		WHERE system_id = $1 AND module_id = $2 AND deleted_at IS NULL
+	`
+	var id string
+	err := r.db.QueryRow(query, systemID, moduleID).Scan(&id)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query application: %w", err)
+	}
+	return r.GetByID(id)
+}
+
+// List returns paginated list of applications with filters
+func (r *LocalApplicationRepository) List(
+	ctx context.Context,
+	allowedSystemIDs []string,
+	page, pageSize int,
+	search, sortBy, sortDirection string,
+	filterTypes, filterVersions, filterSystemIDs, filterOrgIDs, filterStatuses []string,
+	userFacingOnly bool,
+) ([]*models.Application, int, error) {
+	// nil = owner (no RBAC filter), empty = no access
+	if allowedSystemIDs != nil && len(allowedSystemIDs) == 0 {
+		return []*models.Application{}, 0, nil
+	}
+
+	offset := (page - 1) * pageSize
+
+	// Build WHERE clause: nil means owner (skip system filter), non-nil means RBAC filter
+	var whereClause string
+	var args []interface{}
+	if allowedSystemIDs != nil {
+		whereClause = "a.deleted_at IS NULL AND " + applicationOnLiveSystem + " AND a.system_id = ANY($1::text[])"
+		args = []interface{}{pq.Array(allowedSystemIDs)}
+	} else {
+		whereClause = "a.deleted_at IS NULL AND " + applicationOnLiveSystem
+	}
+
+	// User-facing filter
+	if userFacingOnly {
+		whereClause += " AND a.is_user_facing = TRUE"
+	}
+
+	// Certification level filter: only show applications with certification level 4 or 5
+	whereClause += " AND (a.inventory_data->>'certification_level')::int IN (4, 5)"
+
+	// Search condition
+	if search != "" {
+		searchPattern := "%" + search + "%"
+		whereClause += fmt.Sprintf(" AND (a.module_id ILIKE $%d OR a.display_name ILIKE $%d OR a.instance_of ILIKE $%d OR s.name ILIKE $%d)",
+			len(args)+1, len(args)+2, len(args)+3, len(args)+4)
+		args = append(args, searchPattern, searchPattern, searchPattern, searchPattern)
+	}
+
+	// Filter by types (instance_of)
+	if len(filterTypes) > 0 {
+		whereClause += fmt.Sprintf(" AND a.instance_of = ANY($%d::text[])", len(args)+1)
+		args = append(args, pq.Array(filterTypes))
+	}
+
+	// Filter by versions
+	// Version filter uses prefixed format "application:version" (e.g., "nethvoice:1.5.3")
+	// to avoid ambiguity when same version exists for multiple application types
+	if len(filterVersions) > 0 {
+		versionConditions := make([]string, len(filterVersions))
+		baseIndex := len(args)
+
+		for i, prefixedVersion := range filterVersions {
+			// Split prefixed version into application and version parts
+			parts := strings.SplitN(prefixedVersion, ":", 2)
+			if len(parts) == 2 {
+				// Prefixed format: match both instance_of and version
+				appPlaceholder := fmt.Sprintf("$%d", baseIndex+1)
+				versionPlaceholder := fmt.Sprintf("$%d", baseIndex+2)
+				versionConditions[i] = fmt.Sprintf("(a.instance_of = %s AND a.version = %s)", appPlaceholder, versionPlaceholder)
+				args = append(args, parts[0], parts[1])
+				baseIndex += 2
+			} else {
+				// Fallback for non-prefixed format: match version only
+				versionPlaceholder := fmt.Sprintf("$%d", baseIndex+1)
+				versionConditions[i] = fmt.Sprintf("(a.version = %s)", versionPlaceholder)
+				args = append(args, prefixedVersion)
+				baseIndex++
+			}
+		}
+
+		whereClause += fmt.Sprintf(" AND (%s)", strings.Join(versionConditions, " OR "))
+	}
+
+	// Filter by system IDs (additional filter within allowed)
+	if len(filterSystemIDs) > 0 {
+		whereClause += fmt.Sprintf(" AND a.system_id = ANY($%d::text[])", len(args)+1)
+		args = append(args, pq.Array(filterSystemIDs))
+	}
+
+	// Filter by organization IDs (handle "no_org" for unassigned applications).
+	// An unassigned application belongs to the organization of its system;
+	// ANY(ARRAY(subquery)) keeps both branches on an index (BitmapOr).
+	if len(filterOrgIDs) > 0 {
+		var orgConditions []string
+		var hasNoOrg bool
+		var nonNullOrgIDs []string
+
+		for _, orgID := range filterOrgIDs {
+			if orgID == "no_org" {
+				hasNoOrg = true
+			} else {
+				nonNullOrgIDs = append(nonNullOrgIDs, orgID)
+			}
+		}
+
+		if hasNoOrg {
+			orgConditions = append(orgConditions, "(a.organization_id IS NULL OR a.organization_id = '')")
+		}
+
+		if len(nonNullOrgIDs) > 0 {
+			orgConditions = append(orgConditions, fmt.Sprintf("(a.organization_id = ANY($%d::text[]) OR ((a.organization_id IS NULL OR a.organization_id = '') AND a.system_id = ANY(ARRAY(SELECT sh.id FROM systems sh WHERE sh.deleted_at IS NULL AND sh.organization_id = ANY($%d::text[])))))", len(args)+1, len(args)+1))
+			args = append(args, pq.Array(nonNullOrgIDs))
+		}
+
+		if len(orgConditions) > 0 {
+			whereClause += fmt.Sprintf(" AND (%s)", strings.Join(orgConditions, " OR "))
+		}
+	}
+
+	// Filter by statuses
+	if len(filterStatuses) > 0 {
+		whereClause += fmt.Sprintf(" AND a.status = ANY($%d::text[])", len(args)+1)
+		args = append(args, pq.Array(filterStatuses))
+	}
+
+	// Build ORDER BY clause
+	orderBy := "a.created_at DESC"
+	if sortBy != "" {
+		columnMap := map[string]string{
+			"display_name":        "LOWER(COALESCE(NULLIF(TRIM(a.display_name), ''), a.module_id))",
+			"module_id":           "LOWER(a.module_id)",
+			"instance_of":         "LOWER(a.instance_of)",
+			"version":             "a.version",
+			"status":              "a.status",
+			"system_name":         "LOWER(s.name)",
+			"organization_name":   "LOWER(uo.name)",
+			"created_at":          "a.created_at",
+			"updated_at":          "a.updated_at",
+			"last_inventory_at":   "a.last_inventory_at",
+			"certification_level": "(a.inventory_data->>'certification_level')::int",
+		}
+
+		if column, exists := columnMap[sortBy]; exists {
+			direction := "ASC"
+			if sortDirection == "desc" {
+				direction = "DESC"
+			}
+			orderBy = fmt.Sprintf("%s %s", column, direction)
+		}
+	}
+
+	// Single query with COUNT(*) OVER() to get total count + paginated results
+	query := fmt.Sprintf(`
+		SELECT a.id, a.system_id, a.module_id, a.instance_of, a.name, a.source, a.display_name, a.node_id, a.node_label,
+		       a.version, a.organization_id, a.organization_type, a.status, a.inventory_data,
+		       a.backup_data, a.services_data, a.url, a.notes, a.is_user_facing,
+		       a.created_at, a.updated_at, a.first_seen_at, a.last_inventory_at,
+		       s.name as system_name,
+		       COALESCE(uo.name, 'Owner') as organization_name,
+		       uo.db_id as organization_db_id,
+		       COUNT(*) OVER() as total_count
+		FROM applications a
+		LEFT JOIN systems s ON a.system_id = s.id
+		LEFT JOIN unified_organizations uo ON a.organization_id = uo.logto_id
+		WHERE %s
+		ORDER BY %s
+		LIMIT $%d OFFSET $%d
+	`, whereClause, orderBy, len(args)+1, len(args)+2)
+
+	listArgs := make([]interface{}, len(args)+2)
+	copy(listArgs, args)
+	listArgs[len(args)] = pageSize
+	listArgs[len(args)+1] = offset
+
+	rows, err := r.db.QueryContext(ctx, query, listArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to query applications: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var totalCount int
+	var apps []*models.Application
+	for rows.Next() {
+		app := &models.Application{}
+		var appName, appSource, displayName, nodeLabel, version, orgID, orgType, url, notes sql.NullString
+		var nodeID sql.NullInt32
+		var lastInventoryAt sql.NullTime
+		var systemName, orgName, orgDbID sql.NullString
+		var inventoryData, backupData, servicesData []byte
+
+		err := rows.Scan(
+			&app.ID, &app.SystemID, &app.ModuleID, &app.InstanceOf, &appName, &appSource, &displayName, &nodeID, &nodeLabel,
+			&version, &orgID, &orgType, &app.Status, &inventoryData,
+			&backupData, &servicesData, &url, &notes, &app.IsUserFacing,
+			&app.CreatedAt, &app.UpdatedAt, &app.FirstSeenAt, &lastInventoryAt,
+			&systemName, &orgName, &orgDbID,
+			&totalCount,
+		)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to scan application: %w", err)
+		}
+
+		// Convert nullable fields
+		if appName.Valid {
+			app.Name = &appName.String
+		}
+		if appSource.Valid {
+			app.Source = &appSource.String
+		}
+		if displayName.Valid {
+			app.DisplayName = &displayName.String
+		}
+		if nodeID.Valid {
+			nodeIDInt := int(nodeID.Int32)
+			app.NodeID = &nodeIDInt
+		}
+		if nodeLabel.Valid {
+			app.NodeLabel = &nodeLabel.String
+		}
+		if version.Valid {
+			app.Version = &version.String
+		}
+		if orgID.Valid {
+			app.OrganizationID = &orgID.String
+		}
+		if orgType.Valid {
+			app.OrganizationType = &orgType.String
+		}
+		if url.Valid {
+			app.URL = &url.String
+		}
+		if notes.Valid {
+			app.Notes = &notes.String
+		}
+		if lastInventoryAt.Valid {
+			app.LastInventoryAt = &lastInventoryAt.Time
+		}
+
+		app.InventoryData = inventoryData
+		app.BackupData = backupData
+		app.ServicesData = servicesData
+
+		// Set system summary
+		if systemName.Valid {
+			app.System = &models.SystemSummary{
+				ID:   app.SystemID,
+				Name: systemName.String,
+			}
+		}
+
+		// Set organization summary
+		if orgID.Valid && orgName.Valid {
+			app.Organization = &models.OrganizationSummary{
+				ID:      orgDbID.String,
+				LogtoID: orgID.String,
+				Name:    orgName.String,
+				Type:    orgType.String,
+			}
+		}
+
+		apps = append(apps, app)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating applications: %w", err)
+	}
+
+	return apps, totalCount, nil
+}
+
+// GetTotals returns statistics for applications using a single CTE query
+func (r *LocalApplicationRepository) GetTotals(allowedSystemIDs []string, userFacingOnly bool) (*models.ApplicationTotals, error) {
+	// nil = owner (no filter), empty = no access
+	if allowedSystemIDs != nil && len(allowedSystemIDs) == 0 {
+		return &models.ApplicationTotals{
+			Total:      0,
+			Unassigned: 0,
+			Assigned:   0,
+			WithErrors: 0,
+			ByType:     make(map[string]int64),
+			ByStatus:   make(map[string]int64),
+		}, nil
+	}
+
+	userFacingClause := ""
+	if userFacingOnly {
+		userFacingClause = " AND is_user_facing = TRUE"
+	}
+
+	certLevelClause := " AND (inventory_data->>'certification_level')::int IN (4, 5)"
+
+	systemClause := ""
+	var args []interface{}
+	if allowedSystemIDs != nil {
+		systemClause = " AND system_id = ANY($1::text[])"
+		args = []interface{}{pq.Array(allowedSystemIDs)}
+	}
+
+	query := fmt.Sprintf(`
+		WITH filtered AS (
+			SELECT instance_of, status, organization_id, services_data
+			FROM applications a
+			WHERE deleted_at IS NULL AND %s%s%s%s
+		)
+		SELECT
+			(SELECT COUNT(*) FROM filtered) as total,
+			(SELECT COUNT(*) FROM filtered WHERE organization_id IS NULL) as unassigned,
+			(SELECT COUNT(*) FROM filtered WHERE organization_id IS NOT NULL) as assigned,
+			(SELECT COUNT(*) FROM filtered WHERE services_data->>'has_errors' = 'true') as with_errors,
+			(SELECT COALESCE(json_object_agg(instance_of, cnt), '{}') FROM (SELECT instance_of, COUNT(*) as cnt FROM filtered GROUP BY instance_of) t) as by_type,
+			(SELECT COALESCE(json_object_agg(status, cnt), '{}') FROM (SELECT status, COUNT(*) as cnt FROM filtered GROUP BY status) s) as by_status
+	`, applicationOnLiveSystem, systemClause, userFacingClause, certLevelClause)
+
+	totals := &models.ApplicationTotals{
+		ByType:   make(map[string]int64),
+		ByStatus: make(map[string]int64),
+	}
+
+	var byTypeJSON, byStatusJSON []byte
+	err := r.db.QueryRow(query, args...).Scan(
+		&totals.Total, &totals.Unassigned, &totals.Assigned, &totals.WithErrors,
+		&byTypeJSON, &byStatusJSON,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get applications totals: %w", err)
+	}
+
+	if err := json.Unmarshal(byTypeJSON, &totals.ByType); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal by_type: %w", err)
+	}
+	if err := json.Unmarshal(byStatusJSON, &totals.ByStatus); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal by_status: %w", err)
+	}
+
+	return totals, nil
+}
+
+// GetTypeSummary returns applications grouped by instance_of with total count
+// allowedSystemIDs scopes the query to systems the user can access
+// organizationIDs optionally filters by specific organization(s); if empty, no org filter is applied
+// page/pageSize control pagination of the by_type array (0 means no pagination)
+// sortBy/sortDirection control ordering of the by_type array
+func (r *LocalApplicationRepository) GetTypeSummary(allowedSystemIDs []string, organizationIDs []string, userFacingOnly bool, page, pageSize int, sortBy, sortDirection string) (*models.ApplicationTypeSummary, error) {
+	// nil = owner (no filter), empty = no access
+	if allowedSystemIDs != nil && len(allowedSystemIDs) == 0 {
+		return &models.ApplicationTypeSummary{
+			Total:  0,
+			ByType: []models.ApplicationType{},
+		}, nil
+	}
+
+	var args []interface{}
+
+	systemClause := ""
+	if allowedSystemIDs != nil {
+		args = append(args, pq.Array(allowedSystemIDs))
+		systemClause = " AND system_id = ANY($1::text[])"
+	}
+
+	userFacingClause := ""
+	if userFacingOnly {
+		userFacingClause = " AND is_user_facing = TRUE"
+	}
+
+	certLevelClause := " AND (inventory_data->>'certification_level')::int IN (4, 5)"
+
+	// Organization filter clause: an unassigned application belongs to the
+	// organization of its system.
+	orgClause := ""
+	if len(organizationIDs) > 0 {
+		orgClause = fmt.Sprintf(" AND (a.organization_id = ANY($%d::text[]) OR ((a.organization_id IS NULL OR a.organization_id = '') AND a.system_id = ANY(ARRAY(SELECT sh.id FROM systems sh WHERE sh.deleted_at IS NULL AND sh.organization_id = ANY($%d::text[])))))", len(args)+1, len(args)+1)
+		args = append(args, pq.Array(organizationIDs))
+	}
+
+	whereClause := fmt.Sprintf("deleted_at IS NULL AND %s%s%s%s%s", applicationOnLiveSystem, systemClause, userFacingClause, certLevelClause, orgClause)
+
+	// Get total count of applications and distinct types
+	countQuery := fmt.Sprintf(`SELECT COUNT(*), COUNT(DISTINCT instance_of) FROM applications a WHERE %s`, whereClause)
+
+	summary := &models.ApplicationTypeSummary{
+		ByType: []models.ApplicationType{},
+	}
+
+	err := r.db.QueryRow(countQuery, args...).Scan(&summary.Total, &summary.TotalTypes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get type summary total: %w", err)
+	}
+
+	// Determine ORDER BY clause
+	orderClause := "count DESC" // default
+	dir := "DESC"
+	if strings.ToUpper(sortDirection) == "ASC" {
+		dir = "ASC"
+	}
+	switch sortBy {
+	case "count":
+		orderClause = fmt.Sprintf("count %s", dir)
+	case "created_at":
+		orderClause = fmt.Sprintf("MAX(a.created_at) %s", dir)
+	case "instance_of":
+		orderClause = fmt.Sprintf("instance_of %s", dir)
+	}
+
+	// Pagination clause
+	paginationClause := ""
+	if pageSize > 0 {
+		offset := 0
+		if page > 1 {
+			offset = (page - 1) * pageSize
+		}
+		paginationClause = fmt.Sprintf(" LIMIT %d OFFSET %d", pageSize, offset)
+	}
+
+	// Get counts by type with human-readable name (using array_agg instead of correlated subquery)
+	typeQuery := fmt.Sprintf(`
+		SELECT instance_of,
+			(array_agg(name ORDER BY updated_at DESC) FILTER (WHERE name IS NOT NULL))[1] as name,
+			COUNT(*) as count
+		FROM applications a
+		WHERE %s
+		GROUP BY instance_of
+		ORDER BY %s%s
+	`, whereClause, orderClause, paginationClause)
+
+	rows, err := r.db.Query(typeQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get type summary by type: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var t models.ApplicationType
+		var name *string
+		if err := rows.Scan(&t.InstanceOf, &name, &t.Count); err != nil {
+			return nil, fmt.Errorf("failed to scan type summary count: %w", err)
+		}
+		if name != nil {
+			t.Name = *name
+		}
+		summary.ByType = append(summary.ByType, t)
+	}
+
+	return summary, nil
+}
+
+// GetTrend returns trend data for applications over a specified period
+func (r *LocalApplicationRepository) GetTrend(allowedSystemIDs []string, period int) ([]struct {
+	Date  string
+	Count int
+}, int, int, error) {
+	// nil = owner (no filter), empty = no access
+	if allowedSystemIDs != nil && len(allowedSystemIDs) == 0 {
+		return []struct {
+			Date  string
+			Count int
+		}{}, 0, 0, nil
+	}
+
+	// Determine interval for date series based on period
+	var interval string
+	switch period {
+	case 7, 30:
+		interval = "1 day"
+	case 180:
+		interval = "1 week"
+	case 365:
+		interval = "1 month"
+	default:
+		return nil, 0, 0, fmt.Errorf("invalid period: %d", period)
+	}
+
+	// Build system filter clause
+	systemClause := ""
+	var args []interface{}
+	if allowedSystemIDs != nil {
+		systemClause = "AND system_id = ANY($1::text[])"
+		args = []interface{}{pq.Array(allowedSystemIDs)}
+	}
+
+	// Query to get cumulative count for each date in the period
+	query := fmt.Sprintf(`
+		WITH date_series AS (
+			SELECT generate_series(
+				CURRENT_DATE - INTERVAL '%d days',
+				CURRENT_DATE,
+				INTERVAL '%s'
+			)::date AS date
+		)
+		SELECT
+			ds.date::text,
+			COALESCE((
+				SELECT COUNT(*)
+				FROM applications a
+				WHERE deleted_at IS NULL
+				  AND %s
+				  %s
+				  AND (inventory_data->>'certification_level')::int IN (4, 5)
+				  AND created_at::date <= ds.date
+			), 0) AS count
+		FROM date_series ds
+		ORDER BY ds.date
+	`, period, interval, applicationOnLiveSystem, systemClause)
+
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("failed to query applications trend data: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var dataPoints []struct {
+		Date  string
+		Count int
+	}
+
+	for rows.Next() {
+		var date string
+		var count int
+		if err := rows.Scan(&date, &count); err != nil {
+			return nil, 0, 0, fmt.Errorf("failed to scan applications trend data: %w", err)
+		}
+		dataPoints = append(dataPoints, struct {
+			Date  string
+			Count int
+		}{Date: date, Count: count})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, 0, fmt.Errorf("error iterating applications trend data: %w", err)
+	}
+
+	// Calculate current and previous totals
+	var currentTotal, previousTotal int
+	if len(dataPoints) > 0 {
+		currentTotal = dataPoints[len(dataPoints)-1].Count
+		previousTotal = dataPoints[0].Count
+	}
+
+	return dataPoints, currentTotal, previousTotal, nil
+}
+
+// GetDistinctTypes returns distinct application types with is_user_facing from database
+func (r *LocalApplicationRepository) GetDistinctTypes(allowedSystemIDs []string, userFacingOnly bool) ([]models.ApplicationType, error) {
+	// nil = owner (no filter), empty = no access
+	if allowedSystemIDs != nil && len(allowedSystemIDs) == 0 {
+		return []models.ApplicationType{}, nil
+	}
+
+	userFacingClause := ""
+	if userFacingOnly {
+		userFacingClause = " AND is_user_facing = TRUE"
+	}
+
+	certLevelClause := " AND (inventory_data->>'certification_level')::int IN (4, 5)"
+
+	systemClause := ""
+	var args []interface{}
+	if allowedSystemIDs != nil {
+		systemClause = " AND system_id = ANY($1::text[])"
+		args = []interface{}{pq.Array(allowedSystemIDs)}
+	}
+
+	query := fmt.Sprintf(`
+		SELECT instance_of,
+			(array_agg(name ORDER BY updated_at DESC) FILTER (WHERE name IS NOT NULL))[1] as name,
+			COUNT(*) as count
+		FROM applications a
+		WHERE deleted_at IS NULL AND %s%s%s%s
+		GROUP BY instance_of
+		ORDER BY instance_of
+	`, applicationOnLiveSystem, systemClause, userFacingClause, certLevelClause)
+
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get distinct types: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var types []models.ApplicationType
+	for rows.Next() {
+		var t models.ApplicationType
+		var name *string
+		if err := rows.Scan(&t.InstanceOf, &name, &t.Count); err != nil {
+			return nil, fmt.Errorf("failed to scan type: %w", err)
+		}
+		if name != nil {
+			t.Name = *name
+		}
+		types = append(types, t)
+	}
+
+	return types, nil
+}
+
+// ApplicationVersionGroup holds versions and human-readable name for an application type
+type ApplicationVersionGroup struct {
+	Name     string
+	Versions []string
+}
+
+// GetDistinctVersions returns distinct application versions grouped by instance_of
+func (r *LocalApplicationRepository) GetDistinctVersions(allowedSystemIDs []string, userFacingOnly bool) (map[string]ApplicationVersionGroup, error) {
+	// nil = owner (no filter), empty = no access
+	if allowedSystemIDs != nil && len(allowedSystemIDs) == 0 {
+		return map[string]ApplicationVersionGroup{}, nil
+	}
+
+	userFacingClause := ""
+	if userFacingOnly {
+		userFacingClause = " AND is_user_facing = TRUE"
+	}
+
+	certLevelClause := " AND (inventory_data->>'certification_level')::int IN (4, 5)"
+
+	systemClause := ""
+	var args []interface{}
+	if allowedSystemIDs != nil {
+		systemClause = " AND system_id = ANY($1::text[])"
+		args = []interface{}{pq.Array(allowedSystemIDs)}
+	}
+
+	query := fmt.Sprintf(`
+		SELECT instance_of,
+			(array_agg(name ORDER BY updated_at DESC) FILTER (WHERE name IS NOT NULL))[1] as name,
+			version
+		FROM applications a
+		WHERE deleted_at IS NULL AND %s AND version IS NOT NULL%s%s%s
+		GROUP BY instance_of, version
+		ORDER BY instance_of ASC, version DESC
+	`, applicationOnLiveSystem, systemClause, userFacingClause, certLevelClause)
+
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get distinct versions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	versionsByProduct := make(map[string]ApplicationVersionGroup)
+	for rows.Next() {
+		var instanceOf, version string
+		var name *string
+		if err := rows.Scan(&instanceOf, &name, &version); err != nil {
+			return nil, fmt.Errorf("failed to scan version: %w", err)
+		}
+		prefixedVersion := fmt.Sprintf("%s:%s", instanceOf, version)
+		group := versionsByProduct[instanceOf]
+		if name != nil && group.Name == "" {
+			group.Name = *name
+		}
+		group.Versions = append(group.Versions, prefixedVersion)
+		versionsByProduct[instanceOf] = group
+	}
+
+	return versionsByProduct, nil
+}
+
+// Create creates a new application
+func (r *LocalApplicationRepository) Create(app *models.Application) error {
+	query := `
+		INSERT INTO applications (
+			id, system_id, module_id, instance_of, name, source, display_name, node_id, node_label,
+			version, organization_id, organization_type, status, inventory_data,
+			backup_data, services_data, url, notes, is_user_facing,
+			created_at, updated_at, first_seen_at, last_inventory_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+		)
+	`
+
+	_, err := r.db.Exec(query,
+		app.ID, app.SystemID, app.ModuleID, app.InstanceOf, app.Name, app.Source, app.DisplayName, app.NodeID, app.NodeLabel,
+		app.Version, app.OrganizationID, app.OrganizationType, app.Status, app.InventoryData,
+		app.BackupData, app.ServicesData, app.URL, app.Notes, app.IsUserFacing,
+		app.CreatedAt, app.UpdatedAt, app.FirstSeenAt, app.LastInventoryAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create application: %w", err)
+	}
+
+	return nil
+}
+
+// Update updates an existing application (only notes is editable, other fields come from inventory)
+func (r *LocalApplicationRepository) Update(id string, req *models.UpdateApplicationRequest) error {
+	query := `
+		UPDATE applications
+		SET notes = COALESCE($2, notes),
+		    updated_at = $3
+		WHERE id = $1 AND deleted_at IS NULL
+	`
+
+	result, err := r.db.Exec(query, id, req.Notes, time.Now())
+	if err != nil {
+		return fmt.Errorf("failed to update application: %w", err)
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("application not found")
+	}
+
+	return nil
+}
+
+// AssignOrganization assigns an organization to an application
+func (r *LocalApplicationRepository) AssignOrganization(id, organizationID, organizationType string) error {
+	query := `
+		UPDATE applications
+		SET organization_id = $2,
+		    organization_type = $3,
+		    status = 'assigned',
+		    updated_at = $4
+		WHERE id = $1 AND deleted_at IS NULL
+	`
+
+	result, err := r.db.Exec(query, id, organizationID, organizationType, time.Now())
+	if err != nil {
+		return fmt.Errorf("failed to assign organization: %w", err)
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("application not found")
+	}
+
+	return nil
+}
+
+// UnassignOrganization removes organization assignment from an application
+func (r *LocalApplicationRepository) UnassignOrganization(id string) error {
+	query := `
+		UPDATE applications
+		SET organization_id = NULL,
+		    organization_type = NULL,
+		    status = 'unassigned',
+		    updated_at = $2
+		WHERE id = $1 AND deleted_at IS NULL
+	`
+
+	result, err := r.db.Exec(query, id, time.Now())
+	if err != nil {
+		return fmt.Errorf("failed to unassign organization: %w", err)
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("application not found")
+	}
+
+	return nil
+}
+
+// UnassignAllForSystem clears the organization assignment on every application
+// that belongs to the given system. Invoked when the system itself is moved to
+// a different organization: the previous owner's RBAC scope is gone, and the
+// new owner may sit in a different hierarchy where the previously chosen
+// org_id has no meaning. The new owner reassigns each app explicitly.
+//
+// Returns the number of applications reset; idempotent (a rerun matches no
+// rows because everything is already unassigned).
+func (r *LocalApplicationRepository) UnassignAllForSystem(systemID string) (int64, error) {
+	if systemID == "" {
+		return 0, fmt.Errorf("systemID is required")
+	}
+	result, err := r.db.Exec(
+		`UPDATE applications
+		 SET organization_id = NULL,
+		     organization_type = NULL,
+		     status = 'unassigned',
+		     updated_at = $2
+		 WHERE system_id = $1
+		   AND deleted_at IS NULL
+		   AND organization_id IS NOT NULL`,
+		systemID, time.Now(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to unassign applications for system: %w", err)
+	}
+	return result.RowsAffected()
+}
+
+// Delete soft-deletes an application
+func (r *LocalApplicationRepository) Delete(id string) error {
+	query := `
+		UPDATE applications
+		SET deleted_at = $2, updated_at = $2
+		WHERE id = $1 AND deleted_at IS NULL
+	`
+
+	now := time.Now()
+	result, err := r.db.Exec(query, id, now)
+	if err != nil {
+		return fmt.Errorf("failed to delete application: %w", err)
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("application not found")
+	}
+
+	return nil
+}
+
+// UpdateFromInventory updates application data from inventory
+func (r *LocalApplicationRepository) UpdateFromInventory(
+	systemID, moduleID string,
+	nodeID *int,
+	nodeLabel, version *string,
+	inventoryData json.RawMessage,
+	isUserFacing bool,
+) error {
+	query := `
+		UPDATE applications
+		SET node_id = $3,
+		    node_label = $4,
+		    version = $5,
+		    inventory_data = $6,
+		    is_user_facing = $7,
+		    last_inventory_at = $8,
+		    updated_at = $8
+		WHERE system_id = $1 AND module_id = $2 AND deleted_at IS NULL
+	`
+
+	now := time.Now()
+	result, err := r.db.Exec(query, systemID, moduleID, nodeID, nodeLabel, version, inventoryData, isUserFacing, now)
+	if err != nil {
+		return fmt.Errorf("failed to update application from inventory: %w", err)
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("application not found for system %s, module %s", systemID, moduleID)
+	}
+
+	return nil
+}
+
+// UpsertFromInventory creates or updates application from inventory data
+func (r *LocalApplicationRepository) UpsertFromInventory(
+	id, systemID, moduleID, instanceOf string,
+	nodeID *int,
+	nodeLabel, version, name, source *string,
+	inventoryData json.RawMessage,
+	isUserFacing bool,
+) error {
+	query := `
+		INSERT INTO applications (
+			id, system_id, module_id, instance_of, node_id, node_label, version,
+			name, source, inventory_data, is_user_facing, status,
+			created_at, updated_at, first_seen_at, last_inventory_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'unassigned', $12, $12, $12, $12
+		)
+		ON CONFLICT (system_id, module_id) WHERE deleted_at IS NULL
+		DO UPDATE SET
+			node_id = EXCLUDED.node_id,
+			node_label = EXCLUDED.node_label,
+			version = EXCLUDED.version,
+			name = COALESCE(EXCLUDED.name, applications.name),
+			source = COALESCE(EXCLUDED.source, applications.source),
+			inventory_data = EXCLUDED.inventory_data,
+			is_user_facing = EXCLUDED.is_user_facing,
+			last_inventory_at = EXCLUDED.last_inventory_at,
+			updated_at = EXCLUDED.updated_at
+	`
+
+	now := time.Now()
+	_, err := r.db.Exec(query, id, systemID, moduleID, instanceOf, nodeID, nodeLabel, version, name, source, inventoryData, isUserFacing, now)
+	if err != nil {
+		return fmt.Errorf("failed to upsert application: %w", err)
+	}
+
+	return nil
+}
+
+// GetSystemIDForApplication returns the system_id for a given application
+func (r *LocalApplicationRepository) GetSystemIDForApplication(appID string) (string, error) {
+	var systemID string
+	err := r.db.QueryRow("SELECT system_id FROM applications WHERE id = $1 AND deleted_at IS NULL", appID).Scan(&systemID)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("application not found")
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get system ID: %w", err)
+	}
+	return systemID, nil
+}

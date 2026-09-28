@@ -1,0 +1,147 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { NeButton, NeDropdown, NeHeading } from '@nethesis/vue-components'
+import DistributorsTable from '@/components/distributors/DistributorsTable.vue'
+import ImportOrganizationsModal from '@/components/organizations/ImportOrganizationsModal.vue'
+import { ref } from 'vue'
+import {
+  faChevronDown,
+  faCircleArrowUp,
+  faCirclePlus,
+  faFileCsv,
+  faFilePdf,
+} from '@fortawesome/free-solid-svg-icons'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import { canManageDistributors } from '@/lib/permissions'
+import { useDistributors } from '@/queries/organizations/distributors'
+import { useI18n } from 'vue-i18n'
+import {
+  getExport,
+  getImportTemplate,
+  validateDistributorsImport,
+  confirmDistributorsImport,
+  DISTRIBUTORS_KEY,
+  DISTRIBUTORS_TOTAL_KEY,
+  type DistributorStatus,
+} from '@/lib/organizations/distributors'
+import { downloadFile } from '@/lib/common'
+
+const { t } = useI18n()
+const { state, debouncedTextFilter, statusFilter, createdByFilter, sortBy, sortDescending } =
+  useDistributors()
+
+const isShownCreateDistributorDrawer = ref(false)
+const isShownImportDistributorsModal = ref(false)
+
+function getBulkActionsMenuItems() {
+  return [
+    ...(canManageDistributors()
+      ? [
+          {
+            id: 'importDistributors',
+            label: t('distributors.import_distributors'),
+            icon: faCircleArrowUp,
+            action: () => (isShownImportDistributorsModal.value = true),
+          },
+        ]
+      : []),
+    {
+      id: 'exportFilteredToPdf',
+      label: t('distributors.export_distributors_to_pdf'),
+      icon: faFilePdf,
+      action: () => exportDistributors('pdf'),
+      disabled: !state.value.data?.distributors.length,
+    },
+    {
+      id: 'exportFilteredToCsv',
+      label: t('distributors.export_distributors_to_csv'),
+      icon: faFileCsv,
+      action: () => exportDistributors('csv'),
+      disabled: !state.value.data?.distributors.length,
+    },
+  ]
+}
+
+async function exportDistributors(format: 'pdf' | 'csv') {
+  try {
+    const exportData = await getExport(
+      format,
+      debouncedTextFilter.value,
+      statusFilter.value.map((o) => o.id) as DistributorStatus[],
+      createdByFilter.value.map((o) => o.id),
+      sortBy.value,
+      sortDescending.value,
+    )
+    const fileName = `${t('distributors.title')}.${format}`
+    downloadFile(exportData, fileName, format)
+  } catch (error) {
+    console.error(`Cannot export distributors to ${format}:`, error)
+    throw error
+  }
+}
+</script>
+
+<template>
+  <div>
+    <NeHeading tag="h3" class="mb-7">{{ $t('distributors.title') }}</NeHeading>
+    <div class="mb-8 flex flex-col items-start justify-between gap-6 xl:flex-row">
+      <div class="max-w-2xl text-gray-500 dark:text-gray-400">
+        {{ $t('distributors.page_description') }}
+      </div>
+      <div class="flex flex-row-reverse items-center gap-4 xl:flex-row">
+        <NeDropdown
+          :items="getBulkActionsMenuItems()"
+          align-to-right
+          :openMenuAriaLabel="$t('ne_dropdown.open_menu')"
+        >
+          >
+          <template #button>
+            <NeButton>
+              <template #suffix>
+                <FontAwesomeIcon
+                  :icon="faChevronDown"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                /> </template
+              >{{ $t('common.actions') }}</NeButton
+            >
+          </template>
+        </NeDropdown>
+        <!-- create distributor -->
+        <NeButton
+          v-if="canManageDistributors()"
+          kind="primary"
+          size="lg"
+          class="shrink-0"
+          @click="isShownCreateDistributorDrawer = true"
+        >
+          <template #prefix>
+            <FontAwesomeIcon :icon="faCirclePlus" aria-hidden="true" />
+          </template>
+          {{ $t('distributors.create_distributor') }}
+        </NeButton>
+      </div>
+    </div>
+    <DistributorsTable
+      :isShownCreateDistributorDrawer="isShownCreateDistributorDrawer"
+      @close-drawer="isShownCreateDistributorDrawer = false"
+    />
+    <!-- import distributors modal -->
+    <ImportOrganizationsModal
+      :is-shown="isShownImportDistributorsModal"
+      entity-name="distributors"
+      entity-label="distributor"
+      :cache-keys="{ main: DISTRIBUTORS_KEY, total: DISTRIBUTORS_TOTAL_KEY }"
+      :api="{
+        getTemplate: getImportTemplate,
+        validate: validateDistributorsImport,
+        confirm: confirmDistributorsImport,
+      }"
+      @close="isShownImportDistributorsModal = false"
+    />
+  </div>
+</template>

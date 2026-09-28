@@ -1,64 +1,91 @@
-# Nexwall Partner Multi-Tenant
+# Nexwall Partner Program
 
-The Nexwall Partner Program — `partner.nexwall.com.br`. The business/
-account layer for Nexwall's reseller channel: partner onboarding, the
-Distributor → Reseller → Customer hierarchy, entitlements, billing, and
-partner-facing SSO/RBAC.
+`partner.nexwall.com.br` — the Nexwall reseller/partner business layer:
+partner onboarding, org hierarchy (Nexwall → Reseller → Customer, distributor
+tier TBD — see `docs/adr/0002-org-hierarchy-model.md`), entitlements,
+billing, and partner-facing SSO/RBAC.
 
-This is a **separate system on a separate cluster** from
+**This repository is a fork of [`NethServer/my`](https://github.com/NethServer/my)**,
+Nethesis's own equivalent system behind `my.nethesis.it`, forked directly
+rather than reimplemented from scratch (see
+`docs/adr/0004-fork-nethserver-my-directly.md`, which supersedes the
+project's earlier clean-room decision in ADR 0001). Full upstream commit
+history is preserved in this repo for attribution.
+
+It is a **separate service on a separate cluster** from
 [`nexwall-multi-tenant`](https://github.com/nexwall/nexwall-multi-tenant),
-by deliberate decision — see `docs/adr/0001-independent-implementation-not-fork.md`
-and `nexwall-multi-tenant`'s own `docs/adr/0006-partner-program-separate-service.md`
-for the full reasoning on both sides of that split.
-
-| Piece | What it is | Where |
-|---|---|---|
-| Partner Plane | New service: partner/reseller/customer hierarchy, entitlements, billing, auth | `partner-plane/` |
-| Docs | Architecture, decision records, phased roadmap, API contracts | `docs/` |
-
-## What this repo does NOT do
-
-It does not provision Kubernetes infrastructure itself. When a partner
-onboards a new end customer, this service calls **`nexwall-multi-tenant`'s**
-Management Plane API (`POST /tenants`) to provision the real
-`nexwall-controller` stack on that other cluster. This repo owns the
-business data (who the customer belongs to, what plan they're on, whether
-they're paid up); the other repo owns the infrastructure that actually runs
-their firewalls.
-
-## Relationship to `NethServer/my`
-
-`my` (Nethesis's own equivalent system) was studied closely as a reference
-architecture — its org hierarchy, entitlements model, and rebranding/
-white-label support are genuinely close to what this repo needs. **No code
-is copied from it.** `my`'s backend is AGPL-3.0-or-later; this repo is
-GPL-3.0-only and a network service, so copying would carry real obligations
-neither repo currently has. See `NOTICE.md` and
-`docs/adr/0001-independent-implementation-not-fork.md`.
-
-One structural difference worth knowing before reading `my`'s code for
-ideas: `my` is comparatively passive — Nethesis's products run on
-customers' own hardware, so `my` mostly records inventory/heartbeat from
-units that phone home to it. **Nexwall hosts every customer's controller
-stack itself**, so this repo isn't a pure bookkeeping layer like `my` — it
-must actually trigger infrastructure provisioning in another system. That's
-new design surface `my` never had to solve.
-
-## Start here
-
-1. [`docs/adr/`](docs/adr) — read before touching anything. ADR 0001 in
-   particular explains the ground rule for how `my` may and may not be used
-   as a reference while implementing this repo.
-2. [`docs/phases/`](docs/phases) — what's being built, in what order.
-3. [`docs/contracts/`](docs/contracts) — this service's own API contract,
-   once written (Phase 1), plus a copy of the fields it depends on from
-   `nexwall-multi-tenant`'s Management Plane contract.
-
-## Status
-
-Phase 0 (this scaffold). Nothing deployed yet. See
-[`docs/phases/phase-0-foundations.md`](docs/phases/phase-0-foundations.md).
+which owns real customer infrastructure (isolated `nexwall-controller`
+stacks per customer). This repo owns partner/business data only and calls
+that repo's Management Plane API to actually provision a customer's stack
+— see `docs/adr/0003-integration-with-management-plane.md`. `NethServer/my`
+has no equivalent of that integration; it's new code specific to Nexwall,
+covered in `docs/phases/`.
 
 ## License
 
-GPL-3.0-only — see `LICENSE` and `NOTICE.md`.
+**AGPL-3.0-or-later** for `backend/`, `collect/`, and `sync/` (inherited
+unchanged from upstream — see file headers and `NOTICE.md`).
+**GPL-3.0-or-later** for `frontend/` (also inherited unchanged). Because
+this is a network service incorporating AGPL-licensed components, the
+*combined* service is subject to AGPL §13: complete corresponding source
+of what's actually deployed must be available to everyone who interacts
+with it over the network. This repo is public specifically to satisfy
+that — see `NOTICE.md` for the full compliance posture and what's still
+required going forward (keeping this in sync with deployments, an in-app
+"Source code" link).
+
+## 🏗️ Components (inherited from upstream, unchanged so far)
+
+- **[frontend/](./frontend/)** — Vue.js application for UI
+- **[backend/](./backend/)** — Go REST API with Logto JWT authentication and RBAC
+- **[collect/](./collect/)** — Go REST API with Redis queues to handle inventories/heartbeat
+- **[sync/](./sync/)** — CLI tool for RBAC configuration synchronization
+- **[proxy/](./proxy/)** — nginx configuration as load balancer
+- **[services/mimir/](./services/mimir/)** — Grafana Mimir, multi-tenant metrics store
+
+## Start here
+
+1. `docs/adr/` — read `0001` and `0004` first: why this project first chose
+   clean-room reimplementation, then reversed that decision to fork
+   directly, and what that reversal obligates us to do going forward.
+2. `docs/phases/` — what's being adapted, in what order. This is **not**
+   the same roadmap as before the fork: it's now about what to strip,
+   rebrand, keep as-is, and add net-new (the Management Plane integration),
+   not about building from scratch.
+3. `DESIGN.md` (upstream, unchanged so far) — the original architecture
+   doc; still accurate for how the inherited components work internally.
+
+## Status
+
+Just forked. Nothing has been adapted for Nexwall yet — running this
+today would stand up Nethesis's own `my` unmodified (same default branding,
+same assumption of a Nethesis Logto tenant, same Render-specific deploy
+scripts pointed at Nethesis's own infrastructure). See
+`docs/phases/phase-0-import-and-compliance.md` for what has to change
+before this is actually usable as Nexwall's own service.
+
+## Development setup (inherited from upstream — verify before relying on it)
+
+Requirements per upstream: Go 1.24+, Node.js per `.nvmrc`, Make, Docker or
+Podman, a Logto instance with M2M app + Management API permissions, a
+Render account with GitHub integration for deploys. Several of these
+assume Nethesis's own accounts/infrastructure (their Logto tenant, their
+Render account) — Phase 0/1 work replaces these with Nexwall's own, see
+the phase docs. Don't assume `docker-compose up` works out of the box
+until that's done.
+
+```bash
+# Full local infra replica (once .env files are set up for OUR accounts,
+# not copied from upstream's examples with fake values):
+docker compose up
+```
+
+See upstream's original `backend/README.md`, `collect/README.md`, and
+`frontend/README.md` (all inherited, unchanged) for per-component detail.
+
+## Contributing
+
+See `CONTRIBUTING.md` — in particular, the rule about preserving copyright/
+license headers and adding modification notices to any upstream file this
+project changes, which AGPL/GPL require and which matter a lot more now
+that this is a direct fork rather than independent code.

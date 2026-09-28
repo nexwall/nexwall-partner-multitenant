@@ -1,0 +1,948 @@
+/*
+Copyright (C) 2025 Nethesis S.r.l.
+SPDX-License-Identifier: AGPL-3.0-or-later
+*/
+
+package methods
+
+import (
+	"errors"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
+
+	"github.com/nethesis/my/backend/cache"
+	"github.com/nethesis/my/backend/entities"
+	"github.com/nethesis/my/backend/helpers"
+	"github.com/nethesis/my/backend/logger"
+	"github.com/nethesis/my/backend/models"
+	"github.com/nethesis/my/backend/response"
+	"github.com/nethesis/my/backend/services/alerting"
+	"github.com/nethesis/my/backend/services/local"
+)
+
+// CreateReseller handles POST /api/resellers - creates a new reseller locally and syncs to Logto
+func CreateReseller(c *gin.Context) {
+	// Parse request body
+	var request models.CreateLocalResellerRequest
+	if err := c.ShouldBindBodyWith(&request, binding.JSON); err != nil {
+		c.JSON(http.StatusBadRequest, response.ValidationBadRequestMultiple(err))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Create service
+	service := local.NewOrganizationService()
+
+	// Validate permissions
+	userOrgRole := strings.ToLower(user.OrgRole)
+	if canCreate, reason := service.CanCreateReseller(userOrgRole, user.OrganizationID); !canCreate {
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied: "+reason, nil))
+		return
+	}
+
+	// Resolve the owning organization (custom_data.createdBy). By default the
+	// reseller is owned by the caller's org; an owner may attribute it to a
+	// distributor in their hierarchy via created_by_organization_id, preserving
+	// hierarchical visibility.
+	createdByOrgID, createdByOrgName, allowed, reason := service.ResolveCreatedByOrg(userOrgRole, user.OrganizationID, request.CreatedByOrganizationID, "reseller")
+	if !allowed {
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied: "+reason, nil))
+		return
+	}
+
+	// Build the creator snapshot. When the reseller is attributed to a distributor
+	// via created_by_organization_id, stamp that org on the snapshot so the display
+	// "created by" matches the owning distributor (mirroring systems); the user
+	// identity stays the actual actor.
+	creator := models.NewOrgCreatorFromUser(*user)
+	creator.AttributeToOrg(createdByOrgID, createdByOrgName)
+
+	// Create reseller
+	reseller, err := service.CreateReseller(&request, creator, createdByOrgID)
+	if err != nil {
+		// Check if it's a validation error from service
+		if validationErr := getValidationError(err); validationErr != nil {
+			logger.Warn().
+				Str("user_id", user.ID).
+				Str("reseller_name", request.Name).
+				Str("validation_reason", validationErr.ErrorData.Errors[0].Message).
+				Msg("Reseller creation validation failed")
+
+			c.JSON(http.StatusBadRequest, response.ValidationFailed("validation failed", validationErr.ErrorData.Errors))
+			return
+		}
+
+		// System error - log as error
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_name", request.Name).
+			Msg("Failed to create reseller")
+
+		// Default to internal server error
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to create reseller", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Log the action
+	logger.LogBusinessOperation(c, "resellers", "create", "reseller", reseller.ID, true, nil)
+
+	// Auto-provision default alerting configuration so the built-in history
+	// webhook is active from day one and any ancestor layers (Owner /
+	// Distributor) propagate to Mimir for the new tenant. The new reseller
+	// starts with no layer of its own; admins opt in to notifications by
+	// saving a layer via POST /alerts/config. Runs in the background: a
+	// slow/struggling Mimir must not delay this response (failure is
+	// logged, does not block creation).
+	if reseller.LogtoID != nil && *reseller.LogtoID != "" {
+		alerting.ProvisionDefaultConfigAsync(*reseller.LogtoID, "reseller", reseller.ID)
+	}
+
+	// Return success response
+	cache.GetRBACCache().InvalidateAll()
+	c.JSON(http.StatusCreated, response.Created("reseller created successfully", reseller))
+}
+
+// GetReseller handles GET /api/resellers/:id - retrieves a single reseller
+func GetReseller(c *gin.Context) {
+	// Get reseller ID from URL parameter
+	resellerID := c.Param("id")
+	if resellerID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("reseller ID required", nil))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Get reseller
+	repo := entities.NewLocalResellerRepository()
+	reseller, err := repo.GetByID(resellerID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("reseller not found", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to get reseller")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to get reseller", nil))
+		return
+	}
+
+	// Apply RBAC validation
+	userOrgRole := strings.ToLower(user.OrgRole)
+	canAccess := false
+	switch userOrgRole {
+	case "owner":
+		canAccess = true
+	case "distributor":
+		// Check if this reseller was created by the distributor (via CustomData)
+		if reseller.CustomData != nil {
+			if createdBy, ok := reseller.CustomData["createdBy"].(string); ok && createdBy == user.OrganizationID {
+				canAccess = true
+			}
+		}
+	case "reseller":
+		// Reseller can only access themselves
+		if resellerID == user.OrganizationID {
+			canAccess = true
+		}
+	}
+
+	if !canAccess {
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied to reseller", nil))
+		return
+	}
+
+	// Resolve rebranding info
+	if reseller.LogtoID != nil {
+		reseller.RebrandingEnabled, reseller.RebrandingOrgID = resolveRebranding(*reseller.LogtoID)
+	}
+
+	// Log the action
+	logger.RequestLogger(c, "resellers").Info().
+		Str("operation", "get_reseller").
+		Str("reseller_id", resellerID).
+		Msg("Reseller details requested")
+
+	// Return reseller
+	c.JSON(http.StatusOK, response.OK("reseller retrieved successfully", reseller))
+}
+
+// GetResellers handles GET /api/resellers - list resellers with pagination
+func GetResellers(c *gin.Context) {
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Parse pagination and sorting parameters
+	page, pageSize, sortBy, sortDirection := helpers.GetPaginationAndSortingFromQuery(c)
+
+	// Parse search and status parameters
+	search := c.Query("search")
+	statuses := c.QueryArray("status")
+	createdBy := c.QueryArray("created_by")
+	ownedBy := c.QueryArray("organization_id")
+
+	// Create service
+	service := local.NewOrganizationService()
+
+	// include_hierarchy expands each organization_id to the org plus its whole
+	// subtree; the RBAC scope of the list still applies on top.
+	if c.Query("include_hierarchy") == "true" && len(ownedBy) > 0 {
+		expanded, err := service.ExpandOrganizationIDs(ownedBy)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to expand organization hierarchy", nil))
+			return
+		}
+		ownedBy = expanded
+	}
+
+	// include_counts selects the inline counters: absent for none, "true" for
+	// the ones the portal lists render, "all" to also pay for
+	// applications_count. See models.CountsMode.
+	counts := models.ParseCountsMode(c.Query("include_counts"))
+
+	// Get resellers based on RBAC
+	userOrgRole := strings.ToLower(user.OrgRole)
+	resellers, totalCount, err := service.ListResellers(c.Request.Context(), userOrgRole, user.OrganizationID, page, pageSize, search, sortBy, sortDirection, statuses, createdBy, ownedBy, counts)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("user_org_role", userOrgRole).
+			Msg("Failed to list resellers")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to list resellers", nil))
+		return
+	}
+
+	// Batch resolve rebranding info (eliminates N+1 queries)
+	var orgIDsForRebranding []string
+	for _, res := range resellers {
+		if res.LogtoID != nil {
+			orgIDsForRebranding = append(orgIDsForRebranding, *res.LogtoID)
+		}
+	}
+	rebrandingService := local.NewRebrandingService()
+	rebrandingResults := rebrandingService.BatchResolveRebranding(orgIDsForRebranding)
+	for i := range resellers {
+		if resellers[i].LogtoID != nil {
+			if res, ok := rebrandingResults[*resellers[i].LogtoID]; ok && res.Enabled {
+				resellers[i].RebrandingEnabled = true
+				resellers[i].RebrandingOrgID = &res.ResolvedOrgID
+			}
+		}
+	}
+
+	// Log the action
+	logger.RequestLogger(c, "resellers").Info().
+		Str("operation", "list_resellers").
+		Int("page", page).
+		Int("page_size", pageSize).
+		Str("search", search).
+		Int("total_count", totalCount).
+		Int("returned_count", len(resellers)).
+		Msg("Resellers list requested")
+
+	// Return paginated response
+	c.JSON(http.StatusOK, response.OK("resellers retrieved successfully", gin.H{
+		"resellers":  helpers.EnsureSlice(resellers),
+		"pagination": helpers.BuildPaginationInfoWithSorting(page, pageSize, totalCount, sortBy, sortDirection),
+	}))
+}
+
+// UpdateReseller handles PUT /api/resellers/:id - updates a reseller locally and syncs to Logto
+func UpdateReseller(c *gin.Context) {
+	// Get reseller ID from URL parameter
+	resellerID := c.Param("id")
+	if resellerID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("reseller ID required", nil))
+		return
+	}
+
+	// Parse request body
+	var request models.UpdateLocalResellerRequest
+	if err := c.ShouldBindBodyWith(&request, binding.JSON); err != nil {
+		c.JSON(http.StatusBadRequest, response.ValidationBadRequestMultiple(err))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Get reseller to obtain logto_id for hierarchy validation
+	repo := entities.NewLocalResellerRepository()
+	reseller, err := repo.GetByID(resellerID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("reseller not found", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to get reseller for update validation")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to get reseller", nil))
+		return
+	}
+
+	// Apply hierarchical RBAC validation using service layer
+	userService := local.NewUserService()
+	userOrgRole := strings.ToLower(user.OrgRole)
+	canUpdate := false
+
+	switch userOrgRole {
+	case "owner":
+		canUpdate = true
+	case "distributor":
+		// Use hierarchical validation - check if reseller organization is in hierarchy
+		// Pass the logto_id, not the local database ID
+		if reseller.LogtoID != nil {
+			canUpdate = userService.IsOrganizationInHierarchy(userOrgRole, user.OrganizationID, *reseller.LogtoID)
+		}
+	case "reseller":
+		// Reseller can only update themselves - compare with logto_id
+		if reseller.LogtoID != nil && *reseller.LogtoID == user.OrganizationID {
+			canUpdate = true
+		}
+	}
+
+	if !canUpdate {
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied to update reseller", nil))
+		return
+	}
+
+	// Create service
+	service := local.NewOrganizationService()
+
+	// Update reseller
+	reseller, err = service.UpdateReseller(resellerID, &request, user.ID, user.OrganizationID)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to update reseller")
+
+		// Check if it's a validation error from service
+		if validationErr := getValidationError(err); validationErr != nil {
+			c.JSON(http.StatusBadRequest, response.ValidationFailed("validation failed", validationErr.ErrorData.Errors))
+			return
+		}
+
+		// Default to internal server error
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to update reseller", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Log the action
+	logger.LogBusinessOperation(c, "resellers", "update", "reseller", resellerID, true, nil)
+
+	// Return success response
+	cache.GetRBACCache().InvalidateAll()
+	c.JSON(http.StatusOK, response.OK("reseller updated successfully", reseller))
+}
+
+// DeleteReseller handles DELETE /api/resellers/:id - soft-deletes a reseller locally and syncs to Logto
+func DeleteReseller(c *gin.Context) {
+	// Get reseller ID from URL parameter
+	resellerID := c.Param("id")
+	if resellerID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("reseller ID required", nil))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Get reseller to obtain logto_id for hierarchy validation
+	repo := entities.NewLocalResellerRepository()
+	reseller, err := repo.GetByID(resellerID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("reseller not found", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to get reseller for deletion validation")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to get reseller", nil))
+		return
+	}
+
+	// Apply hierarchical RBAC validation - only creators and above can delete
+	userService := local.NewUserService()
+	userOrgRole := strings.ToLower(user.OrgRole)
+	canDelete := false
+
+	switch userOrgRole {
+	case "owner":
+		canDelete = true
+	case "distributor":
+		// Use hierarchical validation - check if reseller organization is in hierarchy
+		// Pass the logto_id, not the local database ID
+		if reseller.LogtoID != nil {
+			canDelete = userService.IsOrganizationInHierarchy(userOrgRole, user.OrganizationID, *reseller.LogtoID)
+		}
+	}
+
+	if !canDelete {
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied to delete reseller", nil))
+		return
+	}
+
+	// Create service
+	service := local.NewOrganizationService()
+
+	// Delete reseller
+	deletedSystemsCount, deletedUsersCount, err := service.DeleteReseller(resellerID, user.ID, user.OrganizationID)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to delete reseller")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to delete reseller", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Log the action
+	logger.LogBusinessOperation(c, "resellers", "delete", "reseller", resellerID, true, nil)
+
+	// Return success response
+	cache.GetRBACCache().InvalidateAll()
+	c.JSON(http.StatusOK, response.OK("reseller deleted successfully", map[string]interface{}{
+		"deleted_systems_count": deletedSystemsCount,
+		"deleted_users_count":   deletedUsersCount,
+	}))
+}
+
+// RestoreReseller handles PATCH /api/resellers/:id/restore - restores a soft-deleted reseller
+func RestoreReseller(c *gin.Context) {
+	resellerID := c.Param("id")
+	if resellerID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("reseller ID required", nil))
+		return
+	}
+
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Get reseller (including deleted) for hierarchy validation
+	repo := entities.NewLocalResellerRepository()
+	reseller, err := repo.GetByIDIncludeDeleted(resellerID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("reseller not found", nil))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to get reseller", nil))
+		return
+	}
+
+	// RBAC: owner can always, distributor checks hierarchy
+	userOrgRole := strings.ToLower(user.OrgRole)
+	canRestore := false
+	switch userOrgRole {
+	case "owner":
+		canRestore = true
+	case "distributor":
+		if reseller.LogtoID != nil {
+			userService := local.NewUserService()
+			canRestore = userService.IsOrganizationInHierarchyIncludeDeleted(userOrgRole, user.OrganizationID, *reseller.LogtoID)
+		}
+	}
+
+	if !canRestore {
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied to restore reseller", nil))
+		return
+	}
+
+	service := local.NewOrganizationService()
+
+	restoredSystemsCount, restoredUsersCount, err := service.RestoreReseller(resellerID, user.ID, user.OrganizationID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not deleted") {
+			c.JSON(http.StatusBadRequest, response.BadRequest("reseller is not deleted", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to restore reseller")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to restore reseller", nil))
+		return
+	}
+
+	logger.LogBusinessOperation(c, "resellers", "restore", "reseller", resellerID, true, nil)
+
+	cache.GetRBACCache().InvalidateAll()
+	c.JSON(http.StatusOK, response.OK("reseller restored successfully", map[string]interface{}{
+		"restored_systems_count": restoredSystemsCount,
+		"restored_users_count":   restoredUsersCount,
+	}))
+}
+
+// DestroyReseller handles DELETE /api/resellers/:id/destroy - permanently deletes a reseller
+func DestroyReseller(c *gin.Context) {
+	resellerID := c.Param("id")
+	if resellerID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("reseller ID required", nil))
+		return
+	}
+
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Get reseller (including deleted) for hierarchy validation
+	repo := entities.NewLocalResellerRepository()
+	reseller, err := repo.GetByIDIncludeDeleted(resellerID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("reseller not found", nil))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to get reseller", nil))
+		return
+	}
+
+	// RBAC: owner can always, distributor checks hierarchy
+	userOrgRole := strings.ToLower(user.OrgRole)
+	canDestroy := false
+	switch userOrgRole {
+	case "owner":
+		canDestroy = true
+	case "distributor":
+		if reseller.LogtoID != nil {
+			userService := local.NewUserService()
+			canDestroy = userService.IsOrganizationInHierarchyIncludeDeleted(userOrgRole, user.OrganizationID, *reseller.LogtoID)
+		}
+	}
+
+	if !canDestroy {
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied to destroy reseller", nil))
+		return
+	}
+
+	service := local.NewOrganizationService()
+
+	err = service.DestroyReseller(resellerID, user.ID, user.OrganizationID)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to destroy reseller")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to destroy reseller", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	logger.LogBusinessOperation(c, "resellers", "destroy", "reseller", resellerID, true, nil)
+
+	cache.GetRBACCache().InvalidateAll()
+	c.JSON(http.StatusOK, response.OK("reseller permanently destroyed", nil))
+}
+
+// GetResellerStats handles GET /api/resellers/:id/stats - retrieves users and systems count for a reseller
+func GetResellerStats(c *gin.Context) {
+	// Get reseller ID from URL parameter
+	resellerID := c.Param("id")
+	if resellerID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("reseller ID required", nil))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Get reseller to obtain logto_id for hierarchy validation
+	repo := entities.NewLocalResellerRepository()
+	reseller, err := repo.GetByID(resellerID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("reseller not found", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to get reseller for stats")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to get reseller", nil))
+		return
+	}
+
+	// Apply hierarchical RBAC validation
+	userService := local.NewUserService()
+	userOrgRole := strings.ToLower(user.OrgRole)
+	canAccess := false
+
+	switch userOrgRole {
+	case "owner":
+		canAccess = true
+	case "distributor":
+		if reseller.LogtoID != nil {
+			canAccess = userService.IsOrganizationInHierarchy(userOrgRole, user.OrganizationID, *reseller.LogtoID)
+		}
+	case "reseller":
+		if reseller.LogtoID != nil && *reseller.LogtoID == user.OrganizationID {
+			canAccess = true
+		}
+	}
+
+	if !canAccess {
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied to reseller stats", nil))
+		return
+	}
+
+	// Get stats
+	stats, err := repo.GetStats(resellerID)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to get reseller stats")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to get reseller stats", nil))
+		return
+	}
+
+	// Log the action
+	logger.RequestLogger(c, "resellers").Info().
+		Str("operation", "get_reseller_stats").
+		Str("reseller_id", resellerID).
+		Int("users_count", stats.UsersCount).
+		Int("systems_count", stats.SystemsCount).
+		Int("customers_count", stats.CustomersCount).
+		Int("applications_count", stats.ApplicationsCount).
+		Int("applications_hierarchy_count", stats.ApplicationsHierarchyCount).
+		Msg("Reseller stats requested")
+
+	// Return stats
+	c.JSON(http.StatusOK, response.OK("reseller stats retrieved successfully", stats))
+}
+
+// SuspendReseller handles PATCH /api/resellers/:id/suspend - suspends a reseller and all its users
+func SuspendReseller(c *gin.Context) {
+	// Get reseller ID from URL parameter
+	resellerID := c.Param("id")
+	if resellerID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("reseller ID required", nil))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Get reseller to obtain logto_id for hierarchy validation
+	repo := entities.NewLocalResellerRepository()
+	reseller, err := repo.GetByID(resellerID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("reseller not found", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to get reseller for suspension validation")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to get reseller", nil))
+		return
+	}
+
+	// Apply hierarchical RBAC validation - only Owner and Distributor can suspend
+	userService := local.NewUserService()
+	userOrgRole := strings.ToLower(user.OrgRole)
+	canSuspend := false
+
+	switch userOrgRole {
+	case "owner":
+		canSuspend = true
+	case "distributor":
+		if reseller.LogtoID != nil {
+			canSuspend = userService.IsOrganizationInHierarchy(userOrgRole, user.OrganizationID, *reseller.LogtoID)
+		}
+	}
+
+	if !canSuspend {
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied to suspend reseller", nil))
+		return
+	}
+
+	// Suspend reseller
+	service := local.NewOrganizationService()
+	reseller, suspendedCustomersCount, suspendedUsersCount, suspendedSystemsCount, err := service.SuspendReseller(resellerID, user.ID, user.OrganizationID)
+	if err != nil {
+		if strings.Contains(err.Error(), "already suspended") {
+			c.JSON(http.StatusBadRequest, response.BadRequest("reseller is already suspended", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to suspend reseller")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to suspend reseller", nil))
+		return
+	}
+
+	// Log the action
+	logger.LogBusinessOperation(c, "resellers", "suspend", "reseller", resellerID, true, nil)
+
+	// Return success response
+	cache.GetRBACCache().InvalidateAll()
+	c.JSON(http.StatusOK, response.OK("reseller suspended successfully", map[string]interface{}{
+		"reseller":                  reseller,
+		"suspended_customers_count": suspendedCustomersCount,
+		"suspended_users_count":     suspendedUsersCount,
+		"suspended_systems_count":   suspendedSystemsCount,
+	}))
+}
+
+// ReactivateReseller handles PATCH /api/resellers/:id/reactivate - reactivates a reseller and its cascade-suspended users
+func ReactivateReseller(c *gin.Context) {
+	// Get reseller ID from URL parameter
+	resellerID := c.Param("id")
+	if resellerID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("reseller ID required", nil))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Get reseller to obtain logto_id for hierarchy validation
+	repo := entities.NewLocalResellerRepository()
+	reseller, err := repo.GetByID(resellerID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("reseller not found", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to get reseller for reactivation validation")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to get reseller", nil))
+		return
+	}
+
+	// Apply hierarchical RBAC validation - only Owner and Distributor can reactivate
+	userService := local.NewUserService()
+	userOrgRole := strings.ToLower(user.OrgRole)
+	canReactivate := false
+
+	switch userOrgRole {
+	case "owner":
+		canReactivate = true
+	case "distributor":
+		if reseller.LogtoID != nil {
+			canReactivate = userService.IsOrganizationInHierarchy(userOrgRole, user.OrganizationID, *reseller.LogtoID)
+		}
+	}
+
+	if !canReactivate {
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied to reactivate reseller", nil))
+		return
+	}
+
+	// Guard: if reseller was cascade-suspended by a higher org, only that org's authority can reactivate
+	if reseller.SuspendedByOrgID != nil && *reseller.SuspendedByOrgID != "" {
+		c.JSON(http.StatusForbidden, response.Forbidden("reseller is suspended by a parent organization and cannot be reactivated directly", nil))
+		return
+	}
+
+	// Reactivate reseller
+	service := local.NewOrganizationService()
+	reseller, reactivatedCustomersCount, reactivatedUsersCount, reactivatedSystemsCount, err := service.ReactivateReseller(resellerID, user.ID, user.OrganizationID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not suspended") {
+			c.JSON(http.StatusBadRequest, response.BadRequest("reseller is not suspended", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to reactivate reseller")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to reactivate reseller", nil))
+		return
+	}
+
+	// Log the action
+	logger.LogBusinessOperation(c, "resellers", "reactivate", "reseller", resellerID, true, nil)
+
+	// Return success response
+	cache.GetRBACCache().InvalidateAll()
+	c.JSON(http.StatusOK, response.OK("reseller reactivated successfully", map[string]interface{}{
+		"reseller":                    reseller,
+		"reactivated_customers_count": reactivatedCustomersCount,
+		"reactivated_users_count":     reactivatedUsersCount,
+		"reactivated_systems_count":   reactivatedSystemsCount,
+	}))
+}
+
+// PromoteReseller handles PATCH /api/resellers/:id/promote - moves a reseller
+// up to distributor level, in place. Restricted to owner-level authority: the
+// promoted organization leaves the scope of the distributor that manages it, so
+// no distributor can hand out (or take back) a level on its own.
+func PromoteReseller(c *gin.Context) {
+	resellerID := c.Param("id")
+	if resellerID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("reseller ID required", nil))
+		return
+	}
+
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Promotion changes the shape of the commercial hierarchy: it stays an
+	// Owner-organization duty (Owner and Staff users), with global reach.
+	if !IsOwnerOrgMember(user) {
+		logger.RequestLogger(c, "resellers").Warn().
+			Str("operation", "promote_denied").
+			Str("user_id", user.ID).
+			Str("org_role", user.OrgRole).
+			Strs("user_roles", user.UserRoles).
+			Str("reseller_id", resellerID).
+			Msg("Promotion denied - Owner organization required")
+
+		c.JSON(http.StatusForbidden, response.Forbidden("access denied to promote reseller", nil))
+		return
+	}
+
+	service := local.NewOrganizationService()
+	promotion, err := service.PromoteResellerToDistributor(resellerID, models.NewOrgCreatorFromUser(*user), user.OrganizationID)
+	if err != nil {
+		if validationErr := getValidationError(err); validationErr != nil {
+			c.JSON(validationErr.StatusCode, response.Error(validationErr.StatusCode, "validation failed", validationErr.ErrorData))
+			return
+		}
+
+		switch {
+		case strings.Contains(err.Error(), "not found"):
+			c.JSON(http.StatusNotFound, response.NotFound("reseller not found", nil))
+			return
+		case errors.Is(err, local.ErrPromoteResellerSuspended):
+			promoteConflict(c, resellerID, err, "organization_is_suspended")
+			return
+		case errors.Is(err, local.ErrPromoteResellerNotSynced):
+			promoteConflict(c, resellerID, err, "organization_not_synced")
+			return
+		case errors.Is(err, local.ErrPromoteOwnerOrgUnknown):
+			promoteConflict(c, resellerID, err, "owner_organization_not_found")
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("reseller_id", resellerID).
+			Msg("Failed to promote reseller to distributor")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to promote reseller", nil))
+		return
+	}
+
+	logger.LogBusinessOperation(c, "resellers", "promote", "reseller", resellerID, true, nil)
+
+	// The organization keeps its Mimir tenant, but its ancestor chain now stops
+	// at the Owner: re-render and push the tenant config so the layers of the
+	// distributor it leaves stop reaching it.
+	promotedID := ""
+	if promotion.Distributor != nil {
+		promotedID = promotion.Distributor.ID
+	}
+	alerting.ProvisionDefaultConfigAsync(resellerID, "distributor", promotedID)
+
+	cache.GetRBACCache().InvalidateAll()
+	c.JSON(http.StatusOK, response.OK("reseller promoted to distributor successfully", promotion))
+}
+
+// promoteConflict answers a promotion conflict in the validation-error shape the
+// other write endpoints use: the client builds its i18n key from errors[].key
+// and errors[].message, so the message carries a stable code and the readable
+// wording stays on the client side. The cause goes to the audit log.
+func promoteConflict(c *gin.Context, resellerID string, cause error, code string) {
+	logger.LogBusinessOperation(c, "resellers", "promote", "reseller", resellerID, false, cause)
+
+	c.JSON(http.StatusConflict, response.Error(http.StatusConflict, "validation failed", response.ErrorData{
+		Type: "validation_error",
+		Errors: []response.ValidationError{
+			{Key: "promote", Message: code},
+		},
+	}))
+}

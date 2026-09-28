@@ -1,0 +1,30 @@
+# Extract mimir binary from official image
+FROM docker.io/grafana/mimir:3.0.6 AS mimir
+
+# Final stage: alpine with shell for entrypoint script
+FROM alpine:3.24
+
+RUN apk add --no-cache gettext tzdata
+
+# Copy mimir binary from official image
+COPY --from=mimir /bin/mimir /bin/mimir
+
+# Copy build trigger file to force rebuilds when it changes
+COPY .render-build-trigger /tmp/build-trigger
+
+# Copy Mimir config template
+COPY my.yaml /etc/mimir/my.yaml.template
+
+# Copy default runtime configuration (per-tenant overrides, reloaded every 10s)
+COPY runtime_config.yaml /etc/mimir/runtime_config.yaml
+
+# Copy entrypoint script (must be executable in the repo)
+COPY entrypoint.sh /entrypoint.sh
+
+# Expose default port (can be overridden by runtime environment)
+ARG PORT=9009
+ENV PORT=${PORT}
+EXPOSE ${PORT}
+
+# Use entrypoint script
+ENTRYPOINT ["/entrypoint.sh"]

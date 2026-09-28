@@ -1,0 +1,169 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import { NeButton, NeDropdown, NeHeading } from '@nethesis/vue-components'
+import ResellersTable from '@/components/resellers/ResellersTable.vue'
+import ImportOrganizationsModal from '@/components/organizations/ImportOrganizationsModal.vue'
+import { ref } from 'vue'
+import {
+  faChevronDown,
+  faCircleArrowUp,
+  faCirclePlus,
+  faFileCsv,
+  faFilePdf,
+} from '@fortawesome/free-solid-svg-icons'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import { canManageResellers } from '@/lib/permissions'
+import { useResellers } from '@/queries/organizations/resellers'
+import { useI18n } from 'vue-i18n'
+import {
+  getExport,
+  getImportTemplate,
+  validateResellersImport,
+  confirmResellersImport,
+  RESELLERS_KEY,
+  RESELLERS_TOTAL_KEY,
+  type ResellerStatus,
+} from '@/lib/organizations/resellers'
+import { downloadFile } from '@/lib/common'
+import { useRoute, useRouter } from 'vue-router'
+
+const { t } = useI18n()
+const route = useRoute()
+const router = useRouter()
+const {
+  state,
+  debouncedTextFilter,
+  statusFilter,
+  createdByFilter,
+  organizationFilter,
+  sortBy,
+  sortDescending,
+  resetFilters,
+} = useResellers()
+
+// apply the parent company filter requested via query params, then clean the URL
+const { organization_id: orgId, organization_name: orgName } = route.query
+
+if (typeof orgId === 'string' && orgId && typeof orgName === 'string' && orgName) {
+  resetFilters()
+  // the filter renders the label carried by the selection: pass the organization
+  // name, as it may not be among the options the dropdown has loaded
+  organizationFilter.value = [{ id: orgId, label: orgName }]
+  router.replace({ query: {} })
+}
+
+const isShownCreateResellerDrawer = ref(false)
+const isShownImportResellersModal = ref(false)
+
+function getBulkActionsMenuItems() {
+  return [
+    ...(canManageResellers()
+      ? [
+          {
+            id: 'importResellers',
+            label: t('resellers.import_resellers'),
+            icon: faCircleArrowUp,
+            action: () => (isShownImportResellersModal.value = true),
+          },
+        ]
+      : []),
+    {
+      id: 'exportFilteredToPdf',
+      label: t('resellers.export_resellers_to_pdf'),
+      icon: faFilePdf,
+      action: () => exportResellers('pdf'),
+      disabled: !state.value.data?.resellers.length,
+    },
+    {
+      id: 'exportFilteredToCsv',
+      label: t('resellers.export_resellers_to_csv'),
+      icon: faFileCsv,
+      action: () => exportResellers('csv'),
+      disabled: !state.value.data?.resellers.length,
+    },
+  ]
+}
+
+async function exportResellers(format: 'pdf' | 'csv') {
+  try {
+    const exportData = await getExport(
+      format,
+      debouncedTextFilter.value,
+      statusFilter.value.map((o) => o.id) as ResellerStatus[],
+      createdByFilter.value.map((o) => o.id),
+      organizationFilter.value.map((o) => o.id),
+      sortBy.value,
+      sortDescending.value,
+    )
+    const fileName = `${t('resellers.title')}.${format}`
+    downloadFile(exportData, fileName, format)
+  } catch (error) {
+    console.error(`Cannot export resellers to ${format}:`, error)
+    throw error
+  }
+}
+</script>
+
+<template>
+  <div>
+    <NeHeading tag="h3" class="mb-7">{{ $t('resellers.title') }}</NeHeading>
+    <div class="mb-8 flex flex-col items-start justify-between gap-6 xl:flex-row">
+      <div class="max-w-2xl text-gray-500 dark:text-gray-400">
+        {{ $t('resellers.page_description') }}
+      </div>
+      <div class="flex flex-row-reverse items-center gap-4 xl:flex-row">
+        <NeDropdown
+          :items="getBulkActionsMenuItems()"
+          align-to-right
+          :openMenuAriaLabel="$t('ne_dropdown.open_menu')"
+        >
+          <template #button>
+            <NeButton>
+              <template #suffix>
+                <FontAwesomeIcon
+                  :icon="faChevronDown"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                /> </template
+              >{{ $t('common.actions') }}</NeButton
+            >
+          </template>
+        </NeDropdown>
+        <!-- create reseller -->
+        <NeButton
+          v-if="canManageResellers()"
+          kind="primary"
+          size="lg"
+          class="shrink-0"
+          @click="isShownCreateResellerDrawer = true"
+        >
+          <template #prefix>
+            <FontAwesomeIcon :icon="faCirclePlus" aria-hidden="true" />
+          </template>
+          {{ $t('resellers.create_reseller') }}
+        </NeButton>
+      </div>
+    </div>
+    <ResellersTable
+      :isShownCreateResellerDrawer="isShownCreateResellerDrawer"
+      @close-drawer="isShownCreateResellerDrawer = false"
+    />
+    <!-- import resellers modal -->
+    <ImportOrganizationsModal
+      :is-shown="isShownImportResellersModal"
+      entity-name="resellers"
+      entity-label="reseller"
+      :cache-keys="{ main: RESELLERS_KEY, total: RESELLERS_TOTAL_KEY }"
+      :api="{
+        getTemplate: getImportTemplate,
+        validate: validateResellersImport,
+        confirm: confirmResellersImport,
+      }"
+      @close="isShownImportResellersModal = false"
+    />
+  </div>
+</template>

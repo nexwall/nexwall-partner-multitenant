@@ -1,0 +1,840 @@
+/*
+Copyright (C) 2025 Nethesis S.r.l.
+SPDX-License-Identifier: AGPL-3.0-or-later
+*/
+
+package methods
+
+import (
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
+
+	"github.com/nethesis/my/backend/cache"
+	"github.com/nethesis/my/backend/entities"
+	"github.com/nethesis/my/backend/helpers"
+	"github.com/nethesis/my/backend/logger"
+	"github.com/nethesis/my/backend/models"
+	"github.com/nethesis/my/backend/response"
+	"github.com/nethesis/my/backend/services/local"
+)
+
+// CreateSystem handles POST /api/systems - creates a new system
+func CreateSystem(c *gin.Context) {
+	// Parse request body
+	var request models.CreateSystemRequest
+	if err := c.ShouldBindBodyWith(&request, binding.JSON); err != nil {
+		c.JSON(http.StatusBadRequest, response.ValidationBadRequestMultiple(err))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Create systems service
+	systemsService := local.NewSystemsService()
+
+	// Create SystemCreator object with detailed user information
+	// Use logto_id for consistency across the system (users and organizations both use logto_id)
+	userLogtoID := ""
+	if user.LogtoID != nil {
+		userLogtoID = *user.LogtoID
+	}
+	creatorInfo := &models.SystemCreator{
+		UserID:           userLogtoID,
+		Username:         user.Username,
+		Name:             user.Name,
+		Email:            user.Email,
+		OrganizationID:   user.OrganizationID,
+		OrganizationName: user.OrganizationName,
+	}
+
+	// When an owner/distributor creates a system on behalf of an ancestor org via
+	// created_by_organization_id, stamp that org on the creator snapshot so the
+	// displayed "created by" matches the owning reseller/distributor (parity with
+	// customers). Display/audit only: system ownership stays organization_id-based;
+	// the user identity stays the actual actor.
+	if request.CreatedByOrganizationID != "" {
+		orgService := local.NewOrganizationService()
+		createdByOrgID, createdByOrgName, allowed, reason := orgService.ResolveCreatedByOrg(user.OrgRole, user.OrganizationID, request.CreatedByOrganizationID, "system")
+		if !allowed {
+			c.JSON(http.StatusForbidden, response.Forbidden("access denied: "+reason, nil))
+			return
+		}
+		creatorInfo.AttributeToOrg(createdByOrgID, createdByOrgName)
+	}
+
+	// created_at/registered_at overrides carry the timestamps a system already has
+	// in an external source of record (e.g. a bulk import). Owner/distributor only,
+	// never in the future.
+	if request.CreatedAt != nil || request.RegisteredAt != nil {
+		role := strings.ToLower(user.OrgRole)
+		if !models.IsGlobalOrgRole(role) && role != "distributor" {
+			c.JSON(http.StatusForbidden, response.Forbidden("access denied: only owner or distributor can set created_at/registered_at", nil))
+			return
+		}
+		now := time.Now()
+		var validationErrors []response.ValidationError
+		if request.CreatedAt != nil && request.CreatedAt.After(now) {
+			validationErrors = append(validationErrors, response.ValidationError{
+				Key: "created_at", Message: "cannot_be_in_future", Value: request.CreatedAt.Format(time.RFC3339),
+			})
+		}
+		if request.RegisteredAt != nil && request.RegisteredAt.After(now) {
+			validationErrors = append(validationErrors, response.ValidationError{
+				Key: "registered_at", Message: "cannot_be_in_future", Value: request.RegisteredAt.Format(time.RFC3339),
+			})
+		}
+		if request.CreatedAt != nil && request.RegisteredAt != nil && request.RegisteredAt.Before(*request.CreatedAt) {
+			validationErrors = append(validationErrors, response.ValidationError{
+				Key: "registered_at", Message: "cannot_precede_created_at", Value: request.RegisteredAt.Format(time.RFC3339),
+			})
+		}
+		if len(validationErrors) > 0 {
+			c.JSON(http.StatusBadRequest, response.ValidationFailed("validation failed", validationErrors))
+			return
+		}
+	}
+
+	// Create system with automatic secret generation
+	system, err := systemsService.CreateSystem(&request, creatorInfo, user.OrgRole, user.OrganizationID)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("user_id", user.ID).
+			Str("system_name", request.Name).
+			Msg("Failed to create system")
+
+		// Check if it's an access denied error
+		if strings.Contains(err.Error(), "access denied") {
+			c.JSON(http.StatusForbidden, response.Forbidden(err.Error(), nil))
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to create system", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Log the action
+	logger.LogBusinessOperation(c, "systems", "create", "system", system.ID, true, nil)
+
+	// Return success response with system data directly in data
+	c.JSON(http.StatusCreated, response.Created("system created successfully", system))
+}
+
+// GetSystems handles GET /api/systems - retrieves all systems with pagination
+func GetSystems(c *gin.Context) {
+	// Get current user context with organization ID
+	userID, userOrgID, userOrgRole, _ := helpers.GetUserContextExtended(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, response.Unauthorized("user context required", nil))
+		return
+	}
+
+	// Parse pagination and sorting parameters
+	page, pageSize, sortBy, sortDirection := helpers.GetPaginationAndSortingFromQuery(c)
+
+	// Override default page size for systems
+	if c.Query("page_size") == "" {
+		pageSize = 50 // Default page size for systems
+	}
+
+	// Parse search parameter
+	search := c.Query("search")
+
+	// Parse filter parameters (supporting multiple values via checkbox, except name which is text input)
+	filterName := c.Query("name")                   // Name filter (single value, text input)
+	filterSystemKey := c.QueryArray("system_key")   // System Key filter (multiple values, exact match)
+	filterTypes := c.QueryArray("type")             // Product/Type filter (multiple values)
+	filterCreatedBy := c.QueryArray("created_by")   // Created By filter (multiple user IDs)
+	filterVersions := c.QueryArray("version")       // Version filter (multiple values)
+	filterOrgIDs := c.QueryArray("organization_id") // Organization filter (multiple IDs)
+	filterStatuses := c.QueryArray("status")        // Status filter (multiple values)
+	filterAddons := c.QueryArray("addon")           // Add-on filter (multiple catalog ids)
+
+	// include_hierarchy expands each organization_id filter to the org plus its
+	// whole subtree (resellers/customers); the systems RBAC scope still applies
+	// on top, so the expansion can never widen visibility.
+	if c.Query("include_hierarchy") == "true" && len(filterOrgIDs) > 0 {
+		expanded, err := local.NewOrganizationService().ExpandOrganizationIDs(filterOrgIDs)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to expand organization hierarchy", nil))
+			return
+		}
+		filterOrgIDs = expanded
+	}
+
+	// Create systems service
+	systemsService := local.NewSystemsService()
+
+	// Get systems with pagination, search, sorting and filters
+	filters := models.SystemListFilters{
+		Name:            filterName,
+		SystemKeys:      filterSystemKey,
+		Types:           filterTypes,
+		CreatedBy:       filterCreatedBy,
+		Versions:        filterVersions,
+		OrganizationIDs: filterOrgIDs,
+		Statuses:        filterStatuses,
+		Addons:          filterAddons,
+	}
+	systems, totalCount, err := systemsService.GetSystemsByOrganizationPaginated(
+		c.Request.Context(), userID, userOrgID, userOrgRole, page, pageSize, search, sortBy, sortDirection, filters,
+	)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Str("user_id", userID).
+			Int("page", page).
+			Int("page_size", pageSize).
+			Str("search", search).
+			Str("filter_name", filterName).
+			Strs("filter_types", filterTypes).
+			Strs("filter_created_by", filterCreatedBy).
+			Strs("filter_versions", filterVersions).
+			Strs("filter_organization_ids", filterOrgIDs).
+			Strs("filter_statuses", filterStatuses).
+			Strs("filter_addons", filterAddons).
+			Str("sort_by", sortBy).
+			Str("sort_direction", sortDirection).
+			Msg("Failed to retrieve systems")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to retrieve systems", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Batch resolve rebranding info (eliminates N+1 queries)
+	var orgIDsForRebranding []string
+	for _, sys := range systems {
+		if sys.Organization.LogtoID != "" {
+			orgIDsForRebranding = append(orgIDsForRebranding, sys.Organization.LogtoID)
+		}
+	}
+	rebrandingService := local.NewRebrandingService()
+	rebrandingResults := rebrandingService.BatchResolveRebranding(orgIDsForRebranding)
+	for i := range systems {
+		if systems[i].Organization.LogtoID != "" {
+			if res, ok := rebrandingResults[systems[i].Organization.LogtoID]; ok && res.Enabled {
+				systems[i].RebrandingEnabled = true
+				systems[i].RebrandingOrgID = &res.ResolvedOrgID
+			}
+		}
+	}
+
+	// Add-ons of the page, on request: one batch query over the ids just
+	// fetched, the same shape as the rebranding resolution above. It is opt-in
+	// because only the systems table shows them, while an export asks for tens
+	// of thousands of rows at a time.
+	if c.Query("include_addons") == "true" {
+		attachSystemAddons(c, systems)
+	}
+
+	// Log the action
+	logger.RequestLogger(c, "systems").Info().
+		Str("operation", "list_systems").
+		Int("count", len(systems)).
+		Int("total", totalCount).
+		Int("page", page).
+		Int("page_size", pageSize).
+		Str("search", search).
+		Str("filter_name", filterName).
+		Strs("filter_types", filterTypes).
+		Strs("filter_created_by", filterCreatedBy).
+		Strs("filter_versions", filterVersions).
+		Strs("filter_organization_ids", filterOrgIDs).
+		Strs("filter_statuses", filterStatuses).
+		Strs("filter_addons", filterAddons).
+		Str("sort_by", sortBy).
+		Str("sort_direction", sortDirection).
+		Msg("Systems list requested")
+
+	// Return paginated systems list
+	c.JSON(http.StatusOK, response.OK("systems retrieved successfully", gin.H{
+		"systems":    helpers.EnsureSlice(systems),
+		"pagination": helpers.BuildPaginationInfoWithSorting(page, pageSize, totalCount, sortBy, sortDirection),
+	}))
+}
+
+// GetSystem handles GET /api/systems/:id - retrieves a single system
+func GetSystem(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Create systems service
+	systemsService := local.NewSystemsService()
+
+	// Get system with access validation
+	system, err := systemsService.GetSystem(systemID, user.OrgRole, user.OrganizationID)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Resolve rebranding info
+	if system.Organization.LogtoID != "" {
+		system.RebrandingEnabled, system.RebrandingOrgID = resolveRebranding(system.Organization.LogtoID)
+	}
+
+	// Log the action
+	logger.RequestLogger(c, "systems").Info().
+		Str("operation", "get_system").
+		Str("system_id", systemID).
+		Msg("System details requested")
+
+	// Return system
+	c.JSON(http.StatusOK, response.OK("system retrieved successfully", system))
+}
+
+// UpdateSystem handles PUT /api/systems/:id - updates an existing system
+func UpdateSystem(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Parse request body
+	var request models.UpdateSystemRequest
+	if err := c.ShouldBindBodyWith(&request, binding.JSON); err != nil {
+		c.JSON(http.StatusBadRequest, response.ValidationBadRequestMultiple(err))
+		return
+	}
+
+	// Create systems service
+	systemsService := local.NewSystemsService()
+
+	// Update system with access validation. Pass actor metadata so the
+	// cross-org transfer audit row (if any) records who made the change
+	// and from where.
+	reqCtx := local.UpdateSystemRequestContext{
+		ActorIP:   c.ClientIP(),
+		UserAgent: c.Request.UserAgent(),
+	}
+	system, err := systemsService.UpdateSystem(systemID, &request, user.ID, user.OrganizationID, user.OrgRole, reqCtx)
+	if errors.Is(err, cache.ErrSystemReassignLocked) {
+		c.JSON(http.StatusConflict, response.Error(http.StatusConflict, err.Error(), nil))
+		return
+	}
+	// Reassignment requires the system to be registered (per-system resources
+	// are keyed by system_key, which is only assigned at registration). Map
+	// the precondition error to a structured 400 instead of letting
+	// HandleAccessError fall through to 500.
+	if err != nil && strings.Contains(err.Error(), "cannot reassign organization") {
+		c.JSON(http.StatusBadRequest, response.ValidationFailed("validation failed", []response.ValidationError{
+			{Key: "organization_id", Message: "system_not_registered", Value: request.OrganizationID},
+		}))
+		return
+	}
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Log the action
+	logger.LogBusinessOperation(c, "systems", "update", "system", systemID, true, nil)
+
+	// Return updated system
+	c.JSON(http.StatusOK, response.OK("system updated successfully", system))
+}
+
+// DeleteSystem handles DELETE /api/systems/:id - deletes a system
+func DeleteSystem(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Create systems service
+	systemsService := local.NewSystemsService()
+
+	// Delete system with access validation
+	err := systemsService.DeleteSystem(systemID, user.ID, user.OrganizationID, user.OrgRole)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Log the action
+	logger.LogBusinessOperation(c, "systems", "delete", "system", systemID, true, nil)
+
+	// Return success response
+	c.JSON(http.StatusOK, response.OK("system deleted successfully", nil))
+}
+
+// RestoreSystem handles PATCH /api/systems/:id/restore - restores a soft-deleted system
+func RestoreSystem(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Create systems service
+	systemsService := local.NewSystemsService()
+
+	// Restore system with access validation
+	err := systemsService.RestoreSystem(systemID, user.ID, user.OrganizationID, user.OrgRole)
+	if err != nil {
+		errMsg := err.Error()
+
+		// Check for specific error types
+		if strings.Contains(errMsg, "system not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("system not found", nil))
+			return
+		}
+
+		if strings.Contains(errMsg, "system is not deleted") {
+			c.JSON(http.StatusBadRequest, response.BadRequest("system is not deleted", nil))
+			return
+		}
+
+		if strings.Contains(errMsg, "access denied") {
+			c.JSON(http.StatusForbidden, response.Forbidden("access denied to system", map[string]interface{}{
+				"system_id": systemID,
+			}))
+			return
+		}
+
+		// Technical error
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Str("user_id", user.ID).
+			Msg("Failed to restore system")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to restore system", map[string]interface{}{
+			"error": errMsg,
+		}))
+		return
+	}
+
+	// Log the action
+	logger.LogBusinessOperation(c, "systems", "restore", "system", systemID, true, nil)
+
+	// Return success response
+	c.JSON(http.StatusOK, response.OK("system restored successfully", nil))
+}
+
+// DestroySystem handles DELETE /api/systems/:id/destroy - permanently deletes a system
+func DestroySystem(c *gin.Context) {
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	systemsService := local.NewSystemsService()
+
+	// Resolve the system before destroy so we know which S3 prefix to
+	// purge (the row will be gone after DestroySystem). The lookup
+	// bypasses the deleted_at filter so the two-step "soft delete, then
+	// destroy" flow still runs the purge — GetSystem would otherwise
+	// return "not found" on an already soft-deleted row and the GDPR
+	// erasure would be silently skipped. Skip the purge only when the
+	// row is genuinely missing; DestroySystem will surface the 404 below.
+	if system, lookupErr := systemsService.GetSystemIncludingDeleted(systemID, user.OrgRole, user.OrganizationID); lookupErr == nil {
+		// Build the set of orgs whose prefix may hold backups for this
+		// system: the current owner plus every donor recorded in the audit
+		// log. Without this, a partial cleanup failure during a previous
+		// reassignment can leave ciphertext under a donor prefix that the
+		// destroy never visits — a silent GDPR Article 17 gap.
+		orgsToPurge := []string{system.Organization.LogtoID}
+		seen := map[string]bool{system.Organization.LogtoID: true}
+		auditRepo := entities.NewLocalSystemOrgTransfersRepository()
+		if priorOrgs, err := auditRepo.PriorOrgIDsForSystem(systemID); err == nil {
+			for _, orgID := range priorOrgs {
+				if !seen[orgID] {
+					seen[orgID] = true
+					orgsToPurge = append(orgsToPurge, orgID)
+				}
+			}
+		} else {
+			logger.Warn().Err(err).Str("system_id", systemID).Msg("could not load prior orgs for purge; falling back to current org only")
+		}
+		for _, orgID := range orgsToPurge {
+			if purgeErr := purgeSystemBackups(c.Request.Context(), orgID, system.SystemKey); purgeErr != nil {
+				logger.Error().Err(purgeErr).Str("system_id", systemID).Str("org_id", orgID).Msg("backup purge failed; refusing to destroy system")
+				c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to purge system backups", nil))
+				return
+			}
+		}
+	}
+
+	err := systemsService.DestroySystem(systemID, user.ID, user.OrganizationID, user.OrgRole)
+	if err != nil {
+		errMsg := err.Error()
+
+		if strings.Contains(errMsg, "system not found") {
+			c.JSON(http.StatusNotFound, response.NotFound("system not found", nil))
+			return
+		}
+
+		if strings.Contains(errMsg, "access denied") {
+			c.JSON(http.StatusForbidden, response.Forbidden("access denied to system", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Str("user_id", user.ID).
+			Msg("Failed to destroy system")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to destroy system", map[string]interface{}{
+			"error": errMsg,
+		}))
+		return
+	}
+
+	logger.LogBusinessOperation(c, "systems", "destroy", "system", systemID, true, nil)
+
+	c.JSON(http.StatusOK, response.OK("system permanently destroyed", nil))
+}
+
+// RegenerateSystemSecret handles POST /api/systems/:id/regenerate-secret - regenerates system secret
+func RegenerateSystemSecret(c *gin.Context) {
+	// Get system ID from URL parameter
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	// Get current user context
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	// Create systems service
+	systemsService := local.NewSystemsService()
+
+	// Regenerate system secret
+	system, err := systemsService.RegenerateSystemSecret(systemID, user.ID, user.OrganizationID, user.OrgRole)
+	if err != nil && strings.Contains(err.Error(), "system is already registered") {
+		c.JSON(http.StatusConflict, response.Conflict("system is already registered", nil))
+		return
+	}
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	// Log the action
+	logger.LogBusinessOperation(c, "systems", "regenerate_secret", "system", systemID, true, nil)
+
+	// Return new secret (only time it's visible)
+	c.JSON(http.StatusOK, response.OK("system secret regenerated successfully", system))
+}
+
+// RegisterSystem handles POST /api/systems/register - registers a system using system_secret
+func RegisterSystem(c *gin.Context) {
+	// Parse request body
+	var request models.RegisterSystemRequest
+	if err := c.ShouldBindBodyWith(&request, binding.JSON); err != nil {
+		c.JSON(http.StatusBadRequest, response.ValidationBadRequestMultiple(err))
+		return
+	}
+
+	// Create systems service
+	systemsService := local.NewSystemsService()
+
+	// Register system using the secret token
+	result, err := systemsService.RegisterSystem(request.SystemSecret)
+	if err != nil {
+		errMsg := err.Error()
+
+		logger.Warn().
+			Err(err).
+			Msg("Failed system registration attempt")
+
+		// Map errors to appropriate HTTP status codes
+		switch {
+		case strings.Contains(errMsg, "invalid system secret format"):
+			c.JSON(http.StatusBadRequest, response.BadRequest("invalid system secret format", nil))
+			return
+		case strings.Contains(errMsg, "invalid system secret"):
+			c.JSON(http.StatusUnauthorized, response.Unauthorized("invalid system secret", nil))
+			return
+		case strings.Contains(errMsg, "system has been deleted"):
+			c.JSON(http.StatusForbidden, response.Forbidden("system has been deleted", nil))
+			return
+		case strings.Contains(errMsg, "system is already registered"):
+			c.JSON(http.StatusConflict, response.Conflict("system is already registered", nil))
+			return
+		default:
+			c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to register system", map[string]interface{}{
+				"error": errMsg,
+			}))
+			return
+		}
+	}
+
+	// Log successful registration
+	logger.Info().
+		Str("system_key", result.SystemKey).
+		Time("registered_at", result.RegisteredAt).
+		Msg("System registered successfully")
+
+	// Return system_key and registration info
+	c.JSON(http.StatusOK, response.OK("system registered successfully", result))
+}
+
+// SuspendSystem handles PATCH /api/systems/:id/suspend - suspends a system
+func SuspendSystem(c *gin.Context) {
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	systemsService := local.NewSystemsService()
+	err := systemsService.SuspendSystem(systemID, user.OrgRole, user.OrganizationID)
+	if err != nil {
+		errMsg := err.Error()
+		if errMsg == "system not found" {
+			c.JSON(http.StatusNotFound, response.NotFound("system not found", nil))
+			return
+		}
+		if strings.Contains(errMsg, "access denied") {
+			c.JSON(http.StatusForbidden, response.Forbidden("access denied to system", nil))
+			return
+		}
+		if strings.Contains(errMsg, "already suspended") {
+			c.JSON(http.StatusBadRequest, response.BadRequest("system is already suspended", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Str("user_id", user.ID).
+			Msg("Failed to suspend system")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to suspend system", nil))
+		return
+	}
+
+	logger.LogBusinessOperation(c, "systems", "suspend", "system", systemID, true, nil)
+
+	c.JSON(http.StatusOK, response.OK("system suspended successfully", nil))
+}
+
+// ReactivateSystem handles PATCH /api/systems/:id/reactivate - reactivates a suspended system
+func ReactivateSystem(c *gin.Context) {
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	systemsService := local.NewSystemsService()
+	err := systemsService.ReactivateSystem(systemID, user.OrgRole, user.OrganizationID)
+	if err != nil {
+		errMsg := err.Error()
+		if errMsg == "system not found" {
+			c.JSON(http.StatusNotFound, response.NotFound("system not found", nil))
+			return
+		}
+		if strings.Contains(errMsg, "access denied") {
+			c.JSON(http.StatusForbidden, response.Forbidden("access denied to system", nil))
+			return
+		}
+		if strings.Contains(errMsg, "not suspended") {
+			c.JSON(http.StatusBadRequest, response.BadRequest("system is not suspended", nil))
+			return
+		}
+
+		logger.Error().
+			Err(err).
+			Str("system_id", systemID).
+			Str("user_id", user.ID).
+			Msg("Failed to reactivate system")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to reactivate system", nil))
+		return
+	}
+
+	logger.LogBusinessOperation(c, "systems", "reactivate", "system", systemID, true, nil)
+
+	c.JSON(http.StatusOK, response.OK("system reactivated successfully", nil))
+}
+
+// checkURL performs a HEAD request to the given URL and returns true if the system responds
+func checkURL(ctx *gin.Context, client *http.Client, targetURL string) bool {
+	req, err := http.NewRequestWithContext(ctx.Request.Context(), http.MethodHead, targetURL, nil)
+	if err != nil {
+		return false
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	return true
+}
+
+// CheckSystemReachability handles GET /api/systems/:id/reachability - checks if a system's web UI is reachable
+func CheckSystemReachability(c *gin.Context) {
+	systemID := c.Param("id")
+	if systemID == "" {
+		c.JSON(http.StatusBadRequest, response.BadRequest("system ID required", nil))
+		return
+	}
+
+	user, ok := helpers.GetUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	systemsService := local.NewSystemsService()
+	system, err := systemsService.GetSystem(systemID, user.OrgRole, user.OrganizationID)
+	if helpers.HandleAccessError(c, err, "system", systemID) {
+		return
+	}
+
+	if system.FQDN == "" {
+		c.JSON(http.StatusOK, response.OK("reachability check completed", gin.H{"reachable": false, "url": ""}))
+		return
+	}
+	// The FQDN is what the appliance reported about itself: a value pointing
+	// inside this backend's network would turn the probe into a port scanner
+	// of Render's private services. Such a system is simply "not reachable".
+	if err := rejectNonPublicHost(system.FQDN); err != nil {
+		logger.RequestLogger(c, "systems").Warn().
+			Err(err).
+			Str("system_id", systemID).
+			Str("fqdn", system.FQDN).
+			Msg("Reachability probe refused: host is not publicly routable")
+		c.JSON(http.StatusOK, response.OK("reachability check completed", gin.H{"reachable": false, "url": ""}))
+		return
+	}
+
+	// Build candidate URLs based on system type
+	var candidateURLs []string
+	switch {
+	case system.Type != nil && *system.Type == "ns8":
+		candidateURLs = []string{fmt.Sprintf("https://%s/cluster-admin", system.FQDN)}
+	case system.Type != nil && *system.Type == "nsec":
+		candidateURLs = []string{
+			fmt.Sprintf("https://%s:443", system.FQDN),
+			fmt.Sprintf("https://%s:9090", system.FQDN),
+		}
+	default:
+		c.JSON(http.StatusOK, response.OK("reachability check completed", gin.H{"reachable": false, "url": ""}))
+		return
+	}
+
+	// HTTP client with short timeout and skip TLS verification (self-signed certs)
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // systems use self-signed certificates
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	for _, targetURL := range candidateURLs {
+		if checkURL(c, client, targetURL) {
+			logger.RequestLogger(c, "systems").Debug().
+				Str("system_id", systemID).
+				Str("target_url", targetURL).
+				Msg("System is reachable")
+
+			c.JSON(http.StatusOK, response.OK("reachability check completed", gin.H{"reachable": true, "url": targetURL}))
+			return
+		}
+	}
+
+	logger.RequestLogger(c, "systems").Debug().
+		Str("system_id", systemID).
+		Msg("System is not reachable on any candidate URL")
+
+	c.JSON(http.StatusOK, response.OK("reachability check completed", gin.H{"reachable": false, "url": ""}))
+}
+
+// attachSystemAddons fills the Addons list of the given systems with one batch
+// query. A failure is logged and leaves the lists empty: the add-on badge is
+// an adornment of the systems list, never a reason to fail it.
+func attachSystemAddons(c *gin.Context, systems []*models.System) {
+	if len(systems) == 0 {
+		return
+	}
+
+	ids := make([]string, 0, len(systems))
+	for _, sys := range systems {
+		ids = append(ids, sys.ID)
+	}
+
+	bySystem, err := entities.NewLocalSystemEntitlementRepository().ActiveEntitlementsBySystems(ids)
+	if err != nil {
+		logger.RequestLogger(c, "systems").Warn().Err(err).Msg("Failed to resolve system add-ons")
+		return
+	}
+
+	for _, sys := range systems {
+		if addons, ok := bySystem[sys.ID]; ok {
+			sys.Addons = addons
+		}
+	}
+}

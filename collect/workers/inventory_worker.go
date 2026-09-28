@@ -1,0 +1,901 @@
+/*
+ * Copyright (C) 2025 Nethesis S.r.l.
+ * http://www.nethesis.it - info@nethesis.it
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * author: Edoardo Spadoni <edoardo.spadoni@nethesis.it>
+ */
+
+package workers
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/nethesis/my/collect/configuration"
+	"github.com/nethesis/my/collect/database"
+	"github.com/nethesis/my/collect/helpers"
+	"github.com/nethesis/my/collect/logger"
+	"github.com/nethesis/my/collect/models"
+	"github.com/nethesis/my/collect/queue"
+	"github.com/rs/zerolog"
+)
+
+// DiffTriggerRecord contains only the fields needed to trigger diff processing,
+// avoiding retention of the full inventory Data payload in the async goroutine.
+type DiffTriggerRecord struct {
+	ID        int64
+	SystemID  string
+	Timestamp time.Time
+}
+
+// InventoryWorker handles high-throughput batch operations
+type InventoryWorker struct {
+	inventoryBatch chan *models.InventoryData
+	batchSize      int
+	flushInterval  time.Duration
+	stopCh         chan struct{}
+	isHealthy      int32
+	mu             sync.RWMutex
+	processedCount int64
+	failedCount    int64
+	lastFlush      time.Time
+	queueManager   *queue.QueueManager
+	diffSemaphore  chan struct{}
+}
+
+// NewInventoryWorker creates a new inventory worker
+func NewInventoryWorker(batchSize int, flushInterval time.Duration, queueManager *queue.QueueManager) *InventoryWorker {
+	return &InventoryWorker{
+		inventoryBatch: make(chan *models.InventoryData, batchSize*2), // Buffer 2x batch size
+		batchSize:      batchSize,
+		flushInterval:  flushInterval,
+		stopCh:         make(chan struct{}),
+		isHealthy:      1,
+		lastFlush:      time.Now(),
+		queueManager:   queueManager,
+		diffSemaphore:  make(chan struct{}, 3),
+	}
+}
+
+// Start starts the inventory worker
+func (iw *InventoryWorker) Start(ctx context.Context, wg *sync.WaitGroup) error {
+	wg.Add(1)
+	go iw.batchWorker(ctx, wg)
+	return nil
+}
+
+// Name returns the worker name
+func (iw *InventoryWorker) Name() string {
+	return "inventory-worker"
+}
+
+// IsHealthy returns health status
+func (iw *InventoryWorker) IsHealthy() bool {
+	return atomic.LoadInt32(&iw.isHealthy) == 1
+}
+
+// AddInventory adds inventory data to the batch for processing
+func (iw *InventoryWorker) AddInventory(ctx context.Context, inventory *models.InventoryData) error {
+	select {
+	case iw.inventoryBatch <- inventory:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(1 * time.Second):
+		return fmt.Errorf("inventory worker queue full, dropping inventory")
+	}
+}
+
+// batchWorker processes inventory data in batches
+func (iw *InventoryWorker) batchWorker(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	logger := logger.ComponentLogger("inventory-worker")
+	logger.Info().
+		Int("batch_size", iw.batchSize).
+		Dur("flush_interval", iw.flushInterval).
+		Msg("Inventory worker started")
+
+	ticker := time.NewTicker(iw.flushInterval)
+	defer ticker.Stop()
+
+	batch := make([]*models.InventoryData, 0, iw.batchSize)
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Process remaining items in batch before stopping
+			if len(batch) > 0 {
+				iw.processBatch(ctx, batch, *logger)
+			}
+			logger.Info().Msg("Inventory worker stopped")
+			return
+
+		case inventory := <-iw.inventoryBatch:
+			batch = append(batch, inventory)
+
+			// Process batch when it reaches target size
+			if len(batch) >= iw.batchSize {
+				iw.processBatch(ctx, batch, *logger)
+				batch = make([]*models.InventoryData, 0, iw.batchSize)
+				iw.updateLastFlush()
+			}
+
+		case <-ticker.C:
+			// Process batch on timer if it has items
+			if len(batch) > 0 {
+				iw.processBatch(ctx, batch, *logger)
+				batch = make([]*models.InventoryData, 0, iw.batchSize)
+				iw.updateLastFlush()
+			}
+		}
+	}
+}
+
+// processBatch processes a batch of inventory data
+func (iw *InventoryWorker) processBatch(ctx context.Context, batch []*models.InventoryData, logger zerolog.Logger) {
+	if len(batch) == 0 {
+		return
+	}
+
+	start := time.Now()
+	logger.Info().
+		Int("batch_size", len(batch)).
+		Msg("Processing inventory batch")
+
+	// Get managed connection
+	conn, err := database.GetManagedConnection(ctx)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Int("batch_size", len(batch)).
+			Msg("Failed to acquire database connection for batch")
+		iw.recordFailure(int64(len(batch)))
+		return
+	}
+	defer conn.Release()
+
+	// Process batch in transaction
+	if err := iw.processBatchInTransaction(ctx, conn, batch, logger); err != nil {
+		logger.Error().
+			Err(err).
+			Int("batch_size", len(batch)).
+			Msg("Failed to process batch")
+		iw.recordFailure(int64(len(batch)))
+		return
+	}
+
+	duration := time.Since(start)
+	iw.recordSuccess(int64(len(batch)))
+
+	logger.Info().
+		Int("batch_size", len(batch)).
+		Dur("duration", duration).
+		Float64("items_per_second", float64(len(batch))/duration.Seconds()).
+		Msg("Batch processed successfully")
+}
+
+// processBatchInTransaction processes a batch within a single transaction
+func (iw *InventoryWorker) processBatchInTransaction(ctx context.Context, conn *database.ManagedConnection, batch []*models.InventoryData, logger zerolog.Logger) error {
+	// Start transaction with timeout
+	txCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	tx, err := conn.BeginTx(txCtx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	defer func() {
+		if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
+			logger.Error().Err(err).Msg("Failed to rollback transaction")
+		}
+	}()
+
+	// Prepare statement for batch insert
+	stmt, err := tx.PrepareContext(txCtx, `
+		INSERT INTO inventory_records 
+		(system_id, timestamp, data, data_hash, data_size, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+		ON CONFLICT (system_id, data_hash) 
+		DO UPDATE SET 
+			timestamp = EXCLUDED.timestamp,
+			updated_at = NOW()
+		RETURNING id
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare batch insert statement: %w", err)
+	}
+	defer func() {
+		if err := stmt.Close(); err != nil {
+			logger.Error().Err(err).Msg("Failed to close prepared statement")
+		}
+	}()
+
+	// Track lightweight records for diff processing (without Data payload)
+	var diffTriggerRecords []DiffTriggerRecord
+
+	// Process each item in batch
+	for _, inventory := range batch {
+		dataHash := iw.calculateDataHash(inventory.Data)
+		dataSize := int64(len(inventory.Data))
+
+		var recordID int64
+		err := stmt.QueryRowContext(txCtx,
+			inventory.SystemID,
+			inventory.Timestamp,
+			inventory.Data,
+			dataHash,
+			dataSize,
+		).Scan(&recordID)
+
+		if err != nil {
+			return fmt.Errorf("failed to insert inventory for system %s: %w", inventory.SystemID, err)
+		}
+
+		// Parse inventory JSON once for both updateSystemFields and extractApplications
+		var parsedData map[string]interface{}
+		if err := json.Unmarshal(inventory.Data, &parsedData); err != nil {
+			logger.Warn().
+				Err(err).
+				Str("system_id", inventory.SystemID).
+				Int64("record_id", recordID).
+				Msg("Failed to unmarshal inventory data for field extraction")
+		} else {
+			if err := iw.updateSystemFieldsFromInventory(txCtx, tx, inventory.SystemID, recordID, parsedData, logger); err != nil {
+				logger.Warn().
+					Err(err).
+					Str("system_id", inventory.SystemID).
+					Int64("record_id", recordID).
+					Msg("Failed to update system fields from inventory")
+			}
+
+			if err := iw.extractApplicationsFromInventory(txCtx, tx, inventory.SystemID, recordID, parsedData, logger); err != nil {
+				logger.Warn().
+					Err(err).
+					Str("system_id", inventory.SystemID).
+					Int64("record_id", recordID).
+					Msg("Failed to extract applications from inventory")
+			}
+		}
+
+		// Keep only lightweight record for diff triggering
+		diffTriggerRecords = append(diffTriggerRecords, DiffTriggerRecord{
+			ID:        recordID,
+			SystemID:  inventory.SystemID,
+			Timestamp: inventory.Timestamp,
+		})
+
+		// Log large payloads for monitoring
+		if dataSize > 1024*1024 { // 1MB
+			logger.Warn().
+				Str("system_id", inventory.SystemID).
+				Int64("data_size", dataSize).
+				Int64("record_id", recordID).
+				Msg("Large inventory payload processed")
+		}
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit batch transaction: %w", err)
+	}
+
+	// After successful commit, trigger diff processing asynchronously
+	// Use semaphore to limit concurrent diff goroutines
+	select {
+	case iw.diffSemaphore <- struct{}{}:
+		go func() {
+			defer func() { <-iw.diffSemaphore }()
+			iw.triggerDiffProcessingAsync(ctx, diffTriggerRecords, logger)
+		}()
+	default:
+		logger.Warn().
+			Int("records", len(diffTriggerRecords)).
+			Msg("Diff semaphore full, skipping async diff trigger")
+	}
+
+	return nil
+}
+
+// calculateDataHash calculates SHA-256 hash of inventory data
+func (iw *InventoryWorker) calculateDataHash(data []byte) string {
+	hash := sha256.Sum256(data)
+	return fmt.Sprintf("%x", hash)
+}
+
+// updateLastFlush updates the last flush timestamp
+func (iw *InventoryWorker) updateLastFlush() {
+	iw.mu.Lock()
+	defer iw.mu.Unlock()
+	iw.lastFlush = time.Now()
+}
+
+// recordSuccess records successful batch processing
+func (iw *InventoryWorker) recordSuccess(count int64) {
+	atomic.AddInt64(&iw.processedCount, count)
+	atomic.StoreInt32(&iw.isHealthy, 1)
+}
+
+// recordFailure records failed batch processing
+func (iw *InventoryWorker) recordFailure(count int64) {
+	atomic.AddInt64(&iw.failedCount, count)
+	atomic.StoreInt32(&iw.isHealthy, 0)
+}
+
+// GetStats returns inventory worker statistics
+func (iw *InventoryWorker) GetStats() map[string]interface{} {
+	iw.mu.RLock()
+	lastFlush := iw.lastFlush
+	iw.mu.RUnlock()
+
+	return map[string]interface{}{
+		"processed_count": atomic.LoadInt64(&iw.processedCount),
+		"failed_count":    atomic.LoadInt64(&iw.failedCount),
+		"queue_length":    len(iw.inventoryBatch),
+		"queue_capacity":  cap(iw.inventoryBatch),
+		"last_flush":      lastFlush,
+		"is_healthy":      iw.IsHealthy(),
+		"batch_size":      iw.batchSize,
+		"flush_interval":  iw.flushInterval,
+	}
+}
+
+// triggerDiffProcessingAsync triggers diff processing asynchronously for inserted inventory records.
+// Uses lightweight DiffTriggerRecord to avoid retaining full inventory Data payloads in memory.
+func (iw *InventoryWorker) triggerDiffProcessingAsync(ctx context.Context, records []DiffTriggerRecord, logger zerolog.Logger) {
+	// Create a new context with timeout to prevent goroutine leaks
+	asyncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	successCount := 0
+	failedCount := 0
+
+	for _, record := range records {
+		// Check if there's a previous record for this system
+		previousRecord, err := GetPreviousInventoryRecord(asyncCtx, record.SystemID, record.ID)
+		if err != nil {
+			logger.Warn().
+				Err(err).
+				Str("system_id", record.SystemID).
+				Int64("record_id", record.ID).
+				Msg("Failed to get previous inventory record for diff processing")
+			failedCount++
+			continue
+		}
+
+		// Only trigger diff processing if there's a previous record
+		if previousRecord != nil {
+			// Create ProcessingJob without Data — the DiffWorker loads it from DB
+			processingJob := &models.InventoryProcessingJob{
+				InventoryRecord: &models.InventoryRecord{
+					ID:       record.ID,
+					SystemID: record.SystemID,
+				},
+				SystemID:     record.SystemID,
+				ForceProcess: false,
+			}
+
+			// Use a timeout context for each enqueue operation
+			enqueueCtx, enqueueCancel := context.WithTimeout(asyncCtx, 30*time.Second)
+			err := iw.queueManager.EnqueueProcessing(enqueueCtx, processingJob)
+			enqueueCancel()
+
+			if err != nil {
+				logger.Warn().
+					Err(err).
+					Str("system_id", record.SystemID).
+					Int64("inventory_id", record.ID).
+					Msg("Failed to enqueue processing job for diff computation (non-blocking)")
+				failedCount++
+			} else {
+				logger.Debug().
+					Str("system_id", record.SystemID).
+					Int64("inventory_id", record.ID).
+					Int64("previous_id", previousRecord.ID).
+					Msg("Queued diff processing job")
+				successCount++
+			}
+		}
+	}
+
+	logger.Info().
+		Int("total_records", len(records)).
+		Int("diff_jobs_queued", successCount).
+		Int("diff_jobs_failed", failedCount).
+		Msg("Async diff processing completed")
+}
+
+// updateSystemFieldsFromInventory extracts relevant fields from inventory and updates the systems table.
+// Supports both NS8 (nethserver) and NSEC (nethsecurity) inventory structures.
+// Accepts pre-parsed inventory data to avoid redundant JSON unmarshaling.
+func (iw *InventoryWorker) updateSystemFieldsFromInventory(ctx context.Context, tx *sql.Tx, systemID string, recordID int64, inventoryData map[string]interface{}, logger zerolog.Logger) error {
+	// Detect installation type
+	installation, _ := inventoryData["installation"].(string)
+
+	// Extract system fields based on installation type
+	var name, fqdn, version, systemType, ipv4, ipv6 *string
+
+	switch installation {
+	case "nethserver": // NS8
+		systemType = helpers.StrPtr("ns8")
+
+		// Get facts object
+		facts, ok := inventoryData["facts"].(map[string]interface{})
+		if !ok {
+			return nil // No facts, nothing to extract
+		}
+
+		// Extract cluster info (only ui_name for system name)
+		if cluster, ok := facts["cluster"].(map[string]interface{}); ok {
+			// System name from cluster.ui_name
+			if uiName, ok := cluster["ui_name"].(string); ok && uiName != "" {
+				name = &uiName
+			}
+		}
+
+		// Extract fqdn, ipv4, ipv6, version from leader node
+		if nodes, ok := facts["nodes"].(map[string]interface{}); ok {
+			// Find the leader node (cluster_leader: true)
+			var leaderNode map[string]interface{}
+			for _, nodeInfo := range nodes {
+				if nodeData, ok := nodeInfo.(map[string]interface{}); ok {
+					if isLeader, ok := nodeData["cluster_leader"].(bool); ok && isLeader {
+						leaderNode = nodeData
+						break
+					}
+				}
+			}
+
+			// If no explicit leader found, try node "1" as fallback
+			if leaderNode == nil {
+				if nodeData, ok := nodes["1"].(map[string]interface{}); ok {
+					leaderNode = nodeData
+				}
+			}
+
+			// Extract data from leader node
+			if leaderNode != nil {
+				if nodeFQDN, ok := leaderNode["fqdn"].(string); ok && nodeFQDN != "" {
+					fqdn = &nodeFQDN
+				}
+				if nodeIPv4, ok := leaderNode["default_ipv4"].(string); ok && nodeIPv4 != "" {
+					ipv4 = &nodeIPv4
+				}
+				if nodeIPv6, ok := leaderNode["default_ipv6"].(string); ok && nodeIPv6 != "" {
+					ipv6 = &nodeIPv6
+				}
+				if nodeVersion, ok := leaderNode["version"].(string); ok && nodeVersion != "" {
+					version = &nodeVersion
+				}
+			}
+		}
+
+	case "nethsecurity": // NSEC
+		systemType = helpers.StrPtr("nsec")
+
+		// Get facts object
+		facts, ok := inventoryData["facts"].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		// Extract from distro
+		if distro, ok := facts["distro"].(map[string]interface{}); ok {
+			if distroVersion, ok := distro["version"].(string); ok && distroVersion != "" {
+				version = &distroVersion
+			}
+		}
+
+		// Extract FQDN and public IPs from facts
+		if fqdnVal, ok := facts["fqdn"].(string); ok && fqdnVal != "" {
+			fqdn = &fqdnVal
+		}
+		if publicIPv4, ok := facts["default_ipv4"].(string); ok && publicIPv4 != "" {
+			ipv4 = &publicIPv4
+		}
+		if publicIPv6, ok := facts["default_ipv6"].(string); ok && publicIPv6 != "" {
+			ipv6 = &publicIPv6
+		}
+
+	default:
+		// Unknown installation type, try legacy structure
+		// Extract IPv4 from data.public_ip (legacy)
+		if publicIP, ok := inventoryData["public_ip"].(string); ok && publicIP != "" {
+			ipv4 = &publicIP
+		}
+
+		// Extract FQDN from data.networking.fqdn (legacy)
+		if networking, ok := inventoryData["networking"].(map[string]interface{}); ok {
+			if fqdnVal, ok := networking["fqdn"].(string); ok && fqdnVal != "" {
+				fqdn = &fqdnVal
+			}
+		}
+
+		// Extract version from data.os.release.full (legacy)
+		if os, ok := inventoryData["os"].(map[string]interface{}); ok {
+			if release, ok := os["release"].(map[string]interface{}); ok {
+				if fullVersion, ok := release["full"].(string); ok && fullVersion != "" {
+					version = &fullVersion
+				}
+			}
+
+			// Extract type from data.os.type (legacy)
+			if osType, ok := os["type"].(string); ok && osType != "" {
+				var productName string
+				switch osType {
+				case "nethserver":
+					productName = "ns8"
+				case "nethsecurity":
+					productName = "nsec"
+				default:
+					productName = osType
+				}
+				systemType = &productName
+			}
+		}
+	}
+
+	// Build the systems update. Descriptive fields (name/fqdn/version/type/ip) are
+	// set when present, but `updated_at` is bumped only when one of them ACTUALLY
+	// changes (IS DISTINCT FROM). updated_at is indexed, so bumping it on every
+	// inventory would make every write non-HOT and bloat the index — which is what
+	// turned `systems` into a continuously-vacuumed table. last_inventory_at is
+	// refreshed every inventory but is unindexed, so on the common no-change path
+	// only it is modified and (with the table's fillfactor < 100) the update stays
+	// a HOT update that touches no index at all. Setting a descriptive column to
+	// its current value is not a real modification, so it does not break HOT either.
+	//
+	// Each parameter is reused in its SET clause and in the change check, so it
+	// must be cast to the column type there (::varchar/::inet): the SET deduces the
+	// column type while a bare IS DISTINCT FROM operand defaults to text, and the
+	// two would otherwise collide as "inconsistent types deduced for parameter".
+	setClauses := []string{}
+	changeConds := []string{}
+	args := []interface{}{}
+	argPos := 1
+
+	if name != nil {
+		// Only fill name when currently NULL (preserve user-modified names);
+		// that NULL check is also its change condition.
+		setClauses = append(setClauses, fmt.Sprintf("name = COALESCE(systems.name, $%d)", argPos))
+		changeConds = append(changeConds, "systems.name IS NULL")
+		args = append(args, *name)
+		argPos++
+	}
+	if fqdn != nil {
+		setClauses = append(setClauses, fmt.Sprintf("fqdn = $%d", argPos))
+		changeConds = append(changeConds, fmt.Sprintf("systems.fqdn IS DISTINCT FROM $%d::varchar", argPos))
+		args = append(args, *fqdn)
+		argPos++
+	}
+	if version != nil {
+		setClauses = append(setClauses, fmt.Sprintf("version = $%d", argPos))
+		changeConds = append(changeConds, fmt.Sprintf("systems.version IS DISTINCT FROM $%d::varchar", argPos))
+		args = append(args, *version)
+		argPos++
+	}
+	if systemType != nil {
+		setClauses = append(setClauses, fmt.Sprintf("type = $%d", argPos))
+		changeConds = append(changeConds, fmt.Sprintf("systems.type IS DISTINCT FROM $%d::varchar", argPos))
+		args = append(args, *systemType)
+		argPos++
+	}
+	if ipv4 != nil && net.ParseIP(*ipv4) != nil {
+		setClauses = append(setClauses, fmt.Sprintf("ipv4_address = $%d", argPos))
+		changeConds = append(changeConds, fmt.Sprintf("systems.ipv4_address IS DISTINCT FROM $%d::inet", argPos))
+		args = append(args, *ipv4)
+		argPos++
+	}
+	if ipv6 != nil && net.ParseIP(*ipv6) != nil {
+		setClauses = append(setClauses, fmt.Sprintf("ipv6_address = $%d", argPos))
+		changeConds = append(changeConds, fmt.Sprintf("systems.ipv6_address IS DISTINCT FROM $%d::inet", argPos))
+		args = append(args, *ipv6)
+		argPos++
+	}
+
+	// last_inventory_at is always refreshed; updated_at flips to NOW() only when a
+	// descriptive field genuinely changed, otherwise it keeps its current value.
+	setClauses = append(setClauses, "last_inventory_at = NOW()")
+	if len(changeConds) > 0 {
+		setClauses = append(setClauses, fmt.Sprintf(
+			"updated_at = CASE WHEN (%s) THEN NOW() ELSE systems.updated_at END",
+			strings.Join(changeConds, " OR ")))
+	}
+
+	// Add system_id as last argument
+	args = append(args, systemID)
+
+	query := fmt.Sprintf(`
+		UPDATE systems
+		SET %s
+		WHERE id = $%d AND deleted_at IS NULL
+	`, strings.Join(setClauses, ", "), argPos)
+
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("failed to update system fields: %w", err)
+	}
+
+	if rowsAffected, _ := result.RowsAffected(); rowsAffected > 0 {
+		logger.Debug().
+			Str("system_id", systemID).
+			Int("fields_present", len(setClauses)-1).
+			Msg("System row refreshed from inventory")
+	}
+
+	return nil
+}
+
+// extractApplicationsFromInventory extracts modules from NS8 inventory and upserts them into applications table.
+// Accepts pre-parsed inventory data to avoid redundant JSON unmarshaling.
+func (iw *InventoryWorker) extractApplicationsFromInventory(ctx context.Context, tx *sql.Tx, systemID string, recordID int64, inventoryData map[string]interface{}, logger zerolog.Logger) error {
+	// Only process NS8 inventories (nethserver)
+	installation, _ := inventoryData["installation"].(string)
+	if installation != "nethserver" {
+		return nil // NSEC doesn't have modules
+	}
+
+	// Get facts object
+	facts, ok := inventoryData["facts"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	// Get modules array
+	modulesRaw, ok := facts["modules"].([]interface{})
+	if !ok || len(modulesRaw) == 0 {
+		return nil
+	}
+
+	// Get FQDN for URL generation (from cluster or system record)
+	var systemFQDN string
+	if cluster, ok := facts["cluster"].(map[string]interface{}); ok {
+		if fqdn, ok := cluster["fqdn"].(string); ok {
+			systemFQDN = fqdn
+		}
+	}
+	// If no FQDN in cluster, try to get from system record
+	if systemFQDN == "" {
+		var fqdn sql.NullString
+		err := tx.QueryRowContext(ctx, "SELECT fqdn FROM systems WHERE id = $1", systemID).Scan(&fqdn)
+		if err == nil && fqdn.Valid {
+			systemFQDN = fqdn.String
+		}
+	}
+
+	// Get nodes info for node_label lookup
+	nodesData := make(map[string]map[string]interface{})
+	if nodes, ok := facts["nodes"].(map[string]interface{}); ok {
+		for nodeID, nodeInfo := range nodes {
+			if nodeMap, ok := nodeInfo.(map[string]interface{}); ok {
+				nodesData[nodeID] = nodeMap
+			}
+		}
+	}
+
+	// Get cluster domains for enrichment (map domain name -> full domain data)
+	clusterDomains := make(map[string]map[string]interface{})
+	if cluster, ok := facts["cluster"].(map[string]interface{}); ok {
+		if userDomains, ok := cluster["user_domains"].([]interface{}); ok {
+			for _, domainRaw := range userDomains {
+				if domain, ok := domainRaw.(map[string]interface{}); ok {
+					if domainName, ok := domain["name"].(string); ok && domainName != "" {
+						clusterDomains[domainName] = domain
+					}
+				}
+			}
+		}
+	}
+
+	// Track which module IDs we've seen in this inventory
+	seenModuleIDs := make(map[string]bool)
+
+	// Process each module
+	for _, moduleRaw := range modulesRaw {
+		module, ok := moduleRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Extract fixed fields
+		moduleID, _ := module["id"].(string)
+		// "module" field contains the module type (e.g., "mattermost"), used as instance_of
+		moduleName, _ := module["module"].(string)
+		moduleVersion, _ := module["version"].(string)
+		moduleNodeStr, _ := module["node"].(string)
+		moduleUIName, _ := module["ui_name"].(string) // display_name
+		// "name" is the human-readable label (e.g., "Nextcloud")
+		moduleHumanName, _ := module["name"].(string)
+		// "source" is the image source (e.g., "ghcr.io/nethserver/nextcloud")
+		moduleSource, _ := module["source"].(string)
+
+		if moduleID == "" || moduleName == "" {
+			continue // Skip invalid modules
+		}
+
+		seenModuleIDs[moduleID] = true
+
+		// Parse node ID
+		var nodeID *int
+		if moduleNodeStr != "" {
+			if n, err := strconv.Atoi(moduleNodeStr); err == nil {
+				nodeID = &n
+			}
+		}
+
+		// Get node label from nodes data (ui_name field)
+		var nodeLabel *string
+		if moduleNodeStr != "" {
+			if nodeInfo, ok := nodesData[moduleNodeStr]; ok {
+				if uiName, ok := nodeInfo["ui_name"].(string); ok && uiName != "" {
+					nodeLabel = &uiName
+				}
+			}
+		}
+
+		// Determine if user-facing
+		isUserFacing := configuration.IsUserFacingModule(moduleName)
+
+		// Generate application URL
+		var appURL *string
+		if systemFQDN != "" && isUserFacing {
+			url := configuration.GetApplicationURL(systemFQDN, moduleID)
+			if url != "" {
+				appURL = &url
+			}
+		}
+
+		// Extract dynamic fields for inventory_data JSONB
+		// Remove fixed fields and keep everything else
+		inventoryDataJSON := make(map[string]interface{})
+		fixedFields := map[string]bool{
+			"id": true, "module": true, "name": true, "version": true, "node": true, "ui_name": true, "source": true,
+		}
+		for key, value := range module {
+			if !fixedFields[key] {
+				// Enrich user_domains with full domain data from cluster
+				if key == "user_domains" {
+					if domainNames, ok := value.([]interface{}); ok {
+						enrichedDomains := make([]map[string]interface{}, 0, len(domainNames))
+						for _, domainNameRaw := range domainNames {
+							if domainName, ok := domainNameRaw.(string); ok {
+								if fullDomain, exists := clusterDomains[domainName]; exists {
+									enrichedDomains = append(enrichedDomains, fullDomain)
+								} else {
+									// Domain not found in cluster, keep just the name
+									enrichedDomains = append(enrichedDomains, map[string]interface{}{
+										"name": domainName,
+									})
+								}
+							}
+						}
+						inventoryDataJSON[key] = enrichedDomains
+						continue
+					}
+				}
+				inventoryDataJSON[key] = value
+			}
+		}
+
+		inventoryDataBytes, err := json.Marshal(inventoryDataJSON)
+		if err != nil {
+			logger.Warn().Err(err).Str("module_id", moduleID).Msg("Failed to marshal inventory_data")
+			inventoryDataBytes = []byte("{}")
+		}
+
+		// Generate application ID
+		appID := fmt.Sprintf("%s-%s", systemID, moduleID)
+
+		// Upsert application
+		query := `
+			INSERT INTO applications (
+				id, system_id, module_id, instance_of, display_name,
+				node_id, node_label, version, url, inventory_data,
+				is_user_facing, name, source,
+				status, first_seen_at, last_inventory_at, created_at, updated_at
+			) VALUES (
+				$1, $2, $3, $4, $5,
+				$6, $7, $8, $9, $10,
+				$11, $12, $13,
+				'unassigned', NOW(), NOW(), NOW(), NOW()
+			)
+			ON CONFLICT (id) DO UPDATE SET
+				instance_of = EXCLUDED.instance_of,
+				display_name = COALESCE(EXCLUDED.display_name, applications.display_name),
+				node_id = EXCLUDED.node_id,
+				node_label = COALESCE(EXCLUDED.node_label, applications.node_label),
+				version = EXCLUDED.version,
+				url = COALESCE(EXCLUDED.url, applications.url),
+				inventory_data = EXCLUDED.inventory_data,
+				is_user_facing = EXCLUDED.is_user_facing,
+				name = COALESCE(EXCLUDED.name, applications.name),
+				source = COALESCE(EXCLUDED.source, applications.source),
+				last_inventory_at = NOW(),
+				updated_at = NOW(),
+				deleted_at = NULL
+		`
+
+		_, err = tx.ExecContext(ctx, query,
+			appID,                               // $1
+			systemID,                            // $2
+			moduleID,                            // $3
+			moduleName,                          // $4 (instance_of)
+			helpers.NilIfEmpty(moduleUIName),    // $5 (display_name from ui_name)
+			nodeID,                              // $6
+			nodeLabel,                           // $7
+			helpers.NilIfEmpty(moduleVersion),   // $8
+			appURL,                              // $9
+			inventoryDataBytes,                  // $10
+			isUserFacing,                        // $11
+			helpers.NilIfEmpty(moduleHumanName), // $12 (name)
+			helpers.NilIfEmpty(moduleSource),    // $13 (source)
+		)
+		if err != nil {
+			logger.Warn().
+				Err(err).
+				Str("app_id", appID).
+				Str("module_id", moduleID).
+				Msg("Failed to upsert application")
+			continue
+		}
+	}
+
+	// Soft-delete applications that are no longer in inventory
+	if len(seenModuleIDs) > 0 {
+		// Build list of module IDs we've seen
+		moduleIDList := make([]string, 0, len(seenModuleIDs))
+		for moduleID := range seenModuleIDs {
+			moduleIDList = append(moduleIDList, moduleID)
+		}
+
+		// Create placeholders for the IN clause
+		placeholders := make([]string, len(moduleIDList))
+		args := make([]interface{}, len(moduleIDList)+1)
+		args[0] = systemID
+		for i, moduleID := range moduleIDList {
+			placeholders[i] = fmt.Sprintf("$%d", i+2)
+			args[i+1] = moduleID
+		}
+
+		// Soft-delete applications not in the current inventory
+		softDeleteQuery := fmt.Sprintf(`
+			UPDATE applications
+			SET deleted_at = NOW(), updated_at = NOW()
+			WHERE system_id = $1
+			  AND module_id NOT IN (%s)
+			  AND deleted_at IS NULL
+		`, strings.Join(placeholders, ", "))
+
+		result, err := tx.ExecContext(ctx, softDeleteQuery, args...)
+		if err != nil {
+			logger.Warn().
+				Err(err).
+				Str("system_id", systemID).
+				Msg("Failed to soft-delete removed applications")
+		} else if rowsAffected, _ := result.RowsAffected(); rowsAffected > 0 {
+			logger.Info().
+				Str("system_id", systemID).
+				Int64("deleted_count", rowsAffected).
+				Msg("Soft-deleted applications no longer in inventory")
+		}
+	}
+
+	logger.Debug().
+		Str("system_id", systemID).
+		Int("modules_count", len(seenModuleIDs)).
+		Msg("Applications extracted from inventory")
+
+	return nil
+}

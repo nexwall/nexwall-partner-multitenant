@@ -1,0 +1,833 @@
+/*
+Copyright (C) 2026 Nethesis S.r.l.
+SPDX-License-Identifier: AGPL-3.0-or-later
+*/
+
+package main
+
+import (
+	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Client wraps the Logto OIDC interaction flow + backend /auth/exchange that
+// produces a real, hierarchy-aware backend JWT. Mirrors my_api_client.php so
+// the produced tokens behave exactly like a real browser login.
+//
+// Cookie handling is manual (not via http.CookieJar) because Logto sets a
+// JSON-valued cookie (_interaction={...}) whose value contains '"' bytes.
+// Go's stdlib drops such values both on Set-Cookie parse and on outgoing
+// Cookie header sanitization, breaking the interaction session. Storing raw
+// name=value pairs and emitting them ourselves preserves the exact bytes.
+//
+// TLS verification is disabled because dev typically runs behind a
+// self-signed cert; this tool is dev-only.
+type Client struct {
+	cfg     Config
+	http    *http.Client
+	jwt     string
+	cookies map[string]string
+}
+
+// Said once per run, however many clients the command builds: a registry
+// written before the backend bound the exchange to an audience has no
+// logto_resource, so every login here obtains an opaque token and the backend
+// answers "invalid access token" — which reads as a backend fault rather than
+// as this file being out of date.
+var warnNoResource sync.Once
+
+func NewClient(cfg Config) (*Client, error) {
+	if cfg.LogtoResource == "" {
+		warnNoResource.Do(func() {
+			fmt.Fprintln(os.Stderr,
+				"apitool: the registry has no logto_resource, so /auth/exchange will refuse every token.\n"+
+					"         Set it to the backend's LOGTO_API_RESOURCE, or run: ./apitool init")
+		})
+	}
+	return &Client{
+		cfg: cfg,
+		http: &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		cookies: map[string]string{},
+	}, nil
+}
+
+func (c *Client) JWT() string { return c.jwt }
+
+// AuthzRequest describes an OIDC authorization-code request. It exists so the
+// same interaction flow can be driven for the frontend app and for any other
+// client registered on the tenant (e.g. a third-party application).
+type AuthzRequest struct {
+	ClientID    string
+	RedirectURI string
+	Scope       string
+	// Resource, when set, asks Logto for a JWT access token bound to that API
+	// resource (what the frontend does). Third-party probes leave it empty.
+	Resource string
+}
+
+// AuthzOutcome reports how far an authorization-code flow got. Code is set only
+// when Logto redirected back to the client with an authorization code, i.e. the
+// IdP authorized this user for this client.
+type AuthzOutcome struct {
+	Code         string
+	CodeVerifier string
+	ConsentShown bool
+	Location     string
+	OAuthError   string
+	Stage        string
+}
+
+// DefaultLoginScope is the scope set the frontend app requests.
+const DefaultLoginScope = "openid profile email offline_access urn:logto:scope:organizations urn:logto:scope:organization_roles"
+
+// ThirdPartyScope matches what the third-party applications are provisioned
+// with (see sync config): no offline_access, no API resource scopes.
+const ThirdPartyScope = "openid profile email roles urn:logto:scope:organizations urn:logto:scope:organization_roles"
+
+// Authorize drives the OIDC authorization-code flow for an arbitrary client and
+// stops as soon as Logto redirects back to that client. It never contacts the
+// client's redirect target: the Location header is inspected, not followed.
+func (c *Client) Authorize(email, password string, req AuthzRequest) (*AuthzOutcome, error) {
+	out := &AuthzOutcome{Stage: "start"}
+
+	verBytes := make([]byte, 48)
+	if _, err := rand.Read(verBytes); err != nil {
+		return out, err
+	}
+	codeVerifier := b64url(verBytes)
+	out.CodeVerifier = codeVerifier
+	sum := sha256.Sum256([]byte(codeVerifier))
+	codeChallenge := b64url(sum[:])
+	stateBytes := make([]byte, 16)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return out, err
+	}
+	state := b64url(stateBytes)
+
+	q := url.Values{
+		"client_id":             {req.ClientID},
+		"redirect_uri":          {req.RedirectURI},
+		"response_type":         {"code"},
+		"scope":                 {req.Scope},
+		"state":                 {state},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
+	}
+	if req.Resource != "" {
+		q.Set("resource", req.Resource)
+	}
+	out.Stage = "authorize"
+	r, err := c.followAll(c.cfg.LogtoEndpoint + "/oidc/auth?" + q.Encode())
+	if err != nil {
+		return out, fmt.Errorf("oidc auth: %w", err)
+	}
+	// A refused authorization request (an unknown resource indicator, a
+	// redirect URI the client does not have) sets no interaction cookie, so
+	// every later call fails as session.not_found and hides the real reason.
+	// Report what Logto actually said instead.
+	if r.status >= 400 {
+		return out, fmt.Errorf("oidc auth refused (%d): %s", r.status, r.body)
+	}
+
+	out.Stage = "interaction"
+	if r, err = c.do("PUT", c.cfg.LogtoEndpoint+"/api/interaction", `{"event":"SignIn"}`, "application/json"); err != nil {
+		return out, fmt.Errorf("interaction start: %w", err)
+	}
+	if r.status >= 400 {
+		return out, fmt.Errorf("interaction start refused (%d): %s", r.status, r.body)
+	}
+
+	credBody, err := json.Marshal(map[string]string{"email": email, "password": password})
+	if err != nil {
+		return out, err
+	}
+	out.Stage = "credentials"
+	r, err = c.do("PATCH", c.cfg.LogtoEndpoint+"/api/interaction/identifiers", string(credBody), "application/json")
+	if err != nil {
+		return out, fmt.Errorf("submit creds: %w", err)
+	}
+	if r.status >= 400 {
+		return out, fmt.Errorf("login failed (%d): %s", r.status, r.body)
+	}
+
+	out.Stage = "submit"
+	r, err = c.do("POST", c.cfg.LogtoEndpoint+"/api/interaction/submit", "", "")
+	if err != nil {
+		return out, fmt.Errorf("interaction submit: %w", err)
+	}
+	var sub struct {
+		RedirectTo string `json:"redirectTo"`
+	}
+	if err := json.Unmarshal([]byte(r.body), &sub); err != nil || sub.RedirectTo == "" {
+		return out, fmt.Errorf("no redirectTo: %s", r.body)
+	}
+
+	r, err = c.do("GET", sub.RedirectTo, "", "")
+	if err != nil {
+		return out, fmt.Errorf("follow redirect: %w", err)
+	}
+	loc := r.headers.Get("Location")
+	if strings.Contains(loc, "/consent") {
+		// GET the consent page (Logto records that we visited it),
+		// then POST consent acceptance and re-follow the redirect chain.
+		out.ConsentShown = true
+		out.Stage = "consent"
+		if _, err := c.do("GET", c.cfg.LogtoEndpoint+loc, "", ""); err != nil {
+			return out, fmt.Errorf("consent get: %w", err)
+		}
+		r, err = c.do("POST", c.cfg.LogtoEndpoint+"/api/interaction/consent", "", "")
+		if err != nil {
+			return out, fmt.Errorf("consent post: %w", err)
+		}
+		if r.status >= 400 {
+			out.OAuthError = fmt.Sprintf("consent refused (%d): %s", r.status, r.body)
+			return out, nil
+		}
+		var cr struct {
+			RedirectTo string `json:"redirectTo"`
+		}
+		_ = json.Unmarshal([]byte(r.body), &cr)
+		r, err = c.do("GET", cr.RedirectTo, "", "")
+		if err != nil {
+			return out, fmt.Errorf("follow after consent: %w", err)
+		}
+		loc = r.headers.Get("Location")
+	}
+
+	out.Location = loc
+	out.Stage = "redirect"
+	parsedLoc, err := url.Parse(loc)
+	if err != nil {
+		return out, fmt.Errorf("parse redirect: %w", err)
+	}
+	if e := parsedLoc.Query().Get("error"); e != "" {
+		out.OAuthError = e
+		if d := parsedLoc.Query().Get("error_description"); d != "" {
+			out.OAuthError += ": " + d
+		}
+		return out, nil
+	}
+	out.Code = parsedLoc.Query().Get("code")
+	if out.Code != "" {
+		out.Stage = "code_issued"
+	}
+	return out, nil
+}
+
+// Login executes the full OIDC + backend exchange. On success the JWT is
+// stored on the client and returned by JWT().
+func (c *Client) Login(email, password string) error {
+	redirectURI := c.cfg.AuthBaseURL + "/login-redirect"
+
+	out, err := c.Authorize(email, password, AuthzRequest{
+		ClientID:    c.cfg.LogtoAppID,
+		RedirectURI: redirectURI,
+		Scope:       DefaultLoginScope,
+		Resource:    c.cfg.LogtoResource,
+	})
+	if err != nil {
+		return err
+	}
+	if out.Code == "" {
+		if out.OAuthError != "" {
+			return fmt.Errorf("authorization refused at %s: %s", out.Stage, out.OAuthError)
+		}
+		return fmt.Errorf("no auth code in redirect: %s", out.Location)
+	}
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {out.Code},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {c.cfg.LogtoAppID},
+		"code_verifier": {out.CodeVerifier},
+	}
+	if c.cfg.LogtoResource != "" {
+		form.Set("resource", c.cfg.LogtoResource)
+	}
+	r, err := c.do("POST", c.cfg.LogtoEndpoint+"/oidc/token", form.Encode(), "application/x-www-form-urlencoded")
+	if err != nil {
+		return fmt.Errorf("token exchange: %w", err)
+	}
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal([]byte(r.body), &tok); err != nil || tok.AccessToken == "" {
+		return fmt.Errorf("no logto access_token: %s", r.body)
+	}
+
+	exBody, err := json.Marshal(map[string]string{"access_token": tok.AccessToken})
+	if err != nil {
+		return err
+	}
+	r, err = c.do("POST", c.cfg.BackendURL+"/auth/exchange", string(exBody), "application/json")
+	if err != nil {
+		return fmt.Errorf("backend exchange: %w", err)
+	}
+	if r.status >= 400 {
+		return fmt.Errorf("exchange failed (%d): %s", r.status, r.body)
+	}
+	var ex struct {
+		Data struct {
+			Token string `json:"token"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(r.body), &ex); err != nil || ex.Data.Token == "" {
+		return fmt.Errorf("no token in exchange response: %s", r.body)
+	}
+	c.jwt = ex.Data.Token
+	return nil
+}
+
+type httpResult struct {
+	status  int
+	body    string
+	headers http.Header
+}
+
+func (c *Client) do(method, urlStr, body, contentType string) (*httpResult, error) {
+	var br io.Reader
+	if body != "" {
+		br = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, urlStr, br)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if cookieHdr := c.cookieHeader(); cookieHdr != "" {
+		req.Header.Set("Cookie", cookieHdr)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	c.captureCookies(resp.Header.Values("Set-Cookie"))
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return &httpResult{status: resp.StatusCode, body: string(data), headers: resp.Header}, nil
+}
+
+// cookieHeader builds the Cookie header from raw stored values. Outgoing
+// values bypass http.Cookie sanitization so JSON cookie values survive.
+func (c *Client) cookieHeader() string {
+	if len(c.cookies) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(c.cookies))
+	for k, v := range c.cookies {
+		parts = append(parts, k+"="+v)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// captureCookies parses raw Set-Cookie header lines lazily (only name=value,
+// up to the first ';'). Path/domain/expiry attributes are ignored: this tool
+// only ever talks to one host per flow, and the OIDC session lives <1 minute.
+func (c *Client) captureCookies(setCookieLines []string) {
+	for _, line := range setCookieLines {
+		semi := strings.Index(line, ";")
+		nv := line
+		if semi >= 0 {
+			nv = line[:semi]
+		}
+		eq := strings.Index(nv, "=")
+		if eq <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(nv[:eq])
+		value := strings.TrimSpace(nv[eq+1:])
+		c.cookies[name] = value
+	}
+}
+
+// followAll walks redirect chains manually so cookies set during interim hops
+// are captured by the cookie jar (Go's auto-follow drops some headers).
+func (c *Client) followAll(start string) (*httpResult, error) {
+	cur := start
+	for i := 0; i < 10; i++ {
+		r, err := c.do("GET", cur, "", "")
+		if err != nil {
+			return nil, err
+		}
+		if r.status >= 300 && r.status < 400 {
+			loc := r.headers.Get("Location")
+			if loc == "" {
+				return r, nil
+			}
+			rel, err := url.Parse(loc)
+			if err != nil {
+				return r, nil
+			}
+			base, _ := url.Parse(cur)
+			cur = base.ResolveReference(rel).String()
+			continue
+		}
+		return r, nil
+	}
+	return nil, fmt.Errorf("too many redirects starting at %s", start)
+}
+
+type apiResp struct {
+	status int
+	body   []byte
+}
+
+func (c *Client) api(method, path string, payload interface{}) (*apiResp, error) {
+	if c.jwt == "" {
+		return nil, fmt.Errorf("not authenticated")
+	}
+	var body io.Reader
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, c.cfg.BackendURL+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.jwt)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	data, _ := io.ReadAll(resp.Body)
+	return &apiResp{status: resp.StatusCode, body: data}, nil
+}
+
+// SetDistributorThirdPartyApps replaces the portal list of a distributor
+// (PUT /distributors/{id} with third_party_apps). Owner organization only.
+func (c *Client) SetDistributorThirdPartyApps(logtoID string, apps []string) error {
+	if apps == nil {
+		apps = []string{}
+	}
+	r, err := c.api("PUT", "/distributors/"+logtoID, map[string]interface{}{"third_party_apps": apps})
+	if err != nil {
+		return err
+	}
+	if r.status >= 400 {
+		return fmt.Errorf("set third_party_apps on distributor %s failed (%d): %s", logtoID, r.status, r.body)
+	}
+	return nil
+}
+
+// CreateOrg creates a distributor/reseller/customer; returns its logto_id.
+// thirdPartyApps, when non-nil, is sent as the distributor portal list.
+func (c *Client) CreateOrg(orgType, name, description string, customData map[string]interface{}, thirdPartyApps ...[]string) (string, error) {
+	if !validOrgType(orgType) {
+		return "", fmt.Errorf("invalid org type: %s", orgType)
+	}
+	payload := map[string]interface{}{"name": name}
+	if description != "" {
+		payload["description"] = description
+	}
+	if len(customData) > 0 {
+		payload["custom_data"] = customData
+	}
+	if len(thirdPartyApps) > 0 && thirdPartyApps[0] != nil {
+		payload["third_party_apps"] = thirdPartyApps[0]
+	}
+	r, err := c.api("POST", "/"+orgType+"s", payload)
+	if err != nil {
+		return "", err
+	}
+	if r.status >= 400 {
+		return "", fmt.Errorf("create %s failed (%d): %s", orgType, r.status, r.body)
+	}
+	var resp struct {
+		Data struct {
+			LogtoID string `json:"logto_id"`
+			ID      string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(r.body, &resp); err != nil {
+		return "", fmt.Errorf("parse response: %w", err)
+	}
+	id := resp.Data.LogtoID
+	if id == "" {
+		id = resp.Data.ID
+	}
+	if id == "" {
+		return "", fmt.Errorf("no id in response: %s", r.body)
+	}
+	return id, nil
+}
+
+// CreateUser creates a user under an org. The user's logto_id is populated
+// asynchronously by the backend after Logto sync completes (the immediate
+// POST /users response has logto_id=null), so this polls /users until the
+// just-created user appears with a non-null logto_id, which is then returned.
+// All subsequent /users/:id endpoints expect the logto_id, not the local DB id.
+func (c *Client) CreateUser(email, name, username, orgID string, roleIDs []string) (string, error) {
+	payload := map[string]interface{}{
+		"email":           email,
+		"name":            name,
+		"user_role_ids":   roleIDs,
+		"organization_id": orgID,
+	}
+	if username != "" {
+		payload["username"] = username
+	}
+	r, err := c.api("POST", "/users", payload)
+	if err != nil {
+		return "", err
+	}
+	if r.status >= 400 {
+		return "", fmt.Errorf("create user failed (%d): %s", r.status, r.body)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		logtoID, err := c.findUserLogtoID(orgID, email)
+		if err == nil && logtoID != "" {
+			return logtoID, nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return "", fmt.Errorf("user created but logto_id never populated: %w", err)
+			}
+			return "", fmt.Errorf("user %s created but logto_id never populated within 10s", email)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// findUserLogtoID lists users in the org and returns the logto_id of the user
+// matching the given email. Empty string + nil error means "user listed but
+// logto_id still null" (caller should retry).
+func (c *Client) findUserLogtoID(orgID, email string) (string, error) {
+	r, err := c.api("GET", "/users?organization_id="+url.QueryEscape(orgID), nil)
+	if err != nil {
+		return "", err
+	}
+	if r.status >= 400 {
+		return "", fmt.Errorf("list users failed (%d): %s", r.status, r.body)
+	}
+	var resp struct {
+		Data struct {
+			Users []struct {
+				Email   string  `json:"email"`
+				LogtoID *string `json:"logto_id"`
+			} `json:"users"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(r.body, &resp); err != nil {
+		return "", fmt.Errorf("parse list response: %w", err)
+	}
+	for _, u := range resp.Data.Users {
+		if strings.EqualFold(u.Email, email) {
+			if u.LogtoID != nil && *u.LogtoID != "" {
+				return *u.LogtoID, nil
+			}
+			return "", nil
+		}
+	}
+	return "", fmt.Errorf("user %s not found in org %s", email, orgID)
+}
+
+// ResetPassword retries on 404 because the user record can be momentarily
+// invisible to GetByID right after CreateUser returns (Logto-side write
+// landing slightly after the local DB commit visible to the lookup path).
+// DeleteUser soft-deletes a user by logto_id.
+func (c *Client) DeleteUser(logtoID string) error {
+	r, err := c.api("DELETE", "/users/"+logtoID, nil)
+	if err != nil {
+		return err
+	}
+	if r.status >= 400 && r.status != 404 {
+		return fmt.Errorf("delete user failed (%d): %s", r.status, r.body)
+	}
+	return nil
+}
+
+// DestroyUser permanently deletes a user (requires destroy:users permission).
+func (c *Client) DestroyUser(logtoID string) error {
+	r, err := c.api("DELETE", "/users/"+logtoID+"/destroy", nil)
+	if err != nil {
+		return err
+	}
+	if r.status >= 400 && r.status != 404 {
+		return fmt.Errorf("destroy user failed (%d): %s", r.status, r.body)
+	}
+	return nil
+}
+
+// DeleteOrg soft-deletes a distributor/reseller/customer.
+func (c *Client) DeleteOrg(orgType, logtoID string) error {
+	if !validOrgType(orgType) {
+		return fmt.Errorf("invalid org type: %s", orgType)
+	}
+	r, err := c.api("DELETE", "/"+orgType+"s/"+logtoID, nil)
+	if err != nil {
+		return err
+	}
+	if r.status >= 400 && r.status != 404 {
+		return fmt.Errorf("delete %s failed (%d): %s", orgType, r.status, r.body)
+	}
+	return nil
+}
+
+// ListUsersInOrg returns logto_id+email pairs for users in the given org.
+func (c *Client) ListUsersInOrg(orgID string) ([]struct{ LogtoID, Email string }, error) {
+	r, err := c.api("GET", "/users?organization_id="+url.QueryEscape(orgID)+"&page_size=100", nil)
+	if err != nil {
+		return nil, err
+	}
+	if r.status >= 400 {
+		return nil, fmt.Errorf("list users failed (%d): %s", r.status, r.body)
+	}
+	var resp struct {
+		Data struct {
+			Users []struct {
+				Email   string  `json:"email"`
+				LogtoID *string `json:"logto_id"`
+			} `json:"users"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(r.body, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]struct{ LogtoID, Email string }, 0, len(resp.Data.Users))
+	for _, u := range resp.Data.Users {
+		if u.LogtoID == nil {
+			continue
+		}
+		out = append(out, struct{ LogtoID, Email string }{*u.LogtoID, u.Email})
+	}
+	return out, nil
+}
+
+// RegisterSystem completes the public registration handshake for a system that
+// already has credentials issued by CreateSystem. It mirrors what an appliance
+// would do on first contact: POST /api/systems/register with the secret token.
+// Returns the canonical system_key as stamped by the backend. The endpoint is
+// public (no Bearer auth) so we use a fresh HTTP request rather than c.api.
+func (c *Client) RegisterSystem(secret string) (string, error) {
+	payload, err := json.Marshal(map[string]string{"system_secret": secret})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest("POST", c.cfg.BackendURL+"/systems/register", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("register system failed (%d): %s", resp.StatusCode, body)
+	}
+	var r struct {
+		Data struct {
+			SystemKey string `json:"system_key"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return "", err
+	}
+	if r.Data.SystemKey == "" {
+		return "", fmt.Errorf("no system_key in response: %s", body)
+	}
+	return r.Data.SystemKey, nil
+}
+
+// CreateSystem creates a system under an org. Returns the system_key and the
+// full system_secret token (my_<public>.<secret>), the latter only ever
+// returned by the API at creation time.
+func (c *Client) CreateSystem(name, orgID string) (id, key, secret string, err error) {
+	payload := map[string]interface{}{
+		"name":            name,
+		"organization_id": orgID,
+	}
+	r, err := c.api("POST", "/systems", payload)
+	if err != nil {
+		return "", "", "", err
+	}
+	if r.status >= 400 {
+		return "", "", "", fmt.Errorf("create system failed (%d): %s", r.status, r.body)
+	}
+	var resp struct {
+		Data struct {
+			SystemKey    string `json:"system_key"`
+			SystemSecret string `json:"system_secret"`
+			ID           string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(r.body, &resp); err != nil {
+		return "", "", "", err
+	}
+	if resp.Data.SystemKey == "" {
+		return "", "", "", fmt.Errorf("no system_key in response: %s", r.body)
+	}
+	return resp.Data.ID, resp.Data.SystemKey, resp.Data.SystemSecret, nil
+}
+
+// DeleteSystem soft-deletes a system by its internal UUID.
+func (c *Client) DeleteSystem(systemID string) error {
+	r, err := c.api("DELETE", "/systems/"+systemID, nil)
+	if err != nil {
+		return err
+	}
+	if r.status >= 400 {
+		return fmt.Errorf("delete system failed (%d): %s", r.status, r.body)
+	}
+	return nil
+}
+
+func (c *Client) ResetPassword(userID, password string) error {
+	delays := []time.Duration{0, 250 * time.Millisecond, 500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
+	var lastBody string
+	var lastStatus int
+	for _, d := range delays {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		r, err := c.api("PATCH", "/users/"+userID+"/password", map[string]string{"password": password})
+		if err != nil {
+			return err
+		}
+		if r.status < 400 {
+			return nil
+		}
+		lastStatus = r.status
+		lastBody = string(r.body)
+		if r.status != 404 {
+			break
+		}
+	}
+	return fmt.Errorf("reset password failed (%d): %s", lastStatus, lastBody)
+}
+
+// GetRoles returns a name->id map of available user roles.
+// ThirdPartyApp is one entry of GET /third-party-applications, i.e. an app the
+// authenticated caller is allowed to see in the portal.
+type ThirdPartyApp struct {
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	LoginURL     string   `json:"login_url"`
+	RedirectURIs []string `json:"redirect_uris"`
+}
+
+// ListThirdPartyApps returns the third-party applications visible to the
+// authenticated user. The backend filters this list through the per-app
+// access_control stored in Logto custom_data.
+func (c *Client) ListThirdPartyApps() ([]ThirdPartyApp, error) {
+	r, err := c.api("GET", "/third-party-applications", nil)
+	if err != nil {
+		return nil, err
+	}
+	if r.status != 200 {
+		return nil, fmt.Errorf("list third-party apps failed (%d): %s", r.status, string(r.body))
+	}
+	// data is a bare array; tolerate an {"applications": [...]} wrapper too so
+	// the tool keeps working if the envelope ever changes.
+	var flat struct {
+		Data []ThirdPartyApp `json:"data"`
+	}
+	if err := json.Unmarshal(r.body, &flat); err == nil && flat.Data != nil {
+		return flat.Data, nil
+	}
+	var wrapped struct {
+		Data struct {
+			Applications []ThirdPartyApp `json:"applications"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(r.body, &wrapped); err != nil {
+		return nil, fmt.Errorf("decode third-party apps: %w", err)
+	}
+	return wrapped.Data.Applications, nil
+}
+
+func (c *Client) GetRoles() (map[string]string, error) {
+	r, err := c.api("GET", "/roles", nil)
+	if err != nil {
+		return nil, err
+	}
+	if r.status >= 400 {
+		return nil, fmt.Errorf("get roles failed (%d): %s", r.status, r.body)
+	}
+	var resp struct {
+		Data struct {
+			Roles []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"roles"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(r.body, &resp); err != nil {
+		return nil, fmt.Errorf("parse roles: %w", err)
+	}
+	out := map[string]string{}
+	for _, role := range resp.Data.Roles {
+		out[role.Name] = role.ID
+	}
+	return out, nil
+}
+
+// GetUserRoles returns the technical role names assigned to a user. The list
+// endpoint does not hydrate roles, so this reads the single-user endpoint.
+func (c *Client) GetUserRoles(logtoID string) ([]string, error) {
+	r, err := c.api("GET", "/users/"+logtoID, nil)
+	if err != nil {
+		return nil, err
+	}
+	if r.status >= 400 {
+		return nil, fmt.Errorf("get user %s failed (%d): %s", logtoID, r.status, r.body)
+	}
+	var resp struct {
+		Data struct {
+			Roles []struct {
+				Name string `json:"name"`
+			} `json:"roles"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(r.body, &resp); err != nil {
+		return nil, fmt.Errorf("parse user %s: %w", logtoID, err)
+	}
+	out := make([]string, 0, len(resp.Data.Roles))
+	for _, role := range resp.Data.Roles {
+		out = append(out, role.Name)
+	}
+	return out, nil
+}
+
+func b64url(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+
+func validOrgType(t string) bool {
+	return t == "distributor" || t == "reseller" || t == "customer"
+}

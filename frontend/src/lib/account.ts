@@ -1,0 +1,121 @@
+//  Copyright (C) 2025 Nethesis S.r.l.
+//  SPDX-License-Identifier: GPL-3.0-or-later
+
+import axios from 'axios'
+import { API_URL } from './config'
+import { useLoginStore } from '@/stores/login'
+import * as v from 'valibot'
+import { PhoneNumberSchema } from './users/users'
+
+interface UploadMyAvatarResponse {
+  code: number
+  message: string
+  data: {
+    avatar_url: string
+  }
+}
+
+interface DeleteMyAvatarResponse {
+  code: number
+  message: string
+  data: null
+}
+
+export const ProfileInfoSchema = v.object({
+  name: v.pipe(v.string(), v.nonEmpty('users.name_cannot_be_empty')),
+  email: v.pipe(v.string(), v.nonEmpty('users.email_required'), v.email('users.email_invalid')),
+  phone: v.optional(v.union([v.literal(''), PhoneNumberSchema])),
+})
+
+export const ChangePasswordSchema = v.pipe(
+  v.object({
+    current_password: v.pipe(v.string(), v.nonEmpty('account.current_password_required')),
+    new_password: v.pipe(v.string(), v.nonEmpty('account.new_password_required')),
+    confirm_password: v.pipe(v.string(), v.nonEmpty('account.confirm_password_required')),
+  }),
+  v.forward(
+    v.partialCheck(
+      [['new_password'], ['confirm_password']],
+      (input) => input.new_password === input.confirm_password,
+      'account.passwords_do_not_match',
+    ),
+    ['confirm_password'],
+  ),
+  v.forward(
+    v.partialCheck(
+      [['current_password'], ['new_password']],
+      (input) => input.current_password !== input.new_password,
+      'account.new_password_must_be_different_from_current',
+    ),
+    ['new_password'],
+  ),
+)
+
+export const VerifyEmailChangeSchema = v.object({
+  code: v.pipe(v.string(), v.trim(), v.nonEmpty('account.verification_code_required')),
+})
+
+export type ProfileInfo = v.InferOutput<typeof ProfileInfoSchema>
+export type ChangePassword = v.InferOutput<typeof ChangePasswordSchema>
+export type VerifyEmailChange = v.InferOutput<typeof VerifyEmailChangeSchema>
+
+// POST /me/change-info answers 200 when everything was applied, or 202 when the
+// email differs from the current one: name and phone are applied, the email is
+// parked and a one-time code is mailed to it. The change completes only through
+// postVerifyEmailChange, so the address on the account can never be one its
+// owner has not proven to read.
+export interface ChangeInfoResponse {
+  code: number
+  message: string
+  data: {
+    updated_fields: string[]
+    email_verification_required?: boolean
+    pending_email?: string
+  }
+}
+
+export const postChangeInfo = (profileInfo: Partial<ProfileInfo>) => {
+  const loginStore = useLoginStore()
+
+  return axios.post<ChangeInfoResponse>(`${API_URL}/me/change-info`, profileInfo, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const postVerifyEmailChange = (payload: VerifyEmailChange) => {
+  const loginStore = useLoginStore()
+
+  return axios.post<ChangeInfoResponse>(`${API_URL}/me/change-info/verify-email`, payload, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const postChangePassword = (changePasswordData: ChangePassword) => {
+  const loginStore = useLoginStore()
+
+  return axios.post(`${API_URL}/me/change-password`, changePasswordData, {
+    headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+  })
+}
+
+export const putAvatar = (avatar: File) => {
+  const loginStore = useLoginStore()
+  const formData = new FormData()
+  formData.append('avatar', avatar)
+
+  return axios
+    .put<UploadMyAvatarResponse>(`${API_URL}/me/avatar`, formData, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data.data)
+}
+
+export const deleteAvatar = () => {
+  const loginStore = useLoginStore()
+
+  return axios
+    .delete<DeleteMyAvatarResponse>(`${API_URL}/me/avatar`, {
+      headers: { Authorization: `Bearer ${loginStore.jwtToken}` },
+    })
+    .then((res) => res.data.data)
+}

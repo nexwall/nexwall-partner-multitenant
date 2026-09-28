@@ -1,0 +1,325 @@
+/*
+ * Copyright (C) 2025 Nethesis S.r.l.
+ * http://www.nethesis.it - info@nethesis.it
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * author: Edoardo Spadoni <edoardo.spadoni@nethesis.it>
+ */
+
+package sync
+
+import (
+	"fmt"
+	"path/filepath"
+
+	"github.com/nethesis/my/sync/internal/client"
+	"github.com/nethesis/my/sync/internal/config"
+	"github.com/nethesis/my/sync/internal/logger"
+)
+
+// syncThirdPartyApplications synchronizes third-party applications
+func (e *Engine) syncThirdPartyApplications(cfg *config.Config, result *Result) error {
+	if len(cfg.ThirdPartyApps) == 0 {
+		logger.Info("No third-party applications to sync")
+		return nil
+	}
+
+	logger.Info("Syncing %d third-party applications", len(cfg.ThirdPartyApps))
+
+	// Get existing third-party applications
+	existingAppsList, err := e.client.GetThirdPartyApplications()
+	if err != nil {
+		return fmt.Errorf("failed to get existing third-party applications: %w", err)
+	}
+
+	// Index existing applications by name for efficient lookup
+	existingApps := make(map[string]client.ThirdPartyApplication)
+	for _, app := range existingAppsList {
+		existingApps[app.Name] = app
+	}
+
+	// Sync each configured application
+	for _, appConfig := range cfg.ThirdPartyApps {
+		if err := e.syncSingleApplication(appConfig, existingApps, cfg, result); err != nil {
+			logger.Error("Failed to sync application %s: %v", appConfig.Name, err)
+			result.Errors = append(result.Errors, fmt.Sprintf("Application %s sync failed: %v", appConfig.Name, err))
+		}
+	}
+
+	// Cleanup unused applications if enabled
+	if e.options.Cleanup {
+		if err := e.cleanupThirdPartyApplications(cfg, existingApps, result); err != nil {
+			logger.Error("Failed to cleanup applications: %v", err)
+			result.Errors = append(result.Errors, fmt.Sprintf("Applications cleanup failed: %v", err))
+		}
+	}
+
+	return nil
+}
+
+// buildAppPayload populates CustomData, OidcClientMetadata, and CustomClientMetadata on a ThirdPartyApplication
+func (e *Engine) buildAppPayload(appConfig config.Application, cfg *config.Config, app *client.ThirdPartyApplication) {
+	customData := make(map[string]interface{})
+
+	if appConfig.AccessControl != nil {
+		accessControlData := map[string]interface{}{
+			"organization_roles": appConfig.AccessControl.OrganizationRoles,
+			"user_roles":         appConfig.AccessControl.UserRoles,
+		}
+
+		if len(appConfig.AccessControl.UserRoles) > 0 {
+			userRoleIDs, err := e.resolveUserRoleIDs(cfg, appConfig.AccessControl.UserRoles)
+			if err != nil {
+				logger.Warn("Failed to resolve user role IDs for app %s: %v", appConfig.Name, err)
+			} else {
+				accessControlData["user_role_ids"] = userRoleIDs
+			}
+		}
+
+		if len(appConfig.AccessControl.OrganizationIDs) > 0 {
+			accessControlData["organization_ids"] = appConfig.AccessControl.OrganizationIDs
+		}
+		if appConfig.AccessControl.IDPEnforced != nil {
+			accessControlData["idp_enforced"] = *appConfig.AccessControl.IDPEnforced
+		}
+		customData["access_control"] = accessControlData
+	}
+
+	if appConfig.LoginURL != "" {
+		customData["login_url"] = appConfig.LoginURL
+	}
+
+	if appConfig.InfoURL != "" {
+		customData["info_url"] = appConfig.InfoURL
+	}
+
+	if len(customData) > 0 {
+		app.CustomData = customData
+	}
+
+	if len(appConfig.RedirectUris) > 0 || len(appConfig.PostLogoutRedirectUris) > 0 {
+		app.OidcClientMetadata = &client.OidcClientMetadata{
+			RedirectUris:           appConfig.RedirectUris,
+			PostLogoutRedirectUris: appConfig.PostLogoutRedirectUris,
+		}
+	}
+
+	if len(appConfig.CorsAllowed) > 0 {
+		app.CustomClientMetadata = &client.CustomClientMetadata{
+			CorsAllowedOrigins: appConfig.CorsAllowed,
+		}
+	}
+}
+
+// buildAppBranding loads the configured application icons as data URLs. Logto
+// stores them on the application sign-in experience, next to the display name.
+//
+// Logto merges the branding it receives, so a payload without icons leaves the
+// ones already uploaded in place: an empty "branding:" block in the config is
+// the way to clear them.
+func (e *Engine) buildAppBranding(appConfig config.Application) (*client.ApplicationBranding, error) {
+	if appConfig.Branding == nil {
+		return nil, nil
+	}
+
+	basePath := e.configBasePath()
+	branding := &client.ApplicationBranding{}
+
+	icons := []struct {
+		path   string
+		target *string
+		label  string
+	}{
+		{appConfig.Branding.LogoPath, &branding.LogoURL, "logo"},
+		{appConfig.Branding.LogoDarkPath, &branding.DarkLogoURL, "dark logo"},
+	}
+
+	for _, icon := range icons {
+		if icon.path == "" {
+			continue
+		}
+
+		fullPath := filepath.Join(basePath, icon.path)
+		dataURL, err := e.loadFileAsDataURL(fullPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load %s from %s: %w", icon.label, fullPath, err)
+		}
+		*icon.target = dataURL
+	}
+
+	return branding, nil
+}
+
+// syncSingleApplication synchronizes a single third-party application
+func (e *Engine) syncSingleApplication(appConfig config.Application, existingApps map[string]client.ThirdPartyApplication, cfg *config.Config, result *Result) error {
+	logger.Info("Processing application: %s", appConfig.Name)
+
+	scopes := cfg.GetDefaultScopes()
+	if len(appConfig.Scopes) > 0 {
+		scopes = appConfig.Scopes
+	}
+
+	branding, err := e.buildAppBranding(appConfig)
+	if err != nil {
+		e.addOperation(result, "application", "branding", appConfig.Name, fmt.Sprintf("Load branding assets for %s", appConfig.Name), err)
+		return fmt.Errorf("failed to load branding assets for %s: %w", appConfig.Name, err)
+	}
+
+	experience := client.ApplicationSignInExperience{
+		DisplayName: appConfig.DisplayName,
+		Branding:    branding,
+	}
+
+	if existingApp, exists := existingApps[appConfig.Name]; exists {
+		logger.Info("Updating existing third-party application: %s", appConfig.Name)
+
+		updatedApp := client.ThirdPartyApplication{
+			ID:           existingApp.ID,
+			Name:         appConfig.Name,
+			Description:  appConfig.Description,
+			Type:         existingApp.Type,
+			IsThirdParty: true,
+		}
+		e.buildAppPayload(appConfig, cfg, &updatedApp)
+
+		if !e.options.DryRun {
+			if err := e.client.UpdateThirdPartyApplication(existingApp.ID, updatedApp); err != nil {
+				e.addOperation(result, "application", "update", appConfig.Name, fmt.Sprintf("Update application %s", appConfig.Name), err)
+				return fmt.Errorf("failed to update application %s: %w", appConfig.Name, err)
+			}
+
+			if err := e.client.UpdateThirdPartyApplicationBranding(existingApp.ID, experience); err != nil {
+				e.addOperation(result, "application", "update_branding", appConfig.Name, fmt.Sprintf("Update branding for %s", appConfig.Name), err)
+				return fmt.Errorf("failed to update branding for %s: %w", appConfig.Name, err)
+			}
+
+			if err := e.client.UpdateThirdPartyApplicationScopes(existingApp.ID, scopes); err != nil {
+				e.addOperation(result, "application", "update_scopes", appConfig.Name, fmt.Sprintf("Update scopes for %s", appConfig.Name), err)
+				return fmt.Errorf("failed to update scopes for %s: %w", appConfig.Name, err)
+			}
+		}
+
+		e.addOperation(result, "application", "update", appConfig.Name, fmt.Sprintf("Update application %s", appConfig.Name), nil)
+		result.Summary.ApplicationsUpdated++
+		logger.Info("Updated application: %s", appConfig.Name)
+	} else {
+		logger.Info("Creating new application: %s", appConfig.Name)
+
+		newApp := client.ThirdPartyApplication{
+			Name:         appConfig.Name,
+			Description:  appConfig.Description,
+			Type:         "Traditional",
+			IsThirdParty: true,
+		}
+		e.buildAppPayload(appConfig, cfg, &newApp)
+
+		if !e.options.DryRun {
+			createdApp, err := e.client.CreateThirdPartyApplication(newApp)
+			if err != nil {
+				e.addOperation(result, "application", "create", appConfig.Name, fmt.Sprintf("Create application %s", appConfig.Name), err)
+				return fmt.Errorf("failed to create application %s: %w", appConfig.Name, err)
+			}
+
+			if err := e.client.UpdateThirdPartyApplicationBranding(createdApp.ID, experience); err != nil {
+				e.addOperation(result, "application", "create_branding", appConfig.Name, fmt.Sprintf("Set branding for %s", appConfig.Name), err)
+				return fmt.Errorf("failed to set branding for %s: %w", appConfig.Name, err)
+			}
+
+			if err := e.client.UpdateThirdPartyApplicationScopes(createdApp.ID, scopes); err != nil {
+				e.addOperation(result, "application", "create_scopes", appConfig.Name, fmt.Sprintf("Set scopes for %s", appConfig.Name), err)
+				return fmt.Errorf("failed to set scopes for %s: %w", appConfig.Name, err)
+			}
+		}
+
+		e.addOperation(result, "application", "create", appConfig.Name, fmt.Sprintf("Create application %s", appConfig.Name), nil)
+		result.Summary.ApplicationsCreated++
+		logger.Info("Created application: %s", appConfig.Name)
+	}
+
+	return nil
+}
+
+// cleanupThirdPartyApplications removes applications not defined in config
+func (e *Engine) cleanupThirdPartyApplications(cfg *config.Config, existingApps map[string]client.ThirdPartyApplication, result *Result) error {
+	// Build set of configured application names
+	configuredNames := make(map[string]bool)
+	for _, app := range cfg.ThirdPartyApps {
+		configuredNames[app.Name] = true
+	}
+
+	// Find applications to delete
+	var toDelete []client.ThirdPartyApplication
+	for name, app := range existingApps {
+		if !configuredNames[name] {
+			toDelete = append(toDelete, app)
+		}
+	}
+
+	if len(toDelete) == 0 {
+		logger.Info("No applications to cleanup")
+		return nil
+	}
+
+	logger.Info("Cleaning up %d applications", len(toDelete))
+
+	// Delete each application
+	for _, app := range toDelete {
+		logger.Info("Deleting application: %s", app.Name)
+
+		if !e.options.DryRun {
+			if err := e.client.DeleteThirdPartyApplication(app.ID); err != nil {
+				e.addOperation(result, "application", "delete", app.Name, fmt.Sprintf("Delete application %s", app.Name), err)
+				return fmt.Errorf("failed to delete application %s: %w", app.Name, err)
+			}
+		}
+
+		e.addOperation(result, "application", "delete", app.Name, fmt.Sprintf("Delete application %s", app.Name), nil)
+		result.Summary.ApplicationsDeleted++
+		logger.Info("Deleted application: %s", app.Name)
+	}
+
+	return nil
+}
+
+// resolveUserRoleIDs resolves sync config role IDs to their corresponding Logto role IDs
+func (e *Engine) resolveUserRoleIDs(cfg *config.Config, syncConfigRoleIDs []string) ([]string, error) {
+	// Get all roles from Logto
+	logtoRoles, err := e.client.GetRoles()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get roles from Logto: %w", err)
+	}
+
+	// Create a map from sync config role name to Logto role ID
+	nameToLogtoID := make(map[string]string)
+	for _, logtoRole := range logtoRoles {
+		nameToLogtoID[logtoRole.Name] = logtoRole.ID
+	}
+
+	// Resolve sync config IDs to role names, then to Logto IDs
+	var resolvedLogtoIDs []string
+	for _, syncConfigID := range syncConfigRoleIDs {
+		// Find the role name from sync config
+		var roleName string
+		for _, role := range cfg.UserRoles {
+			if role.ID == syncConfigID {
+				roleName = role.Name
+				break
+			}
+		}
+
+		if roleName == "" {
+			logger.Warn("Sync config role ID '%s' not found in configuration", syncConfigID)
+			continue
+		}
+
+		// Find the corresponding Logto role ID
+		if logtoID, exists := nameToLogtoID[roleName]; exists {
+			resolvedLogtoIDs = append(resolvedLogtoIDs, logtoID)
+		} else {
+			logger.Warn("Logto role with name '%s' not found for sync config ID '%s'", roleName, syncConfigID)
+		}
+	}
+
+	return resolvedLogtoIDs, nil
+}

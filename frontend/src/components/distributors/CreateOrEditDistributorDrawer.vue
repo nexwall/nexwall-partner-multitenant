@@ -1,0 +1,602 @@
+<!--
+  Copyright (C) 2025 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import {
+  NeButton,
+  NeSideDrawer,
+  NeTextInput,
+  focusElement,
+  NeInlineNotification,
+  NeTextArea,
+  NeCombobox,
+  NeFormItemLabel,
+  NeMultiselectCombobox,
+  type NeComboboxOption,
+  type NeMultiselectComboboxOption,
+  getPreference,
+} from '@nethesis/vue-components'
+import { computed, ref, useTemplateRef, type ShallowRef } from 'vue'
+import {
+  CreateDistributorSchema,
+  DISTRIBUTORS_KEY,
+  DISTRIBUTORS_TOTAL_KEY,
+  EditDistributorSchema,
+  postDistributor,
+  putDistributor,
+  type CreateDistributor,
+  type Distributor,
+  type EditDistributor,
+} from '@/lib/organizations/distributors'
+import * as v from 'valibot'
+import { useMutation, useQuery, useQueryCache } from '@pinia/colada'
+import {
+  getThirdPartyAppIcon,
+  getThirdPartyAppsCatalog,
+  THIRD_PARTY_APPS_CATALOG_KEY,
+} from '@/lib/thirdPartyApps'
+import { useNotificationsStore } from '@/stores/notifications'
+import { useI18n } from 'vue-i18n'
+import { getValidationIssues, isValidationError } from '@/lib/validation'
+import type { AxiosError } from 'axios'
+import { getCommonLanguagesOptions } from '@/lib/locale'
+import { getBrowserLocale } from '@/i18n'
+import { useLoginStore } from '@/stores/login'
+import { combinePhoneParts, countryCodeComboOptions, parsePhoneForForm } from '@/lib/phone'
+
+const { isShown = false, currentDistributor = undefined } = defineProps<{
+  isShown: boolean
+  currentDistributor: Distributor | undefined
+}>()
+
+const emit = defineEmits(['close'])
+
+const { t } = useI18n()
+const queryCache = useQueryCache()
+const notificationsStore = useNotificationsStore()
+const loginStore = useLoginStore()
+
+const {
+  mutate: createDistributorMutate,
+  isLoading: createDistributorLoading,
+  reset: createDistributorReset,
+  error: createDistributorError,
+} = useMutation({
+  mutation: (newDistributor: CreateDistributor) => {
+    return postDistributor(newDistributor)
+  },
+  onSuccess(data, vars) {
+    // show success notification after drawer closes
+    setTimeout(() => {
+      notificationsStore.createNotification({
+        kind: 'success',
+        title: t('distributors.distributor_created'),
+        description: t('common.object_created_successfully', {
+          name: vars.name,
+        }),
+      })
+    }, 500)
+
+    closeDrawer()
+  },
+  onError: (error) => {
+    console.error('Error creating distributor:', error)
+    validationIssues.value = getValidationIssues(error as AxiosError, 'organizations')
+  },
+  onSettled: () => {
+    queryCache.invalidateQueries({ key: [DISTRIBUTORS_KEY] })
+    queryCache.invalidateQueries({ key: [DISTRIBUTORS_TOTAL_KEY] })
+  },
+})
+
+const {
+  mutate: editDistributorMutate,
+  isLoading: editDistributorLoading,
+  reset: editDistributorReset,
+  error: editDistributorError,
+} = useMutation({
+  mutation: (distributor: EditDistributor) => {
+    return putDistributor(distributor)
+  },
+  onSuccess(data, vars) {
+    // show success notification after drawer closes
+    setTimeout(() => {
+      notificationsStore.createNotification({
+        kind: 'success',
+        title: t('distributors.distributor_saved'),
+        description: t('common.object_saved_successfully', {
+          name: vars.name,
+        }),
+      })
+    }, 500)
+
+    closeDrawer()
+  },
+  onError: (error) => {
+    console.error('Error editing distributor:', error)
+  },
+  onSettled: () => {
+    queryCache.invalidateQueries({ key: [DISTRIBUTORS_KEY] })
+  },
+})
+
+const name = ref('')
+const nameRef = useTemplateRef<HTMLInputElement>('nameRef')
+const vatNumber = ref('')
+const vatNumberRef = useTemplateRef<HTMLInputElement>('vatNumberRef')
+const address = ref('')
+const addressRef = useTemplateRef<HTMLInputElement>('addressRef')
+const city = ref('')
+const cityRef = useTemplateRef<HTMLInputElement>('cityRef')
+const mainContact = ref('')
+const mainContactRef = useTemplateRef<HTMLInputElement>('mainContactRef')
+const email = ref('')
+const emailRef = useTemplateRef<HTMLInputElement>('emailRef')
+const countryCode = ref('')
+const phone = ref('')
+const phoneRef = useTemplateRef<HTMLInputElement>('phoneRef')
+const language = ref('it')
+const languageRef = useTemplateRef<HTMLInputElement>('languageRef')
+const notes = ref('')
+const notesRef = useTemplateRef<HTMLInputElement>('notesRef')
+// Portals the resellers and customers under the distributor may use
+// (application names); the distributor's own users are not bound by it. Only
+// the Owner organization sees and edits the field, and it exists on this
+// drawer alone: the organizations below inherit the choice.
+const selectedApps = ref<string[]>([])
+const validationIssues = ref<Record<string, string[]>>({})
+
+const canSetThirdPartyApps = computed(() => loginStore.isOwner)
+
+// The catalogue of grantable portals, fetched only while the drawer is open
+// for an Owner user (the endpoint is owner-only).
+const { state: catalog, asyncStatus: catalogStatus } = useQuery({
+  key: [THIRD_PARTY_APPS_CATALOG_KEY],
+  enabled: () => isShown && canSetThirdPartyApps.value,
+  query: getThirdPartyAppsCatalog,
+})
+
+// The option id is the application name, which is what the API stores.
+const thirdPartyAppOptions = computed<NeMultiselectComboboxOption[]>(() =>
+  (catalog.value.data ?? []).map((app) => ({
+    id: app.name,
+    label: app.display_name,
+    description: app.name,
+    icon: getThirdPartyAppIcon(app),
+  })),
+)
+
+// The names are the source of truth (they are what a distributor carries and
+// what the API expects); the picker works on options, resolved against the
+// catalogue as soon as it is loaded. A name the catalogue no longer lists is
+// still shown, by name, so it can be removed.
+const selectedThirdPartyAppOptions = computed<NeMultiselectComboboxOption[]>({
+  get: () =>
+    selectedApps.value.map(
+      (name) =>
+        thirdPartyAppOptions.value.find((option) => option.id === name) ?? {
+          id: name,
+          label: name,
+        },
+    ),
+  set: (options) => {
+    selectedApps.value = options.map((option) => option.id)
+  },
+})
+
+const thirdPartyAppsInvalidMessage = computed(() => {
+  const issue = validationIssues.value.third_party_apps?.[0]
+  return issue ? t(issue) : ''
+})
+
+const fieldRefs: Record<string, Readonly<ShallowRef<HTMLInputElement | null>>> = {
+  name: nameRef,
+  custom_data_vat: vatNumberRef,
+  custom_data_address: addressRef,
+  custom_data_city: cityRef,
+  custom_data_main_contact: mainContactRef,
+  custom_data_email: emailRef,
+  custom_data_phone: phoneRef,
+  custom_data_language: languageRef,
+  custom_data_notes: notesRef,
+}
+
+const saving = computed(() => {
+  return createDistributorLoading.value || editDistributorLoading.value
+})
+
+const languageOptions = computed((): NeComboboxOption[] => {
+  if (loginStore.userInfo?.email && getPreference('locale', loginStore.userInfo.email)) {
+    const locale = getPreference('locale', loginStore.userInfo.email)
+    return getCommonLanguagesOptions(locale)
+  } else {
+    return getCommonLanguagesOptions(getBrowserLocale())
+  }
+})
+
+function onShow() {
+  clearErrors()
+  focusElement(nameRef)
+
+  if (currentDistributor) {
+    // editing distributor
+    name.value = currentDistributor.name
+    vatNumber.value = currentDistributor.custom_data?.vat || ''
+    address.value = currentDistributor.custom_data?.address || ''
+    city.value = currentDistributor.custom_data?.city || ''
+    mainContact.value = currentDistributor.custom_data?.main_contact || ''
+    email.value = currentDistributor.custom_data?.email || ''
+
+    // Parse phone number to extract country code and local part
+    if (currentDistributor.custom_data?.phone) {
+      const parsed = parsePhoneForForm(currentDistributor.custom_data.phone)
+      countryCode.value = parsed.countryCode
+      phone.value = parsed.phone
+    } else {
+      countryCode.value = 'it'
+      phone.value = ''
+    }
+
+    language.value = currentDistributor.custom_data?.language || ''
+    notes.value = currentDistributor.custom_data?.notes || ''
+    selectedApps.value = [...(currentDistributor.third_party_apps ?? [])]
+  } else {
+    // creating distributor, reset form to defaults
+    name.value = ''
+    vatNumber.value = ''
+    address.value = ''
+    city.value = ''
+    mainContact.value = ''
+    email.value = ''
+    countryCode.value = 'it'
+    phone.value = ''
+    language.value = 'it'
+    notes.value = ''
+    selectedApps.value = []
+  }
+}
+
+function closeDrawer() {
+  emit('close')
+}
+
+function clearErrors() {
+  createDistributorReset()
+  editDistributorReset()
+  validationIssues.value = {}
+}
+
+function validateCreate(distributor: CreateDistributor): boolean {
+  validationIssues.value = {}
+  const validation = v.safeParse(CreateDistributorSchema, distributor)
+
+  if (validation.success) {
+    // no validation issues
+    return true
+  } else {
+    const flattenedIssues = v.flatten(validation.issues)
+
+    if (flattenedIssues.nested) {
+      const issues: Record<string, string[]> = {}
+
+      for (const key in flattenedIssues.nested) {
+        // replace dots with underscores for i18n key
+        const newKey = key.replace(/\./g, '_')
+        issues[newKey] = flattenedIssues.nested[key] ?? []
+      }
+      validationIssues.value = issues
+
+      // focus the first field with error
+
+      const firstErrorFieldName = Object.keys(validationIssues.value)[0]
+      fieldRefs[firstErrorFieldName]?.value?.focus()
+    }
+    return false
+  }
+}
+
+function validateEdit(distributor: EditDistributor): boolean {
+  validationIssues.value = {}
+  const validation = v.safeParse(EditDistributorSchema, distributor)
+
+  if (validation.success) {
+    // no validation issues
+    return true
+  } else {
+    const flattenedIssues = v.flatten(validation.issues)
+
+    if (flattenedIssues.nested) {
+      const issues: Record<string, string[]> = {}
+
+      for (const key in flattenedIssues.nested) {
+        // replace dots with underscores for i18n key
+        const newKey = key.replace(/\./g, '_')
+        issues[newKey] = flattenedIssues.nested[key] ?? []
+      }
+      validationIssues.value = issues
+
+      // focus the first field with error
+
+      const firstErrorFieldName = Object.keys(validationIssues.value)[0]
+      fieldRefs[firstErrorFieldName]?.value?.focus()
+    }
+    return false
+  }
+}
+
+async function saveDistributor() {
+  clearErrors()
+
+  const distributor = {
+    name: name.value,
+    custom_data: {
+      vat: vatNumber.value,
+      address: address.value,
+      city: city.value,
+      main_contact: mainContact.value,
+      email: email.value,
+      phone: combinePhoneParts(countryCode.value, phone.value),
+      language: language.value,
+      notes: notes.value,
+    },
+    // Sent only by the Owner organization, which is the only one allowed to
+    // change the list; anyone else leaves it untouched.
+    ...(canSetThirdPartyApps.value ? { third_party_apps: selectedApps.value } : {}),
+  }
+
+  if (currentDistributor?.logto_id) {
+    // editing distributor
+
+    const distributorToEdit: EditDistributor = {
+      ...distributor,
+      logto_id: currentDistributor.logto_id,
+    }
+
+    const isValidationOk = validateEdit(distributorToEdit)
+    if (!isValidationOk) {
+      return
+    }
+    editDistributorMutate(distributorToEdit)
+  } else {
+    // creating distributor
+
+    const distributorToCreate: CreateDistributor = distributor
+    const isValidationOk = validateCreate(distributorToCreate)
+    if (!isValidationOk) {
+      return
+    }
+    createDistributorMutate(distributorToCreate)
+  }
+}
+</script>
+
+<template>
+  <NeSideDrawer
+    :is-shown="isShown"
+    :title="
+      currentDistributor
+        ? $t('distributors.edit_distributor')
+        : $t('distributors.create_distributor')
+    "
+    :close-aria-label="$t('shell.close_side_drawer')"
+    @show="onShow"
+    @close="closeDrawer"
+  >
+    <form @submit.prevent>
+      <div class="space-y-6">
+        <!-- name -->
+        <NeTextInput
+          ref="nameRef"
+          v-model="name"
+          @blur="name = name.trim()"
+          :label="$t('organizations.name')"
+          :invalid-message="validationIssues.name?.[0] ? $t(validationIssues.name[0]) : ''"
+          :disabled="saving"
+        />
+        <!-- VAT number -->
+        <NeTextInput
+          ref="vatNumberRef"
+          v-model="vatNumber"
+          @blur="vatNumber = vatNumber.trim()"
+          :label="$t('organizations.vat_number')"
+          :invalid-message="
+            validationIssues.custom_data_vat?.[0] ? $t(validationIssues.custom_data_vat[0]) : ''
+          "
+          :disabled="saving"
+        />
+        <!-- address -->
+        <NeTextInput
+          ref="addressRef"
+          v-model="address"
+          @blur="address = address.trim()"
+          :label="$t('organizations.address')"
+          :invalid-message="
+            validationIssues.custom_data_address?.[0]
+              ? $t(validationIssues.custom_data_address[0])
+              : ''
+          "
+          :disabled="saving"
+          :optional="true"
+          :optional-label="t('common.optional')"
+        />
+        <!-- city -->
+        <NeTextInput
+          ref="cityRef"
+          v-model="city"
+          @blur="city = city.trim()"
+          :label="$t('organizations.city')"
+          :invalid-message="
+            validationIssues.custom_data_city?.[0] ? $t(validationIssues.custom_data_city[0]) : ''
+          "
+          :disabled="saving"
+          :optional="true"
+          :optional-label="t('common.optional')"
+        />
+        <!-- main contact -->
+        <NeTextInput
+          ref="mainContactRef"
+          v-model="mainContact"
+          @blur="mainContact = mainContact.trim()"
+          :label="$t('organizations.main_contact')"
+          :invalid-message="
+            validationIssues.custom_data_main_contact?.[0]
+              ? $t(validationIssues.custom_data_main_contact[0])
+              : ''
+          "
+          :disabled="saving"
+          :optional="true"
+          :optional-label="t('common.optional')"
+        />
+        <!-- email -->
+        <NeTextInput
+          ref="emailRef"
+          v-model="email"
+          @blur="email = email.trim()"
+          :label="$t('organizations.email')"
+          :invalid-message="
+            validationIssues.custom_data_email?.[0] ? $t(validationIssues.custom_data_email[0]) : ''
+          "
+          :disabled="saving"
+          :optional="true"
+          :optional-label="t('common.optional')"
+        />
+        <!-- phone -->
+        <div>
+          <div class="flex items-center justify-between gap-4">
+            <NeFormItemLabel>{{ $t('organizations.phone_number') }}</NeFormItemLabel>
+            <NeFormItemLabel>{{ $t('common.optional') }}</NeFormItemLabel>
+          </div>
+          <div class="flex gap-4">
+            <!-- country code -->
+            <NeCombobox
+              v-model="countryCode"
+              :options="countryCodeComboOptions"
+              :disabled="saving"
+              :no-results-label="$t('ne_combobox.no_results')"
+              :limited-options-label="$t('ne_combobox.limited_options_label')"
+              :no-options-label="$t('ne_combobox.no_options_label')"
+              :selected-label="$t('ne_combobox.selected')"
+              :user-input-label="$t('ne_combobox.user_input_label')"
+              :optional-label="$t('common.optional')"
+              custom-options-width="17rem"
+            />
+            <!-- local part -->
+            <NeTextInput
+              ref="phoneRef"
+              v-model="phone"
+              @blur="phone = phone.trim()"
+              :invalid-message="
+                validationIssues.custom_data_phone?.[0]
+                  ? t(validationIssues.custom_data_phone[0])
+                  : ''
+              "
+              :disabled="saving"
+              :optional="true"
+              :optional-label="t('common.optional')"
+            />
+          </div>
+        </div>
+        <!-- language -->
+        <NeCombobox
+          ref="languageRef"
+          v-model="language"
+          :options="languageOptions"
+          :label="$t('organizations.language')"
+          :placeholder="$t('ne_combobox.choose')"
+          :invalid-message="
+            validationIssues.custom_data_language?.[0]
+              ? $t(validationIssues.custom_data_language[0])
+              : ''
+          "
+          :disabled="saving"
+          :optional="true"
+          :optional-label="t('common.optional')"
+          :no-results-label="$t('ne_combobox.no_results')"
+          :limited-options-label="$t('ne_combobox.limited_options_label')"
+          :no-options-label="$t('ne_combobox.no_options_label')"
+          :selected-label="$t('ne_combobox.selected')"
+          :user-input-label="$t('ne_combobox.user_input_label')"
+        />
+        <!-- notes -->
+        <NeTextArea
+          ref="notesRef"
+          v-model="notes"
+          @blur="notes = notes.trim()"
+          :label="$t('common.notes')"
+          :disabled="saving"
+          :invalid-message="validationIssues.notes?.[0] ? $t(validationIssues.notes[0]) : ''"
+          :optional="true"
+          :optional-label="t('common.optional')"
+        />
+        <!-- portals (owner only): the resellers and customers below inherit this list -->
+        <template v-if="canSetThirdPartyApps">
+          <NeMultiselectCombobox
+            v-model="selectedThirdPartyAppOptions"
+            :options="thirdPartyAppOptions"
+            :label="$t('organizations.third_party_apps')"
+            :placeholder="$t('organizations.choose_third_party_apps')"
+            :helper-text="$t('organizations.third_party_apps_helper')"
+            :invalid-message="thirdPartyAppsInvalidMessage"
+            :disabled="saving"
+            :loading-options="catalogStatus === 'loading'"
+            :no-results-label="$t('ne_combobox.no_results')"
+            :no-options-label="$t('ne_combobox.no_options_label')"
+            :limited-options-label="$t('ne_combobox.limited_options_label')"
+            :user-input-label="$t('ne_combobox.user_input_label')"
+            :optional="true"
+            :optional-label="$t('common.optional')"
+          />
+          <NeInlineNotification
+            v-if="catalog.status === 'error'"
+            kind="error"
+            :title="t('organizations.cannot_retrieve_third_party_apps')"
+            :description="catalog.error?.message"
+          />
+        </template>
+        <!-- create distributor error notification -->
+        <NeInlineNotification
+          v-if="createDistributorError?.message && !isValidationError(createDistributorError)"
+          kind="error"
+          :title="t('distributors.cannot_create_distributor')"
+          :description="createDistributorError.message"
+        />
+        <!-- edit distributor error notification -->
+        <NeInlineNotification
+          v-if="editDistributorError?.message && !isValidationError(editDistributorError)"
+          kind="error"
+          :title="t('distributors.cannot_save_distributor')"
+          :description="editDistributorError.message"
+        />
+      </div>
+      <!-- footer -->
+      <hr class="my-8" />
+      <div class="flex justify-end">
+        <NeButton
+          kind="tertiary"
+          size="lg"
+          :disabled="saving"
+          class="mr-3"
+          @click.prevent="closeDrawer"
+        >
+          {{ $t('common.cancel') }}
+        </NeButton>
+        <NeButton
+          type="submit"
+          kind="primary"
+          size="lg"
+          :disabled="saving"
+          :loading="saving"
+          @click.prevent="saveDistributor"
+        >
+          {{
+            currentDistributor
+              ? $t('distributors.save_distributor')
+              : $t('distributors.create_distributor')
+          }}
+        </NeButton>
+      </div>
+    </form>
+  </NeSideDrawer>
+</template>

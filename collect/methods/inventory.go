@@ -1,0 +1,138 @@
+/*
+ * Copyright (C) 2025 Nethesis S.r.l.
+ * http://www.nethesis.it - info@nethesis.it
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * author: Edoardo Spadoni <edoardo.spadoni@nethesis.it>
+ */
+
+package methods
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/nethesis/my/collect/configuration"
+	"github.com/nethesis/my/collect/logger"
+	"github.com/nethesis/my/collect/models"
+	"github.com/nethesis/my/collect/queue"
+	"github.com/nethesis/my/collect/response"
+)
+
+var (
+	inventoryQueueManager     *queue.QueueManager
+	inventoryQueueManagerOnce sync.Once
+)
+
+// getInventoryQueueManager returns a singleton QueueManager for the inventory handler
+func getInventoryQueueManager() *queue.QueueManager {
+	inventoryQueueManagerOnce.Do(func() {
+		inventoryQueueManager = queue.NewQueueManager()
+	})
+	return inventoryQueueManager
+}
+
+// CollectInventory handles the POST /api/systems/inventory endpoint
+func CollectInventory(c *gin.Context) {
+	systemIDStr, ok := getAuthenticatedSystemID(c)
+	if !ok {
+		logger.Error().Msg("System ID not found in context after authentication")
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("authentication context error", nil))
+		return
+	}
+
+	// Enforce request size limit using MaxBytesReader (cannot be bypassed by spoofing Content-Length)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, configuration.Config.APIMaxRequestSize)
+
+	// Read raw JSON body directly (inventory is sent as-is from the system)
+	rawBody, err := c.GetRawData()
+	if err != nil {
+		logger.Warn().
+			Err(err).
+			Str("system_id", systemIDStr).
+			Msg("Failed to read request body")
+
+		c.JSON(http.StatusBadRequest, response.BadRequest("failed to read request body", map[string]interface{}{
+			"error": err.Error(),
+		}))
+		return
+	}
+
+	// Create full InventoryData with auto-populated fields
+	now := time.Now()
+	inventoryData := models.InventoryData{
+		SystemID:  systemIDStr,
+		Timestamp: now,
+		Data:      rawBody,
+	}
+
+	// Validate inventory data
+	if err := inventoryData.ValidateInventoryData(); err != nil {
+		logger.Warn().
+			Err(err).
+			Str("system_id", systemIDStr).
+			Msg("Inventory data validation failed")
+
+		c.JSON(http.StatusBadRequest, response.BadRequest("invalid inventory data", map[string]interface{}{
+			"validation_error": err.Error(),
+		}))
+		return
+	}
+
+	// Quick validation of JSON structure
+	var testData interface{}
+	if err := json.Unmarshal(inventoryData.Data, &testData); err != nil {
+		logger.Warn().
+			Err(err).
+			Str("system_id", systemIDStr).
+			Msg("Invalid JSON structure in inventory data")
+
+		c.JSON(http.StatusBadRequest, response.BadRequest("invalid data structure", map[string]interface{}{
+			"error": "Data field must contain valid JSON",
+		}))
+		return
+	}
+
+	// Enqueue for processing with detailed timing and aggressive timeout
+	start := time.Now()
+	queueManager := getInventoryQueueManager()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second) // Very short timeout
+	defer cancel()
+
+	if err := queueManager.EnqueueInventory(ctx, &inventoryData); err != nil {
+		logger.Error().
+			Err(err).
+			Str("system_id", systemIDStr).
+			Dur("enqueue_duration", time.Since(start)).
+			Msg("Failed to enqueue inventory for processing")
+
+		c.JSON(http.StatusInternalServerError, response.InternalServerError("failed to process inventory", map[string]interface{}{
+			"error": "Processing queue unavailable",
+		}))
+		return
+	}
+
+	enqueueTime := time.Since(start)
+
+	logger.Info().
+		Str("system_id", systemIDStr).
+		Time("timestamp", inventoryData.Timestamp).
+		Int("data_size", len(inventoryData.Data)).
+		Dur("enqueue_time", enqueueTime).
+		Msg("Inventory data received and queued for processing")
+
+	// Return success response immediately
+	c.JSON(http.StatusAccepted, response.OK("Inventory received and queued for processing", map[string]interface{}{
+		"system_id":    systemIDStr,
+		"timestamp":    inventoryData.Timestamp,
+		"data_size":    len(inventoryData.Data),
+		"queue_status": "queued",
+		"message":      "Your inventory data has been received and will be processed shortly",
+	}))
+}

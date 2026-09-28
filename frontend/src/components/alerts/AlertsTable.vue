@@ -1,0 +1,680 @@
+<!--
+  Copyright (C) 2026 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import {
+  faArrowRight,
+  faBell,
+  faBellSlash,
+  faCircleCheck,
+  faComment,
+  faEye,
+  faMagnifyingGlass,
+  faServer,
+  faUserCheck,
+} from '@fortawesome/free-solid-svg-icons'
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome'
+import {
+  NeBadgeV2,
+  NeButton,
+  NeDropdown,
+  NeDropdownFilterV2,
+  NeEmptyState,
+  NeInlineNotification,
+  NePaginator,
+  NeSortDropdown,
+  NeSpinner,
+  NeTable,
+  NeTableBody,
+  NeTableCell,
+  NeTableHead,
+  NeTableHeadCell,
+  NeTableRow,
+  type NeDropdownFilterV2Option,
+  type NeDropdownItem,
+  type SortEvent,
+  formatDateTime,
+  formatRelativeTime,
+} from '@nethesis/vue-components'
+import { computed, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { useRoute, useRouter } from 'vue-router'
+import { PAGE_SIZE_OPTIONS } from '@/lib/tablePageSize'
+import { useAlerts } from '@/queries/alerts/alerts'
+import { useAlertFilters } from '@/queries/alerts/alertFilters'
+import { useSystems } from '@/queries/systems/systems'
+import {
+  ALERTS_REFETCH_INTERVAL_SECONDS,
+  ALERTS_TABLE_ID,
+  deleteAlertSilence,
+  getAlertSilenceIds,
+  getAlertSummary,
+  getSeverityBadgeKind,
+  isAlertSilenced,
+  SEVERITY_FILTER_OPTIONS,
+  type Alert,
+  type AlertSortBy,
+} from '@/lib/alerts'
+import { setPendingAlertState, isProcessing } from '@/lib/alertPendingStates'
+import { type AlertFilterAlert } from '@/lib/alertFilters'
+import { useNotificationsStore } from '@/stores/notifications'
+import { canManageSystems, canReadUsers } from '@/lib/permissions'
+import OrganizationIconAndLink from '@/components/organizations/OrganizationIconAndLink.vue'
+import MuteAlertDrawer from '@/components/alerts/MuteAlertDrawer.vue'
+import AlertDetailsDrawer from '@/components/alerts/AlertDetailsDrawer.vue'
+import AssignAlertDrawer from '@/components/alerts/AssignAlertDrawer.vue'
+import AddAlertNoteDrawer from '@/components/alerts/AddAlertNoteDrawer.vue'
+import TakeOverAlertModal from '@/components/alerts/TakeOverAlertModal.vue'
+import AlertAssignee from '@/components/alerts/AlertAssignee.vue'
+import ProcessingAlertBadge from '@/components/alerts/ProcessingAlertBadge.vue'
+import { useLoginStore } from '@/stores/login'
+import capitalize from 'lodash/capitalize'
+import SystemDropdownFilter from '@/components/systems/SystemDropdownFilter.vue'
+import OrganizationDropdownFilter from '@/components/organizations/OrganizationDropdownFilter.vue'
+import AssigneeDropdownFilter from '@/components/alerts/AssigneeDropdownFilter.vue'
+import { savePageSizeToStorage } from '@/lib/tablePageSize'
+import { isUserCustomer } from '@/lib/organizations/organizations'
+import SystemLogoAndLink from '../systems/SystemLogoAndLink.vue'
+
+const { t, locale } = useI18n()
+const route = useRoute()
+const router = useRouter()
+const notificationsStore = useNotificationsStore()
+const loginStore = useLoginStore()
+
+const { state: systemsState } = useSystems()
+
+const {
+  state: alertsState,
+  asyncStatus: alertsAsyncStatus,
+  pageNum,
+  pageSize,
+  sortBy,
+  sortDirection,
+  statusFilters,
+  severityFilters,
+  alertnameFilters,
+  systemKeyFilters,
+  assigneeFilters,
+  organizationIds,
+  areDefaultFiltersApplied,
+  clearFilters,
+  resetStatusFilter,
+  refetch,
+} = useAlerts()
+
+// apply the filters requested via query params, then clean the URL
+const { system_key: sysKey, system_name: sysName, severity, status } = route.query
+
+if (typeof sysKey === 'string' && sysKey && typeof sysName === 'string' && sysName) {
+  clearFilters()
+  systemKeyFilters.value = [{ id: sysKey, label: sysName }]
+  router.replace({ query: {} })
+}
+
+const severityOption = SEVERITY_FILTER_OPTIONS.find((option) => option.id === severity)
+
+if (severityOption) {
+  clearFilters()
+  severityFilters.value = [severityOption]
+  router.replace({ query: {} })
+}
+
+if (status === 'suppressed') {
+  clearFilters()
+  statusFilters.value = [{ id: 'suppressed', label: t('alerts.muted') }]
+  router.replace({ query: {} })
+}
+
+const { state: alertFiltersState } = useAlertFilters()
+
+const alerts = computed(() => alertsState.value.data?.alerts ?? [])
+
+const pagination = computed(() => alertsState.value.data?.pagination)
+
+const isNoDataEmptyStateShown = computed(
+  () =>
+    !alerts.value.length && alertsState.value.status === 'success' && areDefaultFiltersApplied(),
+)
+
+const isNoMatchEmptyStateShown = computed(
+  () =>
+    !alerts.value.length && alertsState.value.status === 'success' && !areDefaultFiltersApplied(),
+)
+
+const isNoSystemsEmptyStateShown = computed(
+  () =>
+    !systemsState.value.data?.systems?.length &&
+    systemsState.value.status === 'success' &&
+    areDefaultFiltersApplied(),
+)
+
+const noEmptyStateShown = computed(
+  () =>
+    !isNoDataEmptyStateShown.value &&
+    !isNoMatchEmptyStateShown.value &&
+    !isNoSystemsEmptyStateShown.value,
+)
+
+// ── Filter options ─────────────────────────────────────────────────────────────
+
+const alertNameFilterOptions = computed<NeDropdownFilterV2Option[]>(() => {
+  const alerts = alertFiltersState.value.data?.alerts ?? []
+  return alerts.map((a: AlertFilterAlert) => ({ id: a.name, label: a.name }))
+})
+
+const statusFilterOptions: NeDropdownFilterV2Option[] = [
+  { id: 'active', label: t('alerts.unmuted') },
+  { id: 'suppressed', label: t('alerts.muted') },
+]
+
+// ── Sort ────────────────────────────────────────────────────────────────────────
+
+const sortDescending = computed({
+  get: () => sortDirection.value === 'desc',
+  set: (val: boolean) => {
+    sortDirection.value = val ? 'desc' : 'asc'
+  },
+})
+
+function onSort(payload: SortEvent) {
+  sortBy.value = payload.key as AlertSortBy
+  sortDirection.value = payload.descending ? 'desc' : 'asc'
+}
+
+// ── Mute alert drawer ────────────────────────────────────────────────────────────
+
+const selectedAlert = ref<Alert | undefined>(undefined)
+const isMuteDrawerShown = ref(false)
+
+function showMuteDrawer(alert: Alert) {
+  selectedAlert.value = alert
+  isMuteDrawerShown.value = true
+}
+
+// ── Unmute alert ────────────────────────────────────────────────────────────
+
+const unmuteError = ref<string | null>(null)
+
+async function handleUnmuteAlert(alert: Alert) {
+  unmuteError.value = null
+  try {
+    const organizationId = alert.labels?.organization_id
+    const silenceIds = getAlertSilenceIds(alert)
+    if (!silenceIds.length) return
+
+    // Delete all silences for this alert
+    for (const silenceId of silenceIds) {
+      await deleteAlertSilence(silenceId, organizationId)
+    }
+
+    // Record the target state so the alert shows as "processing" until the
+    // backend reflects the unmute.
+    setPendingAlertState(alert.fingerprint, organizationId ?? '', false)
+
+    // Show success notification with delay (per frontend conventions)
+    setTimeout(() => {
+      notificationsStore.createNotification({
+        kind: 'success',
+        title: t('alerts.alert_unmuted_successfully'),
+      })
+    }, 500)
+
+    // Refetch alerts to reflect changes
+    refetch()
+  } catch (error) {
+    console.error('Error unmuting alert:', error)
+    unmuteError.value = t('alerts.cannot_unmute_alert')
+  }
+}
+
+// ── Alert details drawer ──────────────────────────────────────────────────────
+
+const detailsDrawerAlert = ref<Alert | undefined>(undefined)
+const isDetailsDrawerShown = ref(false)
+
+function showDetailsDrawer(alert: Alert) {
+  detailsDrawerAlert.value = alert
+  isDetailsDrawerShown.value = true
+}
+
+// ── Assign to me / Add comment ────────────────────────────────────────────────
+
+const isAssignDrawerShown = ref(false)
+const isAddCommentDrawerShown = ref(false)
+const isTakeOverModalShown = ref(false)
+
+// The current assignee id stored by the backend is the Logto id when available,
+// otherwise the local id — compare against both.
+function isAssignedToOther(alert: Alert): boolean {
+  const assignee = alert.assigned_to
+  if (!assignee) return false
+  const me = loginStore.userInfo
+  return assignee.user_id !== me?.logto_id && assignee.user_id !== me?.id
+}
+
+function isAssignedToMe(alert: Alert): boolean {
+  const assignee = alert.assigned_to
+  if (!assignee) return false
+  const me = loginStore.userInfo
+  return assignee.user_id === me?.logto_id || assignee.user_id === me?.id
+}
+
+function onAssignToMe(alert: Alert) {
+  selectedAlert.value = alert
+  if (isAssignedToOther(alert)) {
+    isTakeOverModalShown.value = true
+  } else {
+    isAssignDrawerShown.value = true
+  }
+}
+
+function onTakeOverConfirm() {
+  isTakeOverModalShown.value = false
+  isAssignDrawerShown.value = true
+}
+
+function showAddCommentDrawer(alert: Alert) {
+  selectedAlert.value = alert
+  isAddCommentDrawerShown.value = true
+}
+
+function getKebabMenuItems(alert: Alert): NeDropdownItem[] {
+  const items: NeDropdownItem[] = []
+  if (canManageSystems()) {
+    if (isProcessing(alert)) {
+      // In transition: disable both actions until the backend catches up.
+      items.push(
+        {
+          id: 'muteAlert',
+          label: t('alerts.mute_alert'),
+          icon: faBellSlash,
+          disabled: true,
+          action: () => {},
+        },
+        {
+          id: 'unmuteAlert',
+          label: t('alerts.unmute_alert'),
+          icon: faBell,
+          disabled: true,
+          action: () => {},
+        },
+      )
+    } else if (isAlertSilenced(alert)) {
+      items.push({
+        id: 'unmuteAlert',
+        label: t('alerts.unmute_alert'),
+        icon: faBell,
+        action: () => handleUnmuteAlert(alert),
+      })
+    } else {
+      items.push({
+        id: 'muteAlert',
+        label: t('alerts.mute_alert'),
+        icon: faBellSlash,
+        action: () => showMuteDrawer(alert),
+      })
+    }
+    // Hide "Assign to me" when the alert is already assigned to the current user.
+    if (!isAssignedToMe(alert)) {
+      items.push({
+        id: 'assignToMe',
+        label: t('alerts.assign_to_me'),
+        icon: faUserCheck,
+        action: () => onAssignToMe(alert),
+      })
+    }
+    items.push({
+      id: 'addComment',
+      label: t('alerts.add_comment'),
+      icon: faComment,
+      action: () => showAddCommentDrawer(alert),
+    })
+  }
+  return items
+}
+
+// ── Navigation ──────────────────────────────────────────────────────────────────────
+
+function goToSystems() {
+  router.push({ name: 'systems' })
+}
+</script>
+
+<template>
+  <div>
+    <!-- Error notification: data load -->
+    <NeInlineNotification
+      v-if="alertsState.status === 'error'"
+      kind="error"
+      :title="$t('alerts.cannot_retrieve_alerts')"
+      class="mb-6"
+    />
+
+    <!-- Error notification: unmute -->
+    <NeInlineNotification
+      v-if="unmuteError"
+      kind="error"
+      :title="unmuteError"
+      class="mb-6"
+      @close="unmuteError = null"
+    />
+
+    <!-- Toolbar -->
+    <div class="mb-6 flex items-center gap-4">
+      <div class="flex w-full items-end justify-between gap-4">
+        <!-- Filters -->
+        <div class="flex flex-wrap items-center gap-4">
+          <!-- Severity filter -->
+          <NeDropdownFilterV2
+            v-model="severityFilters"
+            kind="checkbox"
+            :label="t('alerts.severity')"
+            :options="SEVERITY_FILTER_OPTIONS"
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+            @update:model-value="() => (pageNum = 1)"
+          />
+          <!-- Alert name filter -->
+          <NeDropdownFilterV2
+            v-model="alertnameFilters"
+            kind="checkbox"
+            :label="t('alerts.alert')"
+            :options="alertNameFilterOptions"
+            show-options-filter
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+            @update:model-value="() => (pageNum = 1)"
+          />
+          <!-- System filter -->
+          <SystemDropdownFilter
+            v-model="systemKeyFilters"
+            id-field="system_key"
+            @update:model-value="() => (pageNum = 1)"
+          />
+          <!-- Organization filter -->
+          <OrganizationDropdownFilter
+            v-if="!isUserCustomer()"
+            v-model="organizationIds"
+            @update:model-value="() => (pageNum = 1)"
+          />
+          <!-- Status filter -->
+          <NeDropdownFilterV2
+            v-model="statusFilters"
+            kind="checkbox"
+            :label="t('common.status')"
+            :options="statusFilterOptions"
+            :show-clear-filter="false"
+            :clear-filter-label="t('ne_dropdown_filter.clear_selection')"
+            :open-menu-aria-label="t('ne_dropdown_filter.open_filter')"
+            :no-options-label="t('ne_dropdown_filter.no_options')"
+            :more-options-hidden-label="t('ne_dropdown_filter.more_options_hidden')"
+            :clear-search-label="t('ne_dropdown_filter.clear_search')"
+            :options-filter-placeholder="t('ne_dropdown_filter.options_filter_placeholder')"
+            :custom-action-label="t('ne_dropdown_filter.reset_selection')"
+            @custom-action="resetStatusFilter"
+            @update:model-value="() => (pageNum = 1)"
+          />
+          <!-- Assignee filter: the options come from GET /users, so hide it for
+          roles without read:users (they'd get a 403 that kicks them out of the page) -->
+          <AssigneeDropdownFilter
+            v-if="canReadUsers()"
+            v-model="assigneeFilters"
+            @update:model-value="() => (pageNum = 1)"
+          />
+          <!-- Sort -->
+          <NeSortDropdown
+            v-model:sort-key="sortBy"
+            v-model:sort-descending="sortDescending"
+            :label="t('sort.sort')"
+            :options="[
+              { id: 'starts_at', label: t('alerts.started') },
+              { id: 'severity', label: t('alerts.severity') },
+              { id: 'alertname', label: t('alerts.alertname') },
+              { id: 'assigned_user_name', label: t('alerts.assigned_to') },
+            ]"
+            :open-menu-aria-label="t('ne_dropdown.open_menu')"
+            :sort-by-label="t('sort.sort_by')"
+            :sort-direction-label="t('sort.direction')"
+            :ascending-label="t('sort.ascending')"
+            :descending-label="t('sort.descending')"
+          />
+          <!-- Reset filters -->
+          <NeButton kind="tertiary" @click="clearFilters">
+            {{ t('common.reset_filters') }}
+          </NeButton>
+        </div>
+        <!-- Data updated every X seconds -->
+        <div class="flex items-center gap-2">
+          <NeSpinner
+            color="white"
+            v-if="alertsAsyncStatus === 'loading' && alertsState.status !== 'pending'"
+          />
+          <div class="text-tertiary-neutral">
+            {{
+              t('common.data_updated_every_seconds', { seconds: ALERTS_REFETCH_INTERVAL_SECONDS })
+            }}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Empty state: no systems configured -->
+    <NeEmptyState
+      v-if="isNoSystemsEmptyStateShown"
+      :title="$t('alerts.no_systems_configured')"
+      :icon="faServer"
+      class="bg-white dark:bg-gray-950"
+    >
+      <NeButton kind="tertiary" @click="goToSystems">
+        <template #prefix>
+          <FontAwesomeIcon :icon="faArrowRight" aria-hidden="true" />
+        </template>
+        {{ $t('common.go_to_page', { page: $t('systems.title') }) }}
+      </NeButton>
+    </NeEmptyState>
+
+    <!-- Empty state: no data -->
+    <NeEmptyState
+      v-else-if="isNoDataEmptyStateShown"
+      :title="$t('alerts.no_active_alerts')"
+      :description="$t('alerts.no_active_alerts_description')"
+      :icon="faCircleCheck"
+      class="bg-white dark:bg-gray-950"
+    />
+
+    <!-- Empty state: no matches -->
+    <NeEmptyState
+      v-else-if="isNoMatchEmptyStateShown"
+      :title="$t('alerts.no_alerts_found')"
+      :description="$t('common.try_changing_search_filters')"
+      :icon="faMagnifyingGlass"
+      class="bg-white dark:bg-gray-950"
+    >
+      <NeButton kind="tertiary" @click="clearFilters">
+        {{ $t('common.reset_filters') }}
+      </NeButton>
+    </NeEmptyState>
+
+    <!-- Alerts table -->
+    <NeTable
+      v-if="noEmptyStateShown"
+      :sort-key="sortBy"
+      :sort-descending="sortDirection === 'desc'"
+      :aria-label="$t('alerts.title')"
+      card-breakpoint="2xl"
+      :loading="alertsState.status === 'pending'"
+      :skeleton-columns="6"
+      :skeleton-rows="7"
+    >
+      <NeTableHead>
+        <NeTableHeadCell sortable column-key="severity" @sort="onSort">{{
+          $t('alerts.severity')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="alertname" @sort="onSort">{{
+          $t('alerts.alertname')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell>{{ $t('alerts.system') }}</NeTableHeadCell>
+        <NeTableHeadCell>{{ $t('alerts.organization') }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="starts_at" @sort="onSort">{{
+          $t('alerts.started')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell sortable column-key="assigned_user_name" @sort="onSort">{{
+          $t('alerts.assigned_to')
+        }}</NeTableHeadCell>
+        <NeTableHeadCell>
+          <!-- no header for actions -->
+        </NeTableHeadCell>
+      </NeTableHead>
+      <NeTableBody>
+        <NeTableRow v-for="alert in alerts" :key="alert.fingerprint">
+          <!-- Severity -->
+          <NeTableCell :data-label="$t('alerts.severity')">
+            <NeBadgeV2 :kind="getSeverityBadgeKind(alert.labels?.severity)">
+              {{ capitalize(alert.labels?.severity) }}
+            </NeBadgeV2>
+          </NeTableCell>
+          <!-- Alert -->
+          <NeTableCell :data-label="$t('alerts.alertname')">
+            <div class="flex items-start gap-2">
+              <div>
+                <span
+                  class="cursor-pointer font-medium hover:underline"
+                  @click="() => showDetailsDrawer(alert)"
+                  >{{ alert.labels?.alertname || '-' }}</span
+                >
+                <p
+                  v-if="getAlertSummary(alert, locale)"
+                  class="text-tertiary-neutral dark:text-tertiary-neutral mt-0.5 break-all"
+                >
+                  {{ getAlertSummary(alert, locale) }}
+                </p>
+              </div>
+              <ProcessingAlertBadge v-if="isProcessing(alert)" />
+              <NeBadgeV2 v-else-if="isAlertSilenced(alert)" kind="gray">
+                <FontAwesomeIcon :icon="faBellSlash" class="size-4" />
+                {{ t('alerts.muted') }}
+              </NeBadgeV2>
+            </div>
+          </NeTableCell>
+          <!-- System -->
+          <NeTableCell :data-label="$t('alerts.system')">
+            <SystemLogoAndLink
+              :system-id="alert.labels?.system_id"
+              :system-name="alert.labels?.system_name"
+              :system-type="alert.labels?.system_type"
+            ></SystemLogoAndLink>
+          </NeTableCell>
+          <!-- Organization -->
+          <NeTableCell :data-label="$t('alerts.organization')">
+            <OrganizationIconAndLink
+              v-if="alert.labels?.organization_name || alert.labels?.organization_id"
+              :organization="{
+                logto_id: alert.labels?.organization_id,
+                name: alert.labels?.organization_name || alert.labels?.organization_id,
+                type: alert.labels?.organization_type || '',
+              }"
+            />
+            <span v-else>-</span>
+          </NeTableCell>
+          <!-- Started at -->
+          <NeTableCell :data-label="$t('alerts.started')">
+            <div>
+              <p>{{ formatRelativeTime(new Date(alert.startsAt), locale) }}</p>
+              <p class="text-tertiary-neutral dark:text-tertiary-neutral mt-0.5">
+                {{ formatDateTime(new Date(alert.startsAt), locale) }}
+              </p>
+            </div>
+          </NeTableCell>
+          <!-- Assigned to -->
+          <NeTableCell :data-label="$t('alerts.assigned_to')">
+            <AlertAssignee :alert="alert" />
+          </NeTableCell>
+          <!-- Actions -->
+          <NeTableCell :data-label="$t('common.actions')">
+            <div class="-ml-2.5 flex gap-2 2xl:ml-0 2xl:justify-end">
+              <NeButton kind="tertiary" size="sm" @click="() => showDetailsDrawer(alert)">
+                <template #prefix>
+                  <FontAwesomeIcon :icon="faEye" class="h-4 w-4" aria-hidden="true" />
+                </template>
+                {{ $t('common.details') }}
+              </NeButton>
+              <!-- kebab menu -->
+              <NeDropdown
+                v-if="canManageSystems()"
+                :items="getKebabMenuItems(alert)"
+                :align-to-right="true"
+              />
+            </div>
+          </NeTableCell>
+        </NeTableRow>
+      </NeTableBody>
+      <template v-if="pagination" #paginator>
+        <NePaginator
+          :current-page="pageNum"
+          :total-rows="pagination.total_count"
+          :page-size="pageSize"
+          :page-sizes="PAGE_SIZE_OPTIONS"
+          :nav-pagination-label="$t('ne_table.pagination')"
+          :next-label="$t('ne_table.go_to_next_page')"
+          :previous-label="$t('ne_table.go_to_previous_page')"
+          :range-of-total-label="$t('ne_table.of')"
+          :page-size-label="$t('ne_table.show')"
+          @select-page="(page: number) => (pageNum = page)"
+          @select-page-size="
+            (size: number) => {
+              pageSize = size
+              savePageSizeToStorage(ALERTS_TABLE_ID, size)
+            }
+          "
+        />
+      </template>
+    </NeTable>
+
+    <!-- Mute alert drawer -->
+    <MuteAlertDrawer
+      :is-shown="isMuteDrawerShown"
+      :alert="selectedAlert"
+      @close="isMuteDrawerShown = false"
+    />
+
+    <!-- Alert details drawer -->
+    <AlertDetailsDrawer
+      :is-shown="isDetailsDrawerShown"
+      :alert="detailsDrawerAlert"
+      @close="isDetailsDrawerShown = false"
+    />
+
+    <!-- Assign alert drawer -->
+    <AssignAlertDrawer
+      :is-shown="isAssignDrawerShown"
+      :alert="selectedAlert"
+      @close="isAssignDrawerShown = false"
+    />
+
+    <!-- Add comment drawer -->
+    <AddAlertNoteDrawer
+      :is-shown="isAddCommentDrawerShown"
+      :alert="selectedAlert"
+      @close="isAddCommentDrawerShown = false"
+    />
+
+    <!-- Take over confirmation -->
+    <TakeOverAlertModal
+      :visible="isTakeOverModalShown"
+      :alert="selectedAlert"
+      @close="isTakeOverModalShown = false"
+      @confirm="onTakeOverConfirm"
+    />
+  </div>
+</template>
