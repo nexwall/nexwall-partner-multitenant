@@ -1,7 +1,9 @@
 # ADR 0002: Organization hierarchy — default to Nexwall → Reseller → Customer, confirm Distributor tier before building it
 
-**Status**: Proposed (one open question below needs a real answer before
-Phase 2 implementation starts, not before this ADR is accepted)
+**Status**: Proposed, reframed by ADR 0004 (fork `NethServer/my` directly).
+The question below is unchanged, but the codebase now already implements
+4 tiers out of the box — see the note at the bottom before assuming this
+is still a from-scratch design decision.
 
 ## Context
 
@@ -56,3 +58,28 @@ justifies it) — don't guess ahead of a real need here either.
   adding a 4th tier a small change, not a rewrite.
 - Phase 2 (actual hierarchy + entitlements) should not start until this is
   answered.
+
+
+## Update after ADR 0004 (fork, don't reimplement)
+
+The forked codebase already implements all 4 tiers
+(`Owner → Distributor → Reseller → Customer`) end to end, tested, in
+production. The open question below is unchanged, but what answering it
+*does* is different now:
+
+- **If Nexwall keeps all 4 tiers**: no schema/code change needed at all —
+  this is now the "do nothing" option, not the effortful one.
+- **If Nexwall wants 3 tiers (no distributor)**: this means *removing* a
+  working, tested tier from real code (schema migration, dropping the
+  distributor role from `backend/authz/`, updating the visibility-query
+  logic, updating `frontend/` role-dependent UI) — real, non-trivial work,
+  not a simplification. Don't default to this just because Nexwall's
+  channel might be simpler than Nethesis's; only do it if there's a
+  concrete reason 4 tiers actively cause a problem (e.g. UI confusion for
+  an MSP with no distributor concept at all).
+
+Recommendation given this new information: **default to keeping all 4
+tiers** unless the business decision (still open) specifically identifies a
+problem with doing so. This reverses the prior recommendation in this ADR's
+original text below, which assumed building from scratch where 3 tiers was
+the cheaper default.
