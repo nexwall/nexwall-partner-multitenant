@@ -44,12 +44,33 @@ first.
   `rebranding.go`'s actual per-organization override mechanism untouched —
   this task only changes what shows when no reseller override is set.
 
-## 1.5 — `render.yaml` (or its replacement, per Phase 0.5)
+## 1.5 — New `charts/` (k3s, per ADR 0005)
 
-- Once Phase 0.5's infra decision is made: either rewrite `render.yaml`
-  with Nexwall's own service names/regions/IP-allowlists (Option A), or
-  begin the Helm-chart translation (Option B) — this task's shape depends
-  entirely on that decision, don't start it before 0.5 is resolved.
+- **Build new**: translate `docker-compose.yml` (and
+  `services/mimir/docker-compose.yml` separately) into a Helm chart,
+  mirroring `nexwall-multi-tenant`'s `charts/nexwall-controller/`
+  structure and its README's 1:1-mapping-table convention — that
+  convention proved itself well worth repeating here rather than
+  inventing a different documentation style for this chart.
+- **Build new**: disable the Render-specific CI workflows (ADR 0005),
+  with the explanatory top-of-file comment already planned in Phase 0 —
+  do this now, it's unambiguous and was only deferred pending the infra
+  decision.
+
+## 1.6 — Routing-by-role + per-tenant handoff secret storage (per ADR 0006)
+
+- **Build new**: in the existing token-exchange step, branch on org role —
+  Reseller/Owner staff get today's behavior (Partner Program session);
+  Customer-org users get no Partner Program session at all, instead a
+  signed handoff token and an HTTP redirect to their tenant's subdomain.
+- **Build new**: store each Customer org's per-tenant handoff secret
+  (generated at provisioning time, Phase 2) and subdomain — new fields on
+  whatever this repo's Customer-org record already holds.
+- Note this task only produces the *redirect* — actually skipping the
+  customer's local login screen depends on `nexwall-controller` shipping
+  its own receiving endpoint (a different repo, not blocked on by this
+  repo's own Phase 1 exit criteria, but worth flagging to whoever's
+  coordinating both repos' timelines).
 
 ## Exit criteria
 

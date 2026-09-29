@@ -62,29 +62,31 @@ Required before any real partner uses the live service (NOTICE.md, ADR
 pointing at this exact repo. Cheap, easy to forget — do it early rather than
 as an afterthought right before launch.
 
-## 0.5 — Infra decision for this cluster
+## 0.5 — Infra decision: RESOLVED, k3s (ADR 0005)
 
-Still open from before the fork (previously "Build new" in the old Phase 0
-doc). Now informed by a concrete new fact: upstream's own deployment target
-is **Render.com with Docker Compose semantics**, not Kubernetes — materially
-different from `nexwall-multi-tenant`'s k3s-based approach. Decide
-explicitly:
+k3s, own cluster, separate from `nexwall-multi-tenant`'s. See
+`docs/adr/0005-infra-choice-k3s.md` for the full reasoning. This means:
+Render-specific CI workflows get disabled (not adapted), and a new
+`charts/` directory (mirroring `nexwall-multi-tenant`'s
+`charts/nexwall-controller/` structure) is a concrete Phase 1 deliverable.
 
-- **Option A**: keep Render (or a similar PaaS) — minimal deployment-config
-  work, but a third infra pattern in Nexwall's stack (k3s for customers,
-  whatever Render-equivalent for partners) to operate.
-- **Option B**: port to k3s, matching `nexwall-multi-tenant`'s pattern —
-  more upfront work (translating `docker-compose.yml`/`render.yaml` to
-  Helm, the same kind of work `nexwall-multi-tenant`'s own Phase 1 did for
-  `nexwall-controller`), but one less infra pattern to operate long-term.
+## 0.6 — Single-FQDN login + tenant handoff: RESOLVED architecture (ADR 0006)
 
-Write this as `docs/adr/0005-infra-choice.md` once decided — don't proceed
-to Phase 1 without it, since 0.3's `render.yaml` triage depends on the
-answer.
+`partner.nexwall.com.br` serves everyone — partners and customer end-users
+alike — with post-login routing decided by this backend, not by per-tenant
+Logto redirect URIs. See `docs/adr/0006-single-fqdn-email-login-tenant-
+handoff.md` for the full design, including the **cross-repo dependency**:
+`nexwall-controller` needs a new endpoint to accept the handoff token this
+repo will mint (tracked in that repo's own new
+`docs/adr/0001-sso-handoff-from-partner-program.md`) — not yet built, not
+part of this repo's own work.
 
 ## Exit criteria
 
 License compliance mechanics done (0.1 — already true as of this commit).
-CI triaged, no more silent-fail noise. Nethesis-specific config fully
+CI triaged: Render-specific workflows disabled with explanatory comments
+(not yet done — now unambiguous per ADR 0005, do this before Phase 1
+starts rather than leaving it "to decide"). Nethesis-specific config fully
 inventoried (not yet fixed — that's Phase 1). In-app source link live.
-Infra decision made and recorded as an ADR.
+Infra and login-architecture decisions made and recorded as ADRs (0005,
+0006 — both done as of this commit).

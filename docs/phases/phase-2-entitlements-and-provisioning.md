@@ -23,6 +23,11 @@ old (pre-ADR-0004) plan.
   "modifying an inherited file" and "adding a new file").
 - **Build new**: the `provisioning_failed` state and partner-facing retry
   affordance from ADR 0003.
+- **Build new** (per ADR 0006): generate a per-tenant handoff signing
+  secret here, pass it as a Helm value when calling Management Plane's
+  `POST /tenants` — verify whether that contract already has a field for
+  arbitrary per-tenant secrets or needs a new one added (coordinate with
+  `nexwall-multi-tenant`, don't assume).
 
 ## 2.2 — Entitlements adaptation
 
