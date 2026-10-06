@@ -1,0 +1,6 @@
+apiVersion: v2
+name: partner-plane
+description: Nexwall Partner Program (partner.nexwall.com.br) -- forked from NethServer/my, see docs/adr/0004-fork-nethserver-my-directly.md
+type: application
+version: 0.1.0
+appVersion: "dev"

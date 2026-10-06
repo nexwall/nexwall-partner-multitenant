@@ -1,0 +1,47 @@
+images:
+  backend: localhost/nexwall-partner-backend:dev
+  collect: localhost/nexwall-partner-collect:dev
+  frontend: localhost/nexwall-partner-frontend:dev
+  proxy: localhost/nexwall-partner-proxy:dev
+  postgres: postgres:15-alpine
+  redis: redis:7-alpine
+  # imagePullPolicy is forced to Never in the templates for the 4 app images
+  # (locally built, imported directly into containerd -- not in a registry
+  # yet). postgres/redis are real public images and pull normally.
+
+postgres:
+  database: noc
+  user: noc_user
+  storageSize: 2Gi
+
+redis:
+  storageSize: 512Mi
+
+# Dev-only placeholders. Logto is NOT set up yet (Phase 1.1, not done) --
+# the backend will start but auth will not work until real values are set
+# here. JWT_SECRET below is a throwaway dev value, NOT safe for anything
+# beyond this initial infra validation deploy.
+secrets:
+  postgresPassword: "CHANGE_ME_postgres_password"
+  jwtSecret: "CHANGE_ME_at_least_32_chars_dev_only_not_for_production"
+  logtoTenantId: "CHANGE_ME_placeholder_tenant_id"
+  logtoTenantDomain: "placeholder.logto.app"
+  logtoApiResource: "https://partner.nexwall.com.br/api/permissions"
+  logtoFrontendAppId: "CHANGE_ME_placeholder_frontend_app_id"
+  logtoBackendAppId: "CHANGE_ME_placeholder_backend_app_id"
+  logtoBackendAppSecret: "CHANGE_ME_placeholder_backend_app_secret"
+
+frontend:
+  productName: "Nexwall Partner Program"
+  # These were baked in at image build time (Vite env vars are compile-time,
+  # not runtime) -- changing these here does NOT change the running
+  # frontend. Rebuild the image to change them. Documented here only so
+  # it's clear what the current image was built with.
+  builtWith:
+    logtoEndpoint: "https://placeholder.logto.app"
+    logtoAppId: "placeholder-app-id"
+
+proxy:
+  service:
+    type: NodePort
+    nodePort: 30090
